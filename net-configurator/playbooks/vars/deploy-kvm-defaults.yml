@@ -1,0 +1,52 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Default variables for deploy-kvm.yml — KVM digital twin provisioning.
+# Override per-site by passing --extra-vars or creating a site-specific vars file.
+#
+# Required overrides (no defaults — must be supplied):
+#   kvm_base_image   path to a RHEL9 / AlmaLinux 9 cloud-init qcow2 on the KVM host
+#
+# Typical usage:
+#   make deploy-kvm ARCH=2-8-5-200 SITE=kicktires \
+#     KVM_BASE_IMAGE=/var/lib/libvirt/images/AlmaLinux-9-GenericCloud.qcow2
+
+# ── Base image (required) ──────────────────────────────────────────────────
+# RHEL9 or AlmaLinux 9 GenericCloud qcow2 with cloud-init support.
+# Must be pre-staged on the KVM host at this path.
+kvm_base_image: "{{ lookup('env', 'KVM_BASE_IMAGE') | default('/var/lib/libvirt/images/rhel9-base.qcow2', true) }}"
+
+# ── Working directory for KVM images / ISOs ────────────────────────────────
+kvm_image_dir: /var/lib/libvirt/images/digital-twin
+
+# ── SSH key for Ansible → VM access (generated if absent) ─────────────────
+kvm_ssh_key_path: /root/.ssh/dt-key
+
+# ── VM sizing ──────────────────────────────────────────────────────────────
+kvm_vm_vcpus: 4
+kvm_vm_memory_mb: 8192
+kvm_router_vcpus: 2
+kvm_router_memory_mb: 2048
+
+# ── Cloud image default user (cloud-user on RHEL9/AlmaLinux) ──────────────
+kvm_vm_user: cloud-user
+
+# ── Management bridge / subnet ─────────────────────────────────────────────
+# VMs' eth0 (1st virt-install NIC) gets a static IP on this bridge.
+# KVM host has kvm_mgmt_host_ip on the same bridge for Ansible access.
+kvm_mgmt_host_ip: 192.168.200.254/24
+kvm_mgmt_gateway: 192.168.200.254
+kvm_mgmt_prefix: "24"
+
+# Router-vm management IP (eth0 on br-dt-mgmt)
+kvm_router_mgmt_ip: 192.168.200.1
+
+# First management IP offset for GPU nodes: 192.168.200.(gpu_mgmt_base + loop_index)
+# GPU nodes:  192.168.200.11 – 192.168.200.14
+# k8s nodes:  192.168.200.21 – 192.168.200.23
+kvm_gpu_mgmt_base: 10
+kvm_k8s_mgmt_base: 20
+
+# ── Digital twin bridge prefix ─────────────────────────────────────────────
+_dt_bp: br-dt

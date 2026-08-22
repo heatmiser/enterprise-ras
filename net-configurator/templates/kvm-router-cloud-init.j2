@@ -1,0 +1,80 @@
+#cloud-config
+# {{ ansible_managed }}
+# Router-vm cloud-init user-data — dt-router
+# Sets up iproute2 VRFs via NetworkManager to provide L3 gateway isolation
+# between the INBAND (GPU + k8s) and GPU-rail VRFs.
+#
+# NIC layout (enp<N>s0 = Nth virt-install --network arg):
+#   enp1s0 — br-dt-mgmt  (management, configured by network-config)
+#   enp2s0 — br-dt-inband   → VRF_INBAND, {{ kvm_router_inband_ip }}/24
+#   enp3s0 — br-dt-support  → VRF_INBAND, {{ kvm_router_support_ip }}/{{ kvm_router_support_prefix }}
+#   enp4s0 — br-dt-rail1    → VRF_GPU,    {{ kvm_router_rail1_ip }}/24
+#   enp5s0 — br-dt-rail2    → VRF_GPU,    {{ kvm_router_rail2_ip }}/24
+#   enp6s0 — br-dt-rail3    → VRF_GPU,    {{ kvm_router_rail3_ip }}/24
+#   enp7s0 — br-dt-rail4    → VRF_GPU,    {{ kvm_router_rail4_ip }}/24
+
+hostname: dt-router
+
+users:
+  - name: "{{ kvm_vm_user }}"
+    groups: wheel
+    sudo:
+      - "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "{{ _kvm_ssh_pubkey }}"
+
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /etc/NetworkManager/conf.d/99-no-autodefault.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [main]
+      no-auto-default=*
+
+runcmd:
+  # VRF_INBAND (table 10): gateway for GPU-node bond0 + k8s-node bond0
+  - >-
+    nmcli connection add type vrf con-name VRF_INBAND ifname VRF_INBAND
+    table 10 ipv4.method disabled ipv6.method disabled
+  # VRF_GPU (table 20): gateway for GPU rail NICs
+  - >-
+    nmcli connection add type vrf con-name VRF_GPU ifname VRF_GPU
+    table 20 ipv4.method disabled ipv6.method disabled
+  # INBAND interfaces
+  - >-
+    nmcli connection add type ethernet con-name enp2s0 ifname enp2s0
+    controller VRF_INBAND ipv4.method manual
+    ipv4.addresses {{ kvm_router_inband_ip }}/24
+  - >-
+    nmcli connection add type ethernet con-name enp3s0 ifname enp3s0
+    controller VRF_INBAND ipv4.method manual
+    ipv4.addresses {{ kvm_router_support_ip }}/{{ kvm_router_support_prefix }}
+  # GPU rail interfaces
+  - >-
+    nmcli connection add type ethernet con-name enp4s0 ifname enp4s0
+    controller VRF_GPU ipv4.method manual
+    ipv4.addresses {{ kvm_router_rail1_ip }}/24
+  - >-
+    nmcli connection add type ethernet con-name enp5s0 ifname enp5s0
+    controller VRF_GPU ipv4.method manual
+    ipv4.addresses {{ kvm_router_rail2_ip }}/24
+  - >-
+    nmcli connection add type ethernet con-name enp6s0 ifname enp6s0
+    controller VRF_GPU ipv4.method manual
+    ipv4.addresses {{ kvm_router_rail3_ip }}/24
+  - >-
+    nmcli connection add type ethernet con-name enp7s0 ifname enp7s0
+    controller VRF_GPU ipv4.method manual
+    ipv4.addresses {{ kvm_router_rail4_ip }}/24
+  # Bring up VRFs first, then member interfaces
+  - nmcli connection up VRF_INBAND
+  - nmcli connection up VRF_GPU
+  - nmcli connection up enp2s0
+  - nmcli connection up enp3s0
+  - nmcli connection up enp4s0
+  - nmcli connection up enp5s0
+  - nmcli connection up enp6s0
+  - nmcli connection up enp7s0

@@ -14,7 +14,7 @@ SHELL := /bin/bash
         validate-ping-matrix validate-requirements extract-requirements \
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
-        deploy validate-all
+        deploy validate-all deploy-kvm
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -259,6 +259,10 @@ help:  ## Show this help message
 	@echo "  make generate                      # Generate switch configs + topology"
 	@echo "  make air-full-deploy               # Generate + Air simulation + ZTP deploy"
 	@echo "  make switch-ztp-deploy             # ZTP deployment only"
+	@echo ""
+	@echo "OCP / KVM Digital Twin:"
+	@echo "  make generate-ocp ARCH=2-8-5-200  # Generate OCP ABI manifests + NMState"
+	@echo "  make deploy-kvm ARCH=2-8-5-200 KVM_BASE_IMAGE=/path/to/rhel9.qcow2"
 	@echo ""
 	@echo "Manual Context:"
 	@echo "  make use ARCH=2-8-5-200           # Set arch once (SITE defaults to 'default')"
@@ -587,6 +591,24 @@ generate-ocp:  ## Generate OCP Ansible inventory + ABI manifests from ERA invent
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	python3 scripts/generate-ocp-inventory.py --arch $(ARCH) --site $(SITE) \
 		$(if $(OCP_SETTINGS),--ocp-settings $(OCP_SETTINGS),)
+
+deploy-kvm:  ## Deploy KVM digital twin (bridges + router-vm + RHEL VMs + NMState) - requires ARCH, optional SITE, KVM_BASE_IMAGE
+	$(call check_arch,$@)
+	@if [ ! -f "output/$(ARCH)/$(SITE)/ocp/inventory/hosts.yml" ]; then \
+		echo "❌ ERROR: OCP inventory not found for arch=$(ARCH) site=$(SITE)"; \
+		echo "   Run 'make generate-ocp ARCH=$(ARCH) SITE=$(SITE)' first."; \
+		exit 1; \
+	fi
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo "  Deploying KVM digital twin  arch=$(ARCH)  site=$(SITE)"
+	@echo "  KVM_BASE_IMAGE=$(or $(KVM_BASE_IMAGE),/var/lib/libvirt/images/rhel9-base.qcow2)"
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	ansible-playbook -i localhost, playbooks/deploy-kvm.yml \
+		-e nc_arch=$(ARCH) -e nc_site=$(SITE) \
+		$(if $(KVM_BASE_IMAGE),-e kvm_base_image=$(KVM_BASE_IMAGE),) \
+		$(if $(KVM_IMAGE_DIR),-e kvm_image_dir=$(KVM_IMAGE_DIR),) \
+		$(if $(KVM_HOST),-e kvm_host=$(KVM_HOST),) \
+		--ask-become-pass
 
 topology:  ## Generate Air topology only - requires ARCH, optional SITE
 	$(call check_arch,$@)
