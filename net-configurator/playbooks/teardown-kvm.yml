@@ -1,0 +1,52 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Teardown playbook for the KVM Digital Twin environment.
+# Destroys and undefines VMs, deletes Linux bridges, and cleans up storage files.
+
+- name: Teardown KVM Digital Twin
+  hosts: localhost
+  connection: local
+  become: true
+  vars_files:
+    - vars/deploy-kvm-defaults.yml
+
+  tasks:
+    - name: Get list of all libvirt VMs
+      ansible.builtin.command:
+        cmd: virsh list --all --name
+      register: _virsh_list
+      changed_when: false
+      failed_when: false
+
+    - name: Filter digital twin VMs
+      ansible.builtin.set_fact:
+        _dt_vms: "{{ _virsh_list.stdout_lines | select('match', '^dt-router$|^ipp5|gpu|k8s') | list }}"
+
+    - name: Destroy digital twin VMs
+      ansible.builtin.command:
+        cmd: "virsh destroy {{ item }}"
+      loop: "{{ _dt_vms }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Undefine digital twin VMs and remove storage
+      ansible.builtin.command:
+        cmd: "virsh undefine {{ item }} --remove-all-storage"
+      loop: "{{ _dt_vms }}"
+      changed_when: true
+      failed_when: false
+
+    - name: Remove digital twin bridges
+      ansible.builtin.shell: |
+        for br in br-dt-mgmt br-dt-inband br-dt-support br-dt-rail1 br-dt-rail2 br-dt-rail3 br-dt-rail4; do
+          ip link set "$br" down 2>/dev/null || true
+          ip link delete "$br" 2>/dev/null || true
+        done
+      changed_when: true
+
+    - name: Remove digital twin working directory
+      ansible.builtin.file:
+        path: "{{ kvm_image_dir }}"
+        state: absent

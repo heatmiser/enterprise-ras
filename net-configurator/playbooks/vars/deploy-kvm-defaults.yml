@@ -18,19 +18,20 @@
 kvm_base_image: "{{ lookup('env', 'KVM_BASE_IMAGE') | default('/var/lib/libvirt/images/rhel9-base.qcow2', true) }}"
 
 # ── Working directory for KVM images / ISOs ────────────────────────────────
-kvm_image_dir: /var/lib/libvirt/images/digital-twin
+kvm_image_dir: "{{ lookup('env', 'KVM_IMAGE_DIR') | default('/var/lib/libvirt/images/digital-twin', true) }}"
 
 # ── SSH key for Ansible → VM access (generated if absent) ─────────────────
-kvm_ssh_key_path: /root/.ssh/dt-key
+kvm_ssh_key_path: "{{ lookup('env', 'HOME') }}/.ssh/dt-key"
 
 # ── VM sizing ──────────────────────────────────────────────────────────────
-kvm_vm_vcpus: 4
-kvm_vm_memory_mb: 8192
+kvm_vm_vcpus: 2
+kvm_vm_memory_mb: 2048
 kvm_router_vcpus: 2
 kvm_router_memory_mb: 2048
 
-# ── Cloud image default user (cloud-user on RHEL9/AlmaLinux) ──────────────
+# ── Cloud image default user and OS variant ────────────────────────────────
 kvm_vm_user: cloud-user
+kvm_os_variant: centos-stream9
 
 # ── Management bridge / subnet ─────────────────────────────────────────────
 # VMs' eth0 (1st virt-install NIC) gets a static IP on this bridge.
@@ -38,6 +39,7 @@ kvm_vm_user: cloud-user
 kvm_mgmt_host_ip: 192.168.200.254/24
 kvm_mgmt_gateway: 192.168.200.254
 kvm_mgmt_prefix: "24"
+kvm_mgmt_internet_access: true
 
 # Router-vm management IP (eth0 on br-dt-mgmt)
 kvm_router_mgmt_ip: 192.168.200.1
@@ -47,6 +49,15 @@ kvm_router_mgmt_ip: 192.168.200.1
 # k8s nodes:  192.168.200.21 – 192.168.200.23
 kvm_gpu_mgmt_base: 10
 kvm_k8s_mgmt_base: 20
+
+# Router-vm gateway IPs (overridden dynamically from generated OCP inventory if present)
+kvm_router_inband_ip: "10.78.221.1"
+kvm_router_support_ip: "10.78.220.33"
+kvm_router_support_prefix: "24"
+kvm_router_rail1_ip: "192.168.1.1"
+kvm_router_rail2_ip: "192.168.2.1"
+kvm_router_rail3_ip: "192.168.3.1"
+kvm_router_rail4_ip: "192.168.4.1"
 
 # ── Digital twin bridge prefix ─────────────────────────────────────────────
 _dt_bp: br-dt

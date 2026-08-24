@@ -21,6 +21,8 @@ users:
     groups: wheel
     sudo:
       - "ALL=(ALL) NOPASSWD:ALL"
+    passwd: "$6$rounds=656000$saltsalt$f/uX2qL8G5jK1E8O3m/N.aZ72A2I0p/V6mG0L8P1Q0" # centos
+    lock_passwd: false
     ssh_authorized_keys:
       - "{{ _kvm_ssh_pubkey }}"
 
@@ -36,4 +38,5 @@ write_files:
       no-auto-default=*
 
 runcmd:
+  - dnf config-manager --set-enabled crb
   - dnf install -y nmstate
