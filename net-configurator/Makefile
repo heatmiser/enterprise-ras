@@ -14,7 +14,7 @@ SHELL := /bin/bash
         validate-ping-matrix validate-requirements extract-requirements \
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
-        deploy validate-all deploy-kvm
+        deploy validate-all deploy-kvm init-ocp-settings
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -262,6 +262,7 @@ help:  ## Show this help message
 	@echo ""
 	@echo "OCP / KVM Digital Twin:"
 	@echo "  make generate-ocp ARCH=2-8-5-200  # Generate OCP ABI manifests + NMState"
+	@echo "  make init-ocp-settings ARCH=2-8-5-200 SITE=...  # Bootstrap ocp-settings.yml from inventory"
 	@echo "  make deploy-kvm ARCH=2-8-5-200 KVM_BASE_IMAGE=/path/to/rhel9.qcow2"
 	@echo ""
 	@echo "Manual Context:"
@@ -591,6 +592,19 @@ generate-ocp:  ## Generate OCP Ansible inventory + ABI manifests from ERA invent
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	python3 scripts/generate-ocp-inventory.py --arch $(ARCH) --site $(SITE) \
 		$(if $(OCP_SETTINGS),--ocp-settings $(OCP_SETTINGS),)
+
+init-ocp-settings:  ## Bootstrap ocp-settings.yml from ERA inventory - requires ARCH, optional SITE FORCE=1
+	$(call check_arch,$@)
+	@if [ ! -d "output/$(ARCH)/$(SITE)/inventory" ]; then \
+		echo "❌ ERROR: ERA inventory not found for arch=$(ARCH) site=$(SITE)"; \
+		echo "   Run 'make generate ARCH=$(ARCH) SITE=$(SITE)' first."; \
+		exit 1; \
+	fi
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo "  Bootstrapping ocp-settings.yml  arch=$(ARCH)  site=$(SITE)"
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	python3 scripts/init-ocp-settings.py --arch $(ARCH) --site $(SITE) \
+		$(if $(FORCE),--force,)
 
 deploy-kvm:  ## Deploy KVM digital twin (bridges + router-vm + RHEL VMs + NMState) - requires ARCH, optional SITE, KVM_BASE_IMAGE
 	$(call check_arch,$@)
