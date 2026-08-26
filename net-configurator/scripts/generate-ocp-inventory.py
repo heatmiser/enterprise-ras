@@ -140,9 +140,18 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role):
     """Return nmstate networkConfig dict for a node."""
     common     = site_vars.get("common", {})
     ifaces_map = device_data.get("interfaces", {})
+    nic_map    = device_data.get("nic_map", {})
     interfaces = []
     routes     = []
     rules      = []
+
+    def _bond_members(profile_key):
+        """Return bond member NIC names, preferring kernel names from nic_map."""
+        if nic_map:
+            entries = nic_map.get(profile_key, [])
+            if entries:
+                return [e["kernel"] for e in entries]
+        return ifaces_map.get(profile_key, [])
 
     def _bond(members, cidr, gateway):
         if not (cidr and members):
@@ -167,20 +176,20 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role):
             })
 
     if ocp_role in ("control_plane", "infra"):
-        members = ifaces_map.get("support") or ifaces_map.get("cpu", [])
+        members = _bond_members("support") or _bond_members("cpu")
         cidr    = device_data.get("bond_ip1") or device_data.get("bond_ip")
         gw      = common.get("support_gateway") or common.get("cpu_gateway")
         _bond(members, cidr, gw)
 
     elif ocp_role == "worker_gpu":
-        _bond(ifaces_map.get("cpu", []),
+        _bond(_bond_members("cpu"),
               device_data.get("bond_ip"),
               common.get("cpu_gateway"))
-        # GPU rail interfaces (eth3+) are intentionally excluded from the ABI
-        # networkConfig.  They are applied post-install via NNCP CRs in ocp/day2/.
+        # GPU rail interfaces are intentionally excluded from ABI networkConfig;
+        # applied post-install via NNCP CRs in ocp/day2/.
 
     elif ocp_role == "worker_storage":
-        members = ifaces_map.get("storage", [])
+        members = _bond_members("storage")
         cidr    = device_data.get("bond_ip1") or device_data.get("bond_ip")
         gw      = common.get("storage_gateway") or common.get("cpu_gateway")
         _bond(members, cidr, gw)
@@ -206,16 +215,23 @@ def _build_gpu_rail_desiredstate(device_data, site_vars):
     NIC) and the flat gpu_ips fallback (assigns routing tables 901-904 sequentially
     to match the per_rail VLAN numbering).  Returns None when no GPU data is present.
     """
-    common         = site_vars.get("common", {})
-    ifaces_map     = device_data.get("interfaces", {})
+    common          = site_vars.get("common", {})
+    ifaces_map      = device_data.get("interfaces", {})
+    nic_map         = device_data.get("nic_map", {})
     gpu_ifaces_list = device_data.get("gpu_interfaces")
-    gpu_ips_list   = device_data.get("gpu_ips")
-    gpu_nic_names  = ifaces_map.get("gpu", [])
+    gpu_ips_list    = device_data.get("gpu_ips")
+    gpu_nic_names   = ifaces_map.get("gpu", [])
+
+    # Kernel NIC names for GPU rails (from Wire Map col K), ordered by Wire Map row.
+    gpu_kernel_names = [e["kernel"] for e in nic_map.get("gpu", []) if e.get("kernel")]
 
     interfaces, routes, rules = [], [], []
 
     if gpu_ifaces_list:
-        for gi in gpu_ifaces_list:
+        for i, gi in enumerate(gpu_ifaces_list):
+            gi = dict(gi)
+            if i < len(gpu_kernel_names):
+                gi["iface"] = gpu_kernel_names[i]
             nic_ip, nic_prefix = _parse_cidr(gi["ip"])
             interfaces.append({
                 "name": gi["iface"],
@@ -427,11 +443,22 @@ def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch):
         mac            = device_data.get("mac")
         network_config = build_nmstate_network_config(device_data, site_vars, ocp_role)
 
+        nic_map = device_data.get("nic_map", {})
+        if nic_map:
+            hw_interfaces = [
+                {"name": entry["kernel"], "macAddress": entry["mac"]}
+                for entries in nic_map.values()
+                for entry in entries
+                if entry.get("kernel") and entry.get("mac")
+            ]
+        else:
+            hw_interfaces = [{"name": "eth0", "macAddress": mac}] if mac else []
+
         agent_hosts.append({
             "hostname":        hostname,
             "role":            INSTALLER_ROLE[ocp_role],
             "rootDeviceHints": {"deviceName": disk},
-            "interfaces":      [{"name": "eth0", "macAddress": mac}] if mac else [],
+            "interfaces":      hw_interfaces,
             "networkConfig":   network_config,
         })
 
