@@ -358,6 +358,40 @@ def build_interface_map(rows, node_name: str) -> dict:
     return dict(result)
 
 
+def build_nic_map(rows, node_name: str) -> dict:
+    """Build {profile_category: [{kernel, mac}]} from Wire Map rows with K/L data.
+
+    Uses the 'kernel_nic' and 'nic_mac' keys added by _build_wiremap_row_list()
+    when columns K (Kernel NIC Name) and L (MAC Address) are present in the
+    Wire Map sheet.  Rows without a kernel_nic value (BMC, iDRAC) are skipped.
+
+    Returns an empty dict when no K/L data is present (e.g. KVM-only Excels).
+
+    Args:
+        rows: list of Wire Map row dicts, same format as build_interface_map().
+        node_name: hostname to filter on (A-side system_name).
+
+    Returns:
+        {'cpu': [{'kernel': 'ens3f0np0', 'mac': '04:3F:72:01:02:00'}, ...],
+         'oob': [...], 'gpu': [...], ...}
+    """
+    result = defaultdict(list)
+    seen = set()
+    for r in rows:
+        if r.get('system_name') != node_name:
+            continue
+        if is_switch(r.get('system_role', '')):
+            continue
+        kernel = (r.get('kernel_nic') or '').strip()
+        if not kernel or kernel in seen:
+            continue
+        seen.add(kernel)
+        mac     = (r.get('nic_mac') or '').strip()
+        profile = classify_net_profile(r.get('net_profile', ''))
+        result[profile].append({'kernel': kernel, 'mac': mac})
+    return dict(result)
+
+
 _PLANE_RE = re.compile(r'-plane(\d+)(?:-|$)')
 
 

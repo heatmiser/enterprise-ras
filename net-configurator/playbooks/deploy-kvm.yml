@@ -1,0 +1,614 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# KVM Digital Twin Deployment
+# ────────────────────────────
+# Creates a local KVM-based digital twin of an ERA cluster to validate NMState
+# config generation without running a full OCP ABI install.
+#
+# Prerequisites:
+#   1. make generate ARCH=... SITE=...       → ERA inventory
+#   2. make generate-ocp ARCH=... SITE=...   → NMState / NNCP files
+#   3. RHEL9 or AlmaLinux 9 GenericCloud qcow2 staged on KVM host at kvm_base_image
+#   4. libvirt + qemu-kvm + genisoimage installed on KVM host
+#
+# NIC naming assumption:
+#   KVM virtio NICs on x86 q35 VMs are named enp<N>s0 in PCI-slot order.
+#   1st --network arg → enp1s0 (management), 2nd → enp2s0, 3rd → enp3s0, …
+#   NMState configs generated with eth1/eth2/eth3… are patched to enp2s0/enp3s0/enp4s0…
+#   before application.  If your base image uses different NIC naming, override
+#   kvm_nic_map in the extra-vars.
+#
+# Bridge layout (flat bridges, one per logical subnet):
+#   br-dt-mgmt    — 192.168.200.0/24  — management (Ansible access)
+#   br-dt-inband  — 10.78.221.0/24    — GPU nodes bond0 (VRF_INBAND)
+#   br-dt-support — 10.78.220.32/27   — k8s nodes bond0 (VRF_INBAND)
+#   br-dt-rail1   — 192.168.1.0/24    — GPU rail 1 (VRF_GPU)
+#   br-dt-rail2   — 192.168.2.0/24    — GPU rail 2 (VRF_GPU)
+#   br-dt-rail3   — 192.168.3.0/24    — GPU rail 3 (VRF_GPU)
+#   br-dt-rail4   — 192.168.4.0/24    — GPU rail 4 (VRF_GPU)
+#
+# Usage:
+#   make deploy-kvm ARCH=2-8-5-200 SITE=kicktires \
+#     KVM_BASE_IMAGE=/var/lib/libvirt/images/AlmaLinux-9-GenericCloud.qcow2
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Play 1 — KVM host: bridges, images, VMs
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "KVM digital twin — infrastructure setup"
+  hosts: "{{ kvm_host | default('localhost') }}"
+  gather_facts: false
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/vars/deploy-kvm-defaults.yml"
+  vars:
+    _nc_ocp_out: "{{ (playbook_dir + '/../output/' + nc_arch + '/' + nc_site + '/ocp') | realpath }}"
+    _tmpl_dir: "{{ (playbook_dir + '/../templates') | realpath }}"
+    _dt_bridges:
+      - name: br-dt-mgmt
+        host_ip: "{{ kvm_mgmt_host_ip }}"
+      - name: br-dt-inband
+        host_ip: null
+      - name: br-dt-support
+        host_ip: null
+      - name: br-dt-rail1
+        host_ip: null
+      - name: br-dt-rail2
+        host_ip: null
+      - name: br-dt-rail3
+        host_ip: null
+      - name: br-dt-rail4
+        host_ip: null
+
+  tasks:
+
+    # ── Validate prerequisites ─────────────────────────────────────────────
+    - name: "Verify nc_arch and nc_site are set"
+      ansible.builtin.assert:
+        that:
+          - nc_arch is defined and nc_arch | length > 0
+          - nc_site is defined and nc_site | length > 0
+        fail_msg: "nc_arch and nc_site are required — pass via Makefile or -e nc_arch=... nc_site=..."
+
+    - name: "Verify OCP output exists"
+      ansible.builtin.stat:
+        path: "{{ _nc_ocp_out }}/inventory/hosts.yml"
+      register: _ocp_hosts_stat
+
+    - name: "Fail if OCP output not found"
+      ansible.builtin.fail:
+        msg: >-
+          OCP output not found at {{ _nc_ocp_out }}/inventory/hosts.yml —
+          run 'make generate-ocp ARCH={{ nc_arch }} SITE={{ nc_site }}' first.
+      when: not _ocp_hosts_stat.stat.exists
+
+    - name: "Verify base image exists"
+      ansible.builtin.stat:
+        path: "{{ kvm_base_image }}"
+      register: _base_img_stat
+
+    - name: "Fail if base image not found"
+      ansible.builtin.fail:
+        msg: >-
+          KVM base image not found: {{ kvm_base_image }}
+          Set KVM_BASE_IMAGE=/path/to/rhel9.qcow2 or override kvm_base_image.
+      when: not _base_img_stat.stat.exists
+
+    # ── SSH keypair ────────────────────────────────────────────────────────
+    - name: "Load OCP variables if available"
+      ansible.builtin.include_vars:
+        file: "{{ _nc_ocp_out }}/inventory/group_vars/all/ocp.yml"
+        name: _ocp_group_vars
+      failed_when: false
+
+    - name: "Set effective kvm_ssh_key_path from OCP configuration"
+      ansible.builtin.set_fact:
+        kvm_ssh_key_path: "{{ (_ocp_group_vars.ocp_ssh_key_path | regex_replace('\\.pub$', '')) | expanduser }}"
+      when:
+        - _ocp_group_vars is defined
+        - _ocp_group_vars.ocp_ssh_key_path is defined
+        - _ocp_group_vars.ocp_ssh_key_path | length > 0
+
+    - name: "Generate digital twin SSH keypair"
+      ansible.builtin.command:
+        cmd: "ssh-keygen -t ed25519 -f {{ kvm_ssh_key_path }} -N ''"
+        creates: "{{ kvm_ssh_key_path }}"
+      become: false
+
+    - name: "Read SSH public key"
+      ansible.builtin.slurp:
+        src: "{{ kvm_ssh_key_path }}.pub"
+      register: _pubkey_raw
+      become: false
+
+    - name: "Set SSH public key fact"
+      ansible.builtin.set_fact:
+        _kvm_ssh_pubkey: "{{ _pubkey_raw.content | b64decode | trim }}"
+
+    # ── Image working directory ────────────────────────────────────────────
+    - name: "Ensure image working directory exists"
+      ansible.builtin.file:
+        path: "{{ kvm_image_dir }}"
+        state: directory
+        owner: qemu
+        group: qemu
+        mode: "0755"
+
+    # ── Linux bridges ──────────────────────────────────────────────────────
+    - name: "Create digital twin Linux bridges"
+      ansible.builtin.command:
+        cmd: "ip link add name {{ item.name }} type bridge stp_state 0"
+        creates: "/sys/class/net/{{ item.name }}"
+      loop: "{{ _dt_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: "Bring up digital twin bridges"
+      ansible.builtin.command:
+        cmd: "ip link set {{ item.name }} up"
+      loop: "{{ _dt_bridges }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: "Assign host IP to management bridge"
+      ansible.builtin.command:
+        cmd: "ip addr replace {{ kvm_mgmt_host_ip }} dev br-dt-mgmt"
+      changed_when: false
+
+    - name: "Enable management network outbound internet access"
+      when: kvm_mgmt_internet_access | default(true) | bool
+      ignore_errors: true
+      block:
+        - name: "Enable masquerade on firewalld public zone"
+          ansible.posix.firewalld:
+            masquerade: true
+            zone: public
+            state: enabled
+            permanent: true
+            immediate: true
+
+        - name: "Add management bridge subnet to firewalld trusted zone"
+          ansible.posix.firewalld:
+            source: "192.168.200.0/24"
+            zone: trusted
+            state: enabled
+            permanent: true
+            immediate: true
+
+    # ── Load OCP inventory ─────────────────────────────────────────────────
+    - name: "Load generated OCP inventory"
+      ansible.builtin.include_vars:
+        file: "{{ _nc_ocp_out }}/inventory/hosts.yml"
+        name: _ocp_inv
+
+    - name: "Build GPU node list (sorted for deterministic IP assignment)"
+      ansible.builtin.set_fact:
+        _gpu_nodes: >-
+          {{ _ocp_inv.all.children.ocp_worker_gpu.hosts | dict2items | sort(attribute='key') }}
+
+    - name: "Build k8s node list (sorted)"
+      ansible.builtin.set_fact:
+        _k8s_nodes: >-
+          {{ _ocp_inv.all.children.ocp_control_plane.hosts | dict2items | sort(attribute='key') }}
+
+    # ── Dynamically extract router gateway IPs & prefixes from generated OCP inventory ──
+    - name: "Read k8s control_plane host_vars for support gateway extraction"
+      ansible.builtin.slurp:
+        src: "{{ _nc_ocp_out }}/inventory/host_vars/{{ _k8s_nodes[0].key }}.yml"
+      register: _k8s_hv_slurp
+      when: _k8s_nodes | length > 0
+
+    - name: "Read GPU worker host_vars for inband gateway extraction"
+      ansible.builtin.slurp:
+        src: "{{ _nc_ocp_out }}/inventory/host_vars/{{ _gpu_nodes[0].key }}.yml"
+      register: _gpu_hv_slurp
+      when: _gpu_nodes | length > 0
+
+    - name: "Extract router support & inband gateway IPs from OCP host_vars"
+      ansible.builtin.set_fact:
+        kvm_router_support_ip: >-
+          {{ (_k8s_hv_slurp.content | default('') | b64decode | from_yaml).networkConfig.routes.config[0]['next-hop-address']
+             | default(kvm_router_support_ip) }}
+        kvm_router_support_prefix: >-
+          {{ ((_k8s_hv_slurp.content | default('') | b64decode | from_yaml).networkConfig.interfaces[0].ipv4.address[0]['prefix-length']
+             | default(24)) | string }}
+        kvm_router_inband_ip: >-
+          {{ (_gpu_hv_slurp.content | default('') | b64decode | from_yaml).networkConfig.routes.config[0]['next-hop-address']
+             | default(kvm_router_inband_ip) }}
+
+    # ── Router-vm ──────────────────────────────────────────────────────────
+    - name: "Create router-vm thin-provisioned image"
+      ansible.builtin.command:
+        cmd: >-
+          qemu-img create -b {{ kvm_base_image }} -F qcow2
+          -f qcow2 {{ kvm_image_dir }}/dt-router.qcow2
+        creates: "{{ kvm_image_dir }}/dt-router.qcow2"
+      changed_when: true
+
+    - name: "Generate router-vm cloud-init user-data"
+      ansible.builtin.template:
+        src: "{{ _tmpl_dir }}/kvm-router-cloud-init.j2"
+        dest: "{{ kvm_image_dir }}/cloud-init-dt-router.yaml"
+        mode: "0644"
+
+    - name: "Generate router-vm cloud-init meta-data"
+      ansible.builtin.copy:
+        content: "instance-id: dt-router\nlocal-hostname: dt-router\n"
+        dest: "{{ kvm_image_dir }}/meta-data-dt-router"
+        mode: "0644"
+
+    - name: "Generate router-vm cloud-init network-config"
+      ansible.builtin.template:
+        src: "{{ _tmpl_dir }}/kvm-network-config.j2"
+        dest: "{{ kvm_image_dir }}/network-config-dt-router"
+        mode: "0644"
+      vars:
+        _mgmt_ip: "{{ kvm_router_mgmt_ip }}/{{ kvm_mgmt_prefix }}"
+        _mgmt_gw: "{{ kvm_mgmt_gateway }}"
+
+    - name: "Build router-vm cloud-init ISO"
+      ansible.builtin.command:
+        cmd: >-
+          genisoimage -o {{ kvm_image_dir }}/cloud-init-dt-router.iso
+          -V cidata -joliet -rock -graft-points
+          user-data={{ kvm_image_dir }}/cloud-init-dt-router.yaml
+          meta-data={{ kvm_image_dir }}/meta-data-dt-router
+          network-config={{ kvm_image_dir }}/network-config-dt-router
+        creates: "{{ kvm_image_dir }}/cloud-init-dt-router.iso"
+      changed_when: true
+
+    - name: "Deploy router-vm via virt-install"
+      ansible.builtin.command:
+        cmd: >-
+          virt-install
+          --name dt-router
+          --memory {{ kvm_router_memory_mb }}
+          --vcpus {{ kvm_router_vcpus }}
+          --disk path={{ kvm_image_dir }}/dt-router.qcow2,bus=virtio,format=qcow2
+          --disk path={{ kvm_image_dir }}/cloud-init-dt-router.iso,device=cdrom,bus=sata
+          --noautoconsole --import
+          --os-variant {{ kvm_os_variant }}
+          --network bridge=br-dt-mgmt,model=virtio
+          --network bridge=br-dt-inband,model=virtio
+          --network bridge=br-dt-support,model=virtio
+          --network bridge=br-dt-rail1,model=virtio
+          --network bridge=br-dt-rail2,model=virtio
+          --network bridge=br-dt-rail3,model=virtio
+          --network bridge=br-dt-rail4,model=virtio
+        creates: "/etc/libvirt/qemu/dt-router.xml"
+      changed_when: true
+
+    # ── GPU server VMs ─────────────────────────────────────────────────────
+    - name: "Create GPU node thin-provisioned images"
+      ansible.builtin.command:
+        cmd: >-
+          qemu-img create -b {{ kvm_base_image }} -F qcow2
+          -f qcow2 {{ kvm_image_dir }}/{{ item.key }}.qcow2
+        creates: "{{ kvm_image_dir }}/{{ item.key }}.qcow2"
+      loop: "{{ _gpu_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: true
+
+    - name: "Generate GPU node cloud-init user-data"
+      ansible.builtin.template:
+        src: "{{ _tmpl_dir }}/kvm-server-cloud-init.j2"
+        dest: "{{ kvm_image_dir }}/cloud-init-{{ item.key }}.yaml"
+        mode: "0644"
+      vars:
+        _node_name: "{{ item.key }}"
+        _ocp_role: worker_gpu
+      loop: "{{ _gpu_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: "Generate GPU node cloud-init meta-data"
+      ansible.builtin.copy:
+        content: "instance-id: {{ item.key }}\nlocal-hostname: {{ item.key }}\n"
+        dest: "{{ kvm_image_dir }}/meta-data-{{ item.key }}"
+        mode: "0644"
+      loop: "{{ _gpu_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: "Generate GPU node cloud-init network-config"
+      ansible.builtin.template:
+        src: "{{ _tmpl_dir }}/kvm-network-config.j2"
+        dest: "{{ kvm_image_dir }}/network-config-{{ item.key }}"
+        mode: "0644"
+      vars:
+        _mgmt_ip: "192.168.200.{{ kvm_gpu_mgmt_base + idx + 1 }}/{{ kvm_mgmt_prefix }}"
+        _mgmt_gw: "{{ kvm_mgmt_gateway }}"
+      loop: "{{ _gpu_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+        index_var: idx
+
+    - name: "Build GPU node cloud-init ISOs"
+      ansible.builtin.command:
+        cmd: >-
+          genisoimage -o {{ kvm_image_dir }}/cloud-init-{{ item.key }}.iso
+          -V cidata -joliet -rock -graft-points
+          user-data={{ kvm_image_dir }}/cloud-init-{{ item.key }}.yaml
+          meta-data={{ kvm_image_dir }}/meta-data-{{ item.key }}
+          network-config={{ kvm_image_dir }}/network-config-{{ item.key }}
+        creates: "{{ kvm_image_dir }}/cloud-init-{{ item.key }}.iso"
+      loop: "{{ _gpu_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: true
+
+    - name: "Deploy GPU node VMs via virt-install"
+      ansible.builtin.command:
+        cmd: >-
+          virt-install
+          --name {{ item.key }}
+          --memory {{ kvm_vm_memory_mb }}
+          --vcpus {{ kvm_vm_vcpus }}
+          --disk path={{ kvm_image_dir }}/{{ item.key }}.qcow2,bus=virtio,format=qcow2
+          --disk path={{ kvm_image_dir }}/cloud-init-{{ item.key }}.iso,device=cdrom,bus=sata
+          --noautoconsole --import
+          --os-variant {{ kvm_os_variant }}
+          --network bridge=br-dt-mgmt,model=virtio
+          --network bridge=br-dt-inband,model=virtio
+          --network bridge=br-dt-inband,model=virtio
+          --network bridge=br-dt-rail1,model=virtio
+          --network bridge=br-dt-rail2,model=virtio
+          --network bridge=br-dt-rail3,model=virtio
+          --network bridge=br-dt-rail4,model=virtio
+        creates: "/etc/libvirt/qemu/{{ item.key }}.xml"
+      loop: "{{ _gpu_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: true
+
+    # ── k8s server VMs ─────────────────────────────────────────────────────
+    - name: "Create k8s node thin-provisioned images"
+      ansible.builtin.command:
+        cmd: >-
+          qemu-img create -b {{ kvm_base_image }} -F qcow2
+          -f qcow2 {{ kvm_image_dir }}/{{ item.key }}.qcow2
+        creates: "{{ kvm_image_dir }}/{{ item.key }}.qcow2"
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: true
+
+    - name: "Generate k8s node cloud-init user-data"
+      ansible.builtin.template:
+        src: "{{ _tmpl_dir }}/kvm-server-cloud-init.j2"
+        dest: "{{ kvm_image_dir }}/cloud-init-{{ item.key }}.yaml"
+        mode: "0644"
+      vars:
+        _node_name: "{{ item.key }}"
+        _ocp_role: control_plane
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: "Generate k8s node cloud-init meta-data"
+      ansible.builtin.copy:
+        content: "instance-id: {{ item.key }}\nlocal-hostname: {{ item.key }}\n"
+        dest: "{{ kvm_image_dir }}/meta-data-{{ item.key }}"
+        mode: "0644"
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+
+    - name: "Generate k8s node cloud-init network-config"
+      ansible.builtin.template:
+        src: "{{ _tmpl_dir }}/kvm-network-config.j2"
+        dest: "{{ kvm_image_dir }}/network-config-{{ item.key }}"
+        mode: "0644"
+      vars:
+        _mgmt_ip: "192.168.200.{{ kvm_k8s_mgmt_base + idx + 1 }}/{{ kvm_mgmt_prefix }}"
+        _mgmt_gw: "{{ kvm_mgmt_gateway }}"
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+        index_var: idx
+
+    - name: "Build k8s node cloud-init ISOs"
+      ansible.builtin.command:
+        cmd: >-
+          genisoimage -o {{ kvm_image_dir }}/cloud-init-{{ item.key }}.iso
+          -V cidata -joliet -rock -graft-points
+          user-data={{ kvm_image_dir }}/cloud-init-{{ item.key }}.yaml
+          meta-data={{ kvm_image_dir }}/meta-data-{{ item.key }}
+          network-config={{ kvm_image_dir }}/network-config-{{ item.key }}
+        creates: "{{ kvm_image_dir }}/cloud-init-{{ item.key }}.iso"
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: true
+
+    - name: "Deploy k8s node VMs via virt-install"
+      ansible.builtin.command:
+        cmd: >-
+          virt-install
+          --name {{ item.key }}
+          --memory {{ kvm_vm_memory_mb }}
+          --vcpus {{ kvm_vm_vcpus }}
+          --disk path={{ kvm_image_dir }}/{{ item.key }}.qcow2,bus=virtio,format=qcow2
+          --disk path={{ kvm_image_dir }}/cloud-init-{{ item.key }}.iso,device=cdrom,bus=sata
+          --noautoconsole --import
+          --os-variant {{ kvm_os_variant }}
+          --network bridge=br-dt-mgmt,model=virtio
+          --network bridge=br-dt-support,model=virtio
+          --network bridge=br-dt-support,model=virtio
+        creates: "/etc/libvirt/qemu/{{ item.key }}.xml"
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+      changed_when: true
+
+    # ── Register all VMs in in-memory inventory for Play 2 ────────────────
+    - name: "Register GPU VMs in in-memory inventory"
+      ansible.builtin.add_host:
+        name: "{{ item.key }}"
+        ansible_host: "192.168.200.{{ kvm_gpu_mgmt_base + idx + 1 }}"
+        ansible_user: "{{ kvm_vm_user }}"
+        ansible_ssh_private_key_file: "{{ kvm_ssh_key_path }}"
+        groups: kvm_servers
+        _dt_ocp_role: worker_gpu
+        _dt_ocp_out: "{{ _nc_ocp_out }}"
+      loop: "{{ _gpu_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+        index_var: idx
+
+    - name: "Register k8s VMs in in-memory inventory"
+      ansible.builtin.add_host:
+        name: "{{ item.key }}"
+        ansible_host: "192.168.200.{{ kvm_k8s_mgmt_base + idx + 1 }}"
+        ansible_user: "{{ kvm_vm_user }}"
+        ansible_ssh_private_key_file: "{{ kvm_ssh_key_path }}"
+        groups: kvm_servers
+        _dt_ocp_role: control_plane
+        _dt_ocp_out: "{{ _nc_ocp_out }}"
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+        index_var: idx
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Play 2 — Server VMs: wait for boot, apply NMState
+# ══════════════════════════════════════════════════════════════════════════════
+- name: "KVM digital twin — apply NMState to server VMs"
+  hosts: kvm_servers
+  gather_facts: false
+  become: true
+  vars_files:
+    - "{{ playbook_dir }}/vars/deploy-kvm-defaults.yml"
+  vars:
+    # Substitution map: generated NMState uses ethN; KVM qcow2 VMs use eth0 (mgmt) and eth1-eth6 (data).
+    _nic_subs:
+      eth6: eth6
+      eth5: eth5
+      eth4: eth4
+      eth3: eth3
+      eth2: eth2
+      eth1: eth1
+
+  tasks:
+
+    - name: "Wait for VM SSH to become available"
+      ansible.builtin.wait_for_connection:
+        connect_timeout: 10
+        sleep: 10
+        delay: 30
+        timeout: 600
+
+    - name: "Wait for cloud-init to complete"
+      ansible.builtin.command:
+        cmd: cloud-init status --wait
+      changed_when: false
+      failed_when: false
+
+    - name: "Ensure CRB repository and nmstate package are installed"
+      ansible.builtin.dnf:
+        name: nmstate
+        enablerepo: crb
+        state: present
+
+    # ── Stage 1: bond0 NMState ─────────────────────────────────────────────
+    - name: "Read Stage 1 NMState host_vars from control node"
+      ansible.builtin.slurp:
+        src: "{{ _dt_ocp_out }}/inventory/host_vars/{{ inventory_hostname }}.yml"
+      register: _hv_raw
+      delegate_to: localhost
+      become: false
+
+    - name: "Parse host_vars and extract networkConfig"
+      ansible.builtin.set_fact:
+        _nmstate_s1_raw: "{{ (_hv_raw.content | b64decode | from_yaml).networkConfig | to_yaml }}"
+
+    - name: "Substitute KVM NIC names in Stage 1 NMState"
+      ansible.builtin.set_fact:
+        _nmstate_s1: >-
+          {{ _nmstate_s1_raw
+             | replace('eth6', _nic_subs.eth6)
+             | replace('eth5', _nic_subs.eth5)
+             | replace('eth4', _nic_subs.eth4)
+             | replace('eth3', _nic_subs.eth3)
+             | replace('eth2', _nic_subs.eth2)
+             | replace('eth1', _nic_subs.eth1) }}
+
+    - name: "Write Stage 1 NMState to VM"
+      ansible.builtin.copy:
+        content: "{{ _nmstate_s1 }}"
+        dest: /tmp/nmstate-stage1.yml
+        mode: "0644"
+
+    - name: "Apply Stage 1 NMState (bond0)"
+      ansible.builtin.command:
+        cmd: nmstatectl apply /tmp/nmstate-stage1.yml
+      changed_when: true
+      register: _nmstate_s1_result
+
+    - name: "Report Stage 1 result"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Stage 1 NMState applied (bond0)"
+      when: _nmstate_s1_result.rc == 0
+
+    # ── Stage 2: GPU rail NMState (GPU nodes only) ─────────────────────────
+    - name: "Read Stage 2 NNCP from control node"
+      ansible.builtin.slurp:
+        src: "{{ _dt_ocp_out }}/day2/nncp-{{ inventory_hostname }}-gpu-rails.yaml"
+      register: _nncp_raw
+      delegate_to: localhost
+      become: false
+      when: _dt_ocp_role == 'worker_gpu'
+
+    - name: "Extract desiredState from NNCP and substitute KVM NIC names"
+      ansible.builtin.set_fact:
+        _nmstate_s2: >-
+          {{ ((_nncp_raw.content | b64decode | from_yaml).spec.desiredState | to_yaml)
+             | replace('eth6', _nic_subs.eth6)
+             | replace('eth5', _nic_subs.eth5)
+             | replace('eth4', _nic_subs.eth4)
+             | replace('eth3', _nic_subs.eth3) }}
+      when: _dt_ocp_role == 'worker_gpu'
+
+    - name: "Write Stage 2 NMState to VM"
+      ansible.builtin.copy:
+        content: "{{ _nmstate_s2 }}"
+        dest: /tmp/nmstate-stage2.yml
+        mode: "0644"
+      when: _dt_ocp_role == 'worker_gpu'
+
+    - name: "Apply Stage 2 NMState (GPU rails)"
+      ansible.builtin.command:
+        cmd: nmstatectl apply /tmp/nmstate-stage2.yml
+      changed_when: true
+      when: _dt_ocp_role == 'worker_gpu'
+      register: _nmstate_s2_result
+
+    - name: "Report Stage 2 result"
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }}: Stage 2 NMState applied (GPU rails)"
+      when: _dt_ocp_role == 'worker_gpu' and _nmstate_s2_result.rc == 0
+
+    # ── Smoke test: ping default gateway via bond0 ─────────────────────────
+    - name: "Read gateway IP for smoke test"
+      ansible.builtin.set_fact:
+        _bond0_gw: >-
+          {{ ((_hv_raw.content | b64decode | from_yaml).networkConfig.routes.config
+              | selectattr('next-hop-interface', 'equalto', 'bond0')
+              | first)['next-hop-address'] }}
+
+    - name: "Smoke test — ping bond0 gateway"
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 3 -I bond0 {{ _bond0_gw }}"
+      changed_when: false
+      register: _gw_ping
+      failed_when: false
+
+    - name: "Report gateway ping"
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: bond0 gateway {{ _bond0_gw }}
+          {{ 'REACHABLE' if _gw_ping.rc == 0 else 'UNREACHABLE' }}
+...

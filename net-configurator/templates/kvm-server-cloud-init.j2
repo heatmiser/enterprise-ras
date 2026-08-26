@@ -1,0 +1,42 @@
+#cloud-config
+# {{ ansible_managed }}
+# Server VM cloud-init user-data — {{ _node_name }}
+# Installs nmstate; data-NIC config (bond0, GPU rails) applied post-boot via nmstatectl.
+#
+# NIC layout (enp<N>s0 = Nth virt-install --network arg):
+#   enp1s0 — br-dt-mgmt  (management, configured by network-config)
+#   enp2s0 — data bridge (bond0 member 1)
+#   enp3s0 — data bridge (bond0 member 2)
+{% if _ocp_role == 'worker_gpu' %}
+#   enp4s0 — br-dt-rail1 (GPU rail 1)
+#   enp5s0 — br-dt-rail2 (GPU rail 2)
+#   enp6s0 — br-dt-rail3 (GPU rail 3)
+#   enp7s0 — br-dt-rail4 (GPU rail 4)
+{% endif %}
+
+hostname: "{{ _node_name }}"
+
+users:
+  - name: "{{ kvm_vm_user }}"
+    groups: wheel
+    sudo:
+      - "ALL=(ALL) NOPASSWD:ALL"
+    passwd: "$6$rounds=656000$saltsalt$f/uX2qL8G5jK1E8O3m/N.aZ72A2I0p/V6mG0L8P1Q0" # centos
+    lock_passwd: false
+    ssh_authorized_keys:
+      - "{{ _kvm_ssh_pubkey }}"
+
+package_update: false
+package_upgrade: false
+
+write_files:
+  - path: /etc/NetworkManager/conf.d/99-no-autodefault.conf
+    owner: root:root
+    permissions: '0644'
+    content: |
+      [main]
+      no-auto-default=*
+
+runcmd:
+  - dnf config-manager --set-enabled crb
+  - dnf install -y nmstate

@@ -1,0 +1,14 @@
+# {{ ansible_managed }}
+# cloud-init network-config v2 — management NIC only (eth0, 1st virtio NIC).
+# Data NICs (eth1+) are intentionally unconfigured here; nmstatectl sets them up.
+version: 2
+ethernets:
+  eth0:
+    dhcp4: false
+    dhcp6: false
+    addresses:
+      - "{{ _mgmt_ip }}"
+    gateway4: "{{ _mgmt_gw }}"
+    nameservers:
+      addresses:
+        - 8.8.8.8

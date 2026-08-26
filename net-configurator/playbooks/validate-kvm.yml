@@ -1,0 +1,175 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Standalone KVM Digital Twin Network Validation Playbook
+# Executes cross-server ping matrices following the fp-lab-network-automation testbed-validate model:
+#   1. Inband bond0 gateway reachability test
+#   2. Inband bond0 cross-server ping matrix (every server -> all other servers)
+#   3. GPU Rail cross-server ping matrix (every GPU worker -> all other GPU workers across Rail 1-4)
+#
+# Usage:
+#   make validate-kvm ARCH=2-8-5-200 SITE=kvm-ocp
+#   ansible-playbook -i localhost, playbooks/validate-kvm.yml -e nc_arch=2-8-5-200 -e nc_site=kvm-ocp
+
+- name: "KVM digital twin — prepare validation inventory"
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  vars_files:
+    - "{{ playbook_dir }}/vars/deploy-kvm-defaults.yml"
+  tasks:
+    - name: "Verify nc_arch and nc_site are set"
+      ansible.builtin.assert:
+        that:
+          - nc_arch is defined and nc_arch | length > 0
+          - nc_site is defined and nc_site | length > 0
+        fail_msg: "nc_arch and nc_site are required — pass via Makefile or -e nc_arch=... nc_site=..."
+
+    - name: "Set output directory fact"
+      ansible.builtin.set_fact:
+        _nc_ocp_out: "{{ playbook_dir }}/../output/{{ nc_arch }}/{{ nc_site }}/ocp"
+
+    - name: "Load OCP variables if available"
+      ansible.builtin.include_vars:
+        file: "{{ _nc_ocp_out }}/inventory/group_vars/all/ocp.yml"
+        name: _ocp_group_vars
+      failed_when: false
+
+    - name: "Set effective kvm_ssh_key_path from OCP configuration"
+      ansible.builtin.set_fact:
+        kvm_ssh_key_path: "{{ (_ocp_group_vars.ocp_ssh_key_path | regex_replace('\\.pub$', '')) | expanduser }}"
+      when:
+        - _ocp_group_vars is defined
+        - _ocp_group_vars.ocp_ssh_key_path is defined
+        - _ocp_group_vars.ocp_ssh_key_path | length > 0
+
+    - name: "Load generated OCP inventory"
+      ansible.builtin.include_vars:
+        file: "{{ _nc_ocp_out }}/inventory/hosts.yml"
+        name: _ocp_inv
+
+    - name: "Build GPU node list"
+      ansible.builtin.set_fact:
+        _gpu_nodes: >-
+          {{ _ocp_inv.all.children.ocp_worker_gpu.hosts | dict2items | sort(attribute='key') }}
+
+    - name: "Build k8s node list"
+      ansible.builtin.set_fact:
+        _k8s_nodes: >-
+          {{ _ocp_inv.all.children.ocp_control_plane.hosts | dict2items | sort(attribute='key') }}
+
+    - name: "Register GPU VMs in in-memory inventory"
+      ansible.builtin.add_host:
+        name: "{{ item.key }}"
+        ansible_host: "192.168.200.{{ kvm_gpu_mgmt_base + idx + 1 }}"
+        ansible_user: "{{ kvm_vm_user }}"
+        ansible_ssh_private_key_file: "{{ kvm_ssh_key_path }}"
+        groups: kvm_servers, kvm_gpu_nodes
+        _dt_ocp_role: worker_gpu
+        _dt_ocp_out: "{{ _nc_ocp_out }}"
+      loop: "{{ _gpu_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+        index_var: idx
+
+    - name: "Register k8s VMs in in-memory inventory"
+      ansible.builtin.add_host:
+        name: "{{ item.key }}"
+        ansible_host: "192.168.200.{{ kvm_k8s_mgmt_base + idx + 1 }}"
+        ansible_user: "{{ kvm_vm_user }}"
+        ansible_ssh_private_key_file: "{{ kvm_ssh_key_path }}"
+        groups: kvm_servers, kvm_k8s_nodes
+        _dt_ocp_role: control_plane
+        _dt_ocp_out: "{{ _nc_ocp_out }}"
+      loop: "{{ _k8s_nodes }}"
+      loop_control:
+        label: "{{ item.key }}"
+        index_var: idx
+
+- name: "KVM digital twin — cross-server network validation"
+  hosts: kvm_servers
+  gather_facts: false
+  become: false
+  tasks:
+    - name: "Read Stage 1 NMState host_vars from control node"
+      ansible.builtin.slurp:
+        src: "{{ _dt_ocp_out }}/inventory/host_vars/{{ inventory_hostname }}.yml"
+      register: _hv_raw
+      delegate_to: localhost
+
+    - name: "Extract bond0 inband IP and gateway"
+      ansible.builtin.set_fact:
+        _srv_bond0_ip: "{{ (_hv_raw.content | b64decode | from_yaml).networkConfig.interfaces[0].ipv4.address[0].ip }}"
+        _srv_bond0_gw: "{{ (_hv_raw.content | b64decode | from_yaml).networkConfig.routes.config[0]['next-hop-address'] }}"
+
+    - name: "Gather inband IPs across all server nodes"
+      ansible.builtin.set_fact:
+        _all_inband_ips: "{{ groups['kvm_servers'] | map('extract', hostvars, '_srv_bond0_ip') | list }}"
+
+    - name: "Validate bond0 gateway reachability"
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 3 {{ _srv_bond0_gw }}"
+      register: _gw_ping
+      until: _gw_ping.rc == 0
+      retries: 6
+      delay: 5
+      changed_when: false
+
+    - name: "Validate inband bond0 cross-server ping matrix (all-to-all)"
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 3 {{ item }}"
+      loop: "{{ _all_inband_ips | reject('equalto', _srv_bond0_ip) | list }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _inband_matrix_ping
+      until: _inband_matrix_ping.rc == 0
+      retries: 6
+      delay: 5
+      changed_when: false
+
+    - name: "Display inband cross-server ping matrix summary"
+      ansible.builtin.debug:
+        msg: "✅ {{ inventory_hostname }} ({{ _srv_bond0_ip }}) -> {{ item.item }}: REACHABLE"
+      loop: "{{ _inband_matrix_ping.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+- name: "KVM digital twin — GPU rail cross-server validation"
+  hosts: kvm_gpu_nodes
+  gather_facts: false
+  become: false
+  tasks:
+    - name: "Read Stage 2 NNCP rail file"
+      ansible.builtin.slurp:
+        src: "{{ _dt_ocp_out }}/day2/nncp-{{ inventory_hostname }}-gpu-rails.yaml"
+      register: _nncp_raw
+      delegate_to: localhost
+
+    - name: "Extract GPU rail IPs"
+      ansible.builtin.set_fact:
+        _gpu_rail_ips: "{{ (_nncp_raw.content | b64decode | from_yaml).spec.desiredState.interfaces | selectattr('ipv4.address', 'defined') | map(attribute='ipv4.address') | map('first') | map(attribute='ip') | list }}"
+
+    - name: "Gather all GPU nodes' rail IPs"
+      ansible.builtin.set_fact:
+        _all_gpu_rail_ips: "{{ groups['kvm_gpu_nodes'] | map('extract', hostvars, '_gpu_rail_ips') | flatten | list }}"
+
+    - name: "Validate GPU rail cross-server ping matrix (all-to-all)"
+      ansible.builtin.command:
+        cmd: "ping -c 2 -W 3 {{ item }}"
+      loop: "{{ _all_gpu_rail_ips | difference(_gpu_rail_ips) | list }}"
+      loop_control:
+        label: "{{ item }}"
+      register: _rail_matrix_ping
+      until: _rail_matrix_ping.rc == 0
+      retries: 6
+      delay: 5
+      changed_when: false
+
+    - name: "Display GPU rail cross-server ping matrix summary"
+      ansible.builtin.debug:
+        msg: "✅ {{ inventory_hostname }} -> GPU Rail {{ item.item }}: REACHABLE"
+      loop: "{{ _rail_matrix_ping.results }}"
+      loop_control:
+        label: "{{ item.item }}"
