@@ -82,6 +82,7 @@ endif
 # Default site if still not set
 SITE ?= default
 NIC_MODE ?= real-hw
+SERVER_OS ?= ubuntu
 
 INPUT_XLSX        = input/$(ARCH)/$(SITE)/$(ARCH).xlsx
 INVENTORY_DIR     = output/$(ARCH)/$(SITE)/inventory
@@ -565,8 +566,8 @@ ifdef AIR_SWITCHES_ONLY
 endif
 	@echo "✅ Air topology generated"
 	@echo ""
-	@echo "Step 4: Generating Node Instruction scripts..."
-	python3 scripts/generate-node-instructions.py --arch $(ARCH) --site $(SITE)
+	@echo "Step 4: Generating Node Instruction scripts (server-os=$(SERVER_OS))..."
+	python3 scripts/generate-node-instructions.py --arch $(ARCH) --site $(SITE) --server-os $(SERVER_OS)
 	@echo "✅ Node Instructions generated"
 	@echo ""
 ifdef SWITCHES_ONLY
