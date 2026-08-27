@@ -14,7 +14,7 @@ SHELL := /bin/bash
         validate-ping-matrix validate-requirements extract-requirements \
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
-        deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm
+        deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -535,7 +535,7 @@ generate:  ## Generate inventory + switch configs + Air topology - requires ARCH
 	@echo "✅ CLI configurations generated in $(CONFIG_OUTPUT_DIR)/"
 	@echo ""
 	@echo "Step 3: Generating Air topology..."
-	python3 scripts/topology_generator.py generate --arch $(ARCH) --site $(SITE) $(if $(SWITCHES_ONLY),--switches-only,)
+	python3 scripts/topology_generator.py generate --arch $(ARCH) --site $(SITE) $(if $(SERVER_IMAGE),--server-image $(SERVER_IMAGE),) $(if $(SWITCHES_ONLY),--switches-only,)
 	@if [ -n "$(SWITCHES_ONLY)" ]; then touch "output/$(ARCH)/$(SITE)/.switches-only"; \
 	 else rm -f "output/$(ARCH)/$(SITE)/.switches-only"; fi
 ifdef SWITCHES_ONLY
@@ -646,6 +646,30 @@ teardown-kvm:  ## Teardown KVM digital twin (destroy VMs, bridges, storage)
 	ansible-playbook -i localhost, playbooks/teardown-kvm.yml \
 		$(if $(KVM_IMAGE_DIR),-e kvm_image_dir=$(KVM_IMAGE_DIR),) \
 		--ask-become-pass
+
+validate-air-fabric: ## Stage 1: Deploy ERA fabric with RHCOS VMs in Air and run ping matrix
+	$(call check_ansible)
+	@test -n "$(ARCH)" || { echo "❌ ERROR: ARCH is required (e.g. make validate-air-fabric ARCH=2-8-5-200)"; exit 1; }
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo "  Stage 1 ERA Air Fabric Validation  arch=$(ARCH)  site=$(SITE)"
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@$(MAKE) --no-print-directory generate \
+		ARCH=$(ARCH) SITE=$(SITE) \
+		SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack)
+	@$(MAKE) --no-print-directory generate-ocp \
+		ARCH=$(ARCH) SITE=$(SITE) NIC_MODE=kvm
+	python3 scripts/generate-node-instructions.py \
+		--arch $(ARCH) --site $(SITE) --server-os rhcos
+	python3 scripts/upload_rhcos_image.py \
+		--ocp-version $(or $(OCP_VERSION),4.22) \
+		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack)
+	python3 scripts/air-deploy.py \
+		--arch $(ARCH) --site $(SITE) --no-ztp
+	ansible-playbook playbooks/validate-ping-matrix.yml \
+		-i output/$(ARCH)/$(SITE)/inventory/hosts \
+		$(if $(SITE_VARS),-e @$(SITE_VARS),) \
+		-e ansible_user=$(or $(SERVER_ANSIBLE_USER),core) \
+		-e arch=$(ARCH) -e site=$(SITE)
 
 topology:  ## Generate Air topology only - requires ARCH, optional SITE
 	$(call check_arch,$@)

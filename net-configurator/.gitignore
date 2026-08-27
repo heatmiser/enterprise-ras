@@ -43,6 +43,7 @@ Thumbs.db
 *.log
 
 # Local testing
+.cache/
 .pytest_cache/
 .coverage
 htmlcov/
