@@ -73,6 +73,19 @@ GPU_RAIL_TABLE_BASE = 900
 
 OCP_ROLES = ("control_plane", "infra", "worker_gpu", "worker_storage")
 
+_KVM_PROFILE_ORDER = ("oob", "cpu", "gpu", "support", "storage")
+
+
+def _kvm_offset_for_profile(nic_map, profile_key):
+    """Return starting ethN index for profile_key based on canonical profile order."""
+    offset = 0
+    for key in _KVM_PROFILE_ORDER:
+        if key == profile_key:
+            break
+        offset += len(nic_map.get(key, []))
+    return offset
+
+
 INSTALLER_ROLE = {
     "control_plane": "master",
     "infra":         "worker",
@@ -136,7 +149,7 @@ def resolve_disk(hostname, ocp_role, arch, overrides):
 # NMState network config (mirrors era-ocp-configurator build_nmstate_network_config)
 # ---------------------------------------------------------------------------
 
-def build_nmstate_network_config(device_data, site_vars, ocp_role):
+def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="real-hw"):
     """Return nmstate networkConfig dict for a node."""
     common     = site_vars.get("common", {})
     ifaces_map = device_data.get("interfaces", {})
@@ -146,11 +159,15 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role):
     rules      = []
 
     def _bond_members(profile_key):
-        """Return bond member NIC names, preferring kernel names from nic_map."""
-        if nic_map:
+        """Return bond member NIC names, handling real-hw vs kvm mode."""
+        if nic_map and nic_mode == "real-hw":
             entries = nic_map.get(profile_key, [])
             if entries:
                 return [e["kernel"] for e in entries]
+        elif nic_map and nic_mode == "kvm":
+            offset = _kvm_offset_for_profile(nic_map, profile_key)
+            count = len(nic_map.get(profile_key, []))
+            return [f"eth{offset + i}" for i in range(count)]
         return ifaces_map.get(profile_key, [])
 
     def _bond(members, cidr, gateway):
@@ -208,7 +225,7 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role):
 # Stage-2 GPU rail config (NodeNetworkConfigurationPolicy)
 # ---------------------------------------------------------------------------
 
-def _build_gpu_rail_desiredstate(device_data, site_vars):
+def _build_gpu_rail_desiredstate(device_data, site_vars, nic_mode="real-hw"):
     """Return nmstate desiredState dict for GPU rail interfaces only.
 
     Handles both the structured gpu_interfaces list (explicit gateway + table per
@@ -223,7 +240,12 @@ def _build_gpu_rail_desiredstate(device_data, site_vars):
     gpu_nic_names   = ifaces_map.get("gpu", [])
 
     # Kernel NIC names for GPU rails (from Wire Map col K), ordered by Wire Map row.
-    gpu_kernel_names = [e["kernel"] for e in nic_map.get("gpu", []) if e.get("kernel")]
+    if nic_mode == "kvm" and nic_map:
+        gpu_offset = _kvm_offset_for_profile(nic_map, "gpu")
+        gpu_count = len(gpu_ifaces_list) if gpu_ifaces_list else len(nic_map.get("gpu", []))
+        gpu_kernel_names = [f"eth{gpu_offset + i}" for i in range(gpu_count)]
+    else:
+        gpu_kernel_names = [e["kernel"] for e in nic_map.get("gpu", []) if e.get("kernel")]
 
     interfaces, routes, rules = [], [], []
 
@@ -296,12 +318,12 @@ def _build_gpu_rail_desiredstate(device_data, site_vars):
     return state or None
 
 
-def build_gpu_nncp(hostname, device_data, site_vars):
+def build_gpu_nncp(hostname, device_data, site_vars, nic_mode="real-hw"):
     """Return a NodeNetworkConfigurationPolicy CR dict for GPU rail interfaces.
 
     Returns None when the node has no GPU rail data (not a GPU node or data absent).
     """
-    desired_state = _build_gpu_rail_desiredstate(device_data, site_vars)
+    desired_state = _build_gpu_rail_desiredstate(device_data, site_vars, nic_mode=nic_mode)
     if desired_state is None:
         return None
     return {
@@ -409,7 +431,7 @@ def build_ocp_group_vars(ocp_settings, site_vars, ocp_out_dir):
     }
 
 
-def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch):
+def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch, nic_mode="real-hw"):
     """Render agent-config.yaml dict."""
     devices  = site_vars.get("devices", {})
     overrides = {}
@@ -441,10 +463,23 @@ def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch):
 
         disk, _        = resolve_disk(hostname, ocp_role, arch, overrides)
         mac            = device_data.get("mac")
-        network_config = build_nmstate_network_config(device_data, site_vars, ocp_role)
+        network_config = build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode=nic_mode)
 
         nic_map = device_data.get("nic_map", {})
-        if nic_map:
+        if nic_mode == "kvm":
+            if nic_map:
+                all_entries = [
+                    entry for key in _KVM_PROFILE_ORDER
+                    for entry in nic_map.get(key, [])
+                    if entry.get("kernel")
+                ]
+                hw_interfaces = [
+                    {"name": f"eth{i}", "macAddress": entry.get("mac", "")}
+                    for i, entry in enumerate(all_entries)
+                ]
+            else:
+                hw_interfaces = [{"name": "eth0", "macAddress": mac}] if mac else []
+        elif nic_map:
             hw_interfaces = [
                 {"name": entry["kernel"], "macAddress": entry["mac"]}
                 for entries in nic_map.values()
@@ -531,6 +566,13 @@ def main():
     parser.add_argument("--site",  default="default", help="Site name (default: default)")
     parser.add_argument("--ocp-settings", default=None,
                         help="Path to ocp-settings.yml (default: input/<arch>/<site>/ocp-settings.yml)")
+    parser.add_argument(
+        "--nic-mode",
+        choices=("real-hw", "kvm"),
+        default="real-hw",
+        help="NIC naming mode: real-hw uses Wire Map K/L kernel names; "
+             "kvm uses eth0/eth1/ethN (virtio) for KVM and Air simulations.",
+    )
     args = parser.parse_args()
 
     base_dir   = Path("output") / args.arch / args.site
@@ -597,7 +639,7 @@ def main():
             continue
 
         ansible_host = era_host_vars.get(hostname, {}).get("ansible_host", "")
-        network_config = build_nmstate_network_config(device_data, site_vars, ocp_role)
+        network_config = build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode=args.nic_mode)
         disk, used_fallback = resolve_disk(hostname, ocp_role, args.arch, overrides)
         if used_fallback:
             fallback_disk_roles.add(ocp_role)
@@ -631,7 +673,7 @@ def main():
 
     # ── ABI manifests (require ocp-settings.yml) ──────────────────────────
     if ocp_settings:
-        agent_cfg  = build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, args.arch)
+        agent_cfg  = build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, args.arch, nic_mode=args.nic_mode)
         ac_path    = ocp_dir / "agent-config.yaml"
         write_yaml(ac_path, agent_cfg)
         print(f"  ✓ {ac_path}")
@@ -655,7 +697,7 @@ def main():
         device_data = devices.get(hostname)
         if device_data is None:
             continue
-        nncp = build_gpu_nncp(hostname, device_data, site_vars)
+        nncp = build_gpu_nncp(hostname, device_data, site_vars, nic_mode=args.nic_mode)
         if nncp:
             nncp_path = ocp_dir / "day2" / f"nncp-{hostname}-gpu-rails.yaml"
             write_yaml(nncp_path, nncp,
