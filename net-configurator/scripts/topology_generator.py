@@ -407,11 +407,12 @@ class TopologyGenerator:
     )
 
     def __init__(self, excel_path: Path, arch: str, site: str = "default",
-                 switches_only: bool = False):
+                 switches_only: bool = False, server_image: str | None = None):
         self.excel_path = excel_path
         self.arch = arch
         self.site = site
         self.switches_only = switches_only
+        self.server_image = server_image or SERVER_OS
 
         wb = openpyxl.load_workbook(excel_path, data_only=True)
         new_format = "Air_Only" in wb.sheetnames
@@ -655,14 +656,14 @@ class TopologyGenerator:
     def _resolve_os(self, name: str) -> str:
         """Return the Air OS image string for a node.
 
-        For servers always returns SERVER_OS.
+        For servers returns self.server_image (defaults to SERVER_OS).
         For switches, looks up per-function image from _switch_os (populated from
         the Air_Only version mapping table when using new format).
         Falls back to SWITCH_OS_FALLBACK if no mapping is available.
         """
         role_name = self._name_to_role.get(name, name)
         if not is_switch(role_name):
-            return SERVER_OS
+            return self.server_image
         role = classify_node(role_name)  # 'core', 'oob', 'edge', …
         if role in self._switch_os:
             return self._switch_os[role]
@@ -1713,7 +1714,7 @@ class TopologyGenerator:
                 "memory": infra_defaults["memory"],
                 "storage": infra_defaults["storage"],
                 "positioning": {"x": 0, "y": 0},
-                "os": SERVER_OS,
+                "os": self.server_image,
                 "features": {"uefi": False, "tpm": False},
                 "pxehost": False,
                 "secureboot": False,
@@ -2102,13 +2103,14 @@ class TopologyValidator:
     """Compare an existing topology JSON against the Excel wiremap."""
 
     def __init__(self, excel_path: Path, topology_json: Path, arch: str,
-                 switches_only: bool = False):
+                 switches_only: bool = False, server_image: str | None = None):
         self.excel_path = excel_path
         self.topology_json = topology_json
         self.arch = arch
         # When the topology was generated switches-only, the server VMs were
         # intentionally dropped — don't flag them as "missing nodes".
         self.switches_only = switches_only
+        self.server_image = server_image or SERVER_OS
         wb = openpyxl.load_workbook(excel_path, data_only=True)
         self.rows = parse_wiremap_excel(excel_path)
         if "Air_Only" in wb.sheetnames:
@@ -2272,9 +2274,9 @@ class TopologyValidator:
                 if "cumulus" not in actual.lower():
                     self.warnings.append(
                         f"OS mismatch: {name} has '{actual}', expected a Cumulus image")
-            elif actual != SERVER_OS:
+            elif actual != self.server_image:
                 self.warnings.append(
-                    f"OS mismatch: {name} has '{actual}', expected '{SERVER_OS}'")
+                    f"OS mismatch: {name} has '{actual}', expected '{self.server_image}'")
 
     def _check_unconnected_stubs(self, links: list) -> None:
         topo_switch_ports: Dict[str, Set[str]] = defaultdict(set)
@@ -2381,6 +2383,8 @@ def main() -> int:
                      help="Omit server VMs from the topology (switches + jump "
                           "infra only) to test switch configs at larger scale "
                           "within a tighter Air budget")
+    gen.add_argument("--server-image", default=None,
+                     help="Override server node OS image name in Air topology (e.g. 'rhcos-422-openstack')")
 
     val = sub.add_parser("validate",
                          help="Validate topology against wiremap")
@@ -2391,6 +2395,8 @@ def main() -> int:
     val.add_argument("--switches-only", action="store_true",
                      help="Topology was generated switches-only; do not flag "
                           "intentionally-dropped server VMs as missing nodes")
+    val.add_argument("--server-image", default=None,
+                     help="Server node OS image name used during generate")
 
     args = ap.parse_args()
 
@@ -2412,7 +2418,8 @@ def main() -> int:
         print(f"  Generating topology for {args.arch} (site: {args.site})")
         print(f"  Source: {excel_path}")
         generator = TopologyGenerator(excel_path, args.arch, args.site,
-                                      switches_only=getattr(args, "switches_only", False))
+                                      switches_only=getattr(args, "switches_only", False),
+                                      server_image=getattr(args, "server_image", None))
         generator.write(output_path)
         return 0
 
@@ -2432,7 +2439,8 @@ def main() -> int:
         print(f"  Validating {topo_path}")
         print(f"  Against wiremap {excel_path}")
         validator = TopologyValidator(excel_path, topo_path, args.arch,
-                                      switches_only=getattr(args, "switches_only", False))
+                                      switches_only=getattr(args, "switches_only", False),
+                                      server_image=getattr(args, "server_image", None))
         return 0 if validator.validate() else 1
 
     return 1
