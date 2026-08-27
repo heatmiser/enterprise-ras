@@ -81,6 +81,7 @@ endif
 
 # Default site if still not set
 SITE ?= default
+NIC_MODE ?= real-hw
 
 INPUT_XLSX        = input/$(ARCH)/$(SITE)/$(ARCH).xlsx
 INVENTORY_DIR     = output/$(ARCH)/$(SITE)/inventory
@@ -583,14 +584,14 @@ generate-ocp:  ## Generate OCP Ansible inventory + ABI manifests from ERA invent
 		exit 1; \
 	fi
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo "  Generating OCP inventory  arch=$(ARCH)  site=$(SITE)"
+	@echo "  Generating OCP inventory  arch=$(ARCH)  site=$(SITE)  nic-mode=$(NIC_MODE)"
 	@if [ -f "input/$(ARCH)/$(SITE)/ocp-settings.yml" ]; then \
 		echo "  ocp-settings.yml found — explicit node_roles will be used"; \
 	else \
 		echo "  No ocp-settings.yml — OCP roles will be auto-inferred from hostnames"; \
 	fi
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	python3 scripts/generate-ocp-inventory.py --arch $(ARCH) --site $(SITE) \
+	python3 scripts/generate-ocp-inventory.py --arch $(ARCH) --site $(SITE) --nic-mode $(NIC_MODE) \
 		$(if $(OCP_SETTINGS),--ocp-settings $(OCP_SETTINGS),)
 
 init-ocp-settings:  ## Bootstrap ocp-settings.yml from ERA inventory - requires ARCH, optional SITE FORCE=1
