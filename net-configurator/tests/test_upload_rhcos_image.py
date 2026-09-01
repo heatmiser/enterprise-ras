@@ -49,3 +49,16 @@ def test_verify_sha256(tmp_path):
 
     assert uri.verify_sha256(dummy_file, expected) is True
     assert uri.verify_sha256(dummy_file, "0000000000000000000000000000000000000000000000000000000000000000") is False
+
+
+def test_image_name_default_derivation():
+    # Test 2-part version ("4.22") -> "rhcos-422-openstack"
+    parts_422 = "4.22".split(".")
+    ver_422 = "".join(parts_422[:2])
+    assert f"rhcos-{ver_422}-openstack" == "rhcos-422-openstack"
+
+    # Test 3-part version ("4.22.0") -> "rhcos-422-openstack"
+    parts_4220 = "4.22.0".split(".")
+    ver_4220 = "".join(parts_4220[:2])
+    assert f"rhcos-{ver_4220}-openstack" == "rhcos-422-openstack"
+

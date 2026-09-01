@@ -790,6 +790,7 @@ def _inject_l3_trio_netplan_ni(
         "utility": {
             "eth1": {
                 "addr": f"192.168.200.{UTILITY_OCTET}/24",
+                "addrs": [f"192.168.200.{UTILITY_OCTET}/24", "10.78.220.250/25"],
                 # PBR: utility's main default stays via eth0 (Air mgmt) so
                 # Air's SSH service / our jump-box access keep working.
                 # Source-policy rule diverts traffic from .200.78 into
@@ -816,9 +817,11 @@ def _inject_l3_trio_netplan_ni(
             continue
         eth_blocks = []
         for iface, spec in ifaces.items():
+            addrs = spec.get("addrs") or [spec["addr"]]
+            addrs_str = ", ".join(f'"{a}"' for a in addrs)
             lines = [
                 f"    {iface}:",
-                f"      addresses: [{spec['addr']}]",
+                f"      addresses: [{addrs_str}]",
                 "      dhcp4: false",
                 "      dhcp6: false",
             ]
@@ -865,9 +868,11 @@ def _inject_l3_trio_netplan_ni(
             "netplan apply || true",
             "sleep 2",
             *[f"ip link set {iface} up || true" for iface in ifaces],
-            *[f"ip addr replace {spec['addr']} dev {iface} || true"
-              for iface, spec in ifaces.items()],
         ]
+        for iface, spec in ifaces.items():
+            for a in spec.get("addrs") or [spec["addr"]]:
+                commands.append(f"ip addr replace {a} dev {iface} || true")
+
         try:
             create_node_instruction(
                 client, base_url, token, sim_id,
@@ -1105,7 +1110,7 @@ def _render_server_netplan(node_name: str, dev: dict, common: dict) -> str:
                 "link": "bond0",
                 "addresses": [bond_ip1],
                 "nameservers": {"addresses": ["8.8.8.8", "8.8.4.4"]},
-                "routing-policy": [{"from": network, "table": vlan_id}],
+                "routing-policy": [{"from": f"{bond_ip1.split('/')[0]}/32", "table": vlan_id}],
                 "routes": [{"to": "0.0.0.0/0", "via": gateway, "table": vlan_id}],
             }
         if len(data_ifaces) >= 4 and bond_ip2:
@@ -1125,9 +1130,9 @@ def _render_server_netplan(node_name: str, dev: dict, common: dict) -> str:
             del cfg["network"]["vlans"]
         return yaml.dump(cfg, default_flow_style=False, sort_keys=False)
 
-    # Compute nodes (su-*, node-*, or 2-8-9-800-style gpu-NN)
+    # Compute nodes (su-*, node-*, 2-8-9-800-style gpu-NN, or ipp5-*-gpu-* mid-name)
     if (node_name.startswith("su-") or node_name.startswith("node-")
-            or node_name.startswith("gpu-")):
+            or node_name.startswith("gpu-") or "-gpu-" in node_name):
         cpu_ifaces = [i for i in ifaces.get("cpu", []) if i != "eth0"]
         gpu_ifaces = [i for i in ifaces.get("gpu", []) if i != "eth0"]
         gpu_ips = dev.get("gpu_ips", [])
@@ -1268,7 +1273,8 @@ def _render_server_netplan(node_name: str, dev: dict, common: dict) -> str:
     # to the converged-fabric (CSL) switches with VLAN-tagged Support
     # traffic (default native VLAN 400).
     if (node_name.startswith("support") or node_name.startswith("bcm-")
-            or node_name.startswith("slurm-") or node_name.startswith("k8s-")):
+            or node_name.startswith("slurm-") or node_name.startswith("k8s-")
+            or "-k8s-" in node_name):
         data = [i for i in ifaces.get("support", ifaces.get("cpu", [])) if i != "eth0"]
         return _build_bond_vlan_netplan(
             data, dev.get("bond_ip1", ""), dev.get("bond_ip2", ""),
@@ -1386,24 +1392,43 @@ def _inject_server_full_config(
 
     topo_nodes = set(topology_json.get("content", {}).get("nodes", {}).keys())
 
+    from airlib.api import create_userconfig, assign_node_userconfigs
     jobs = []
+    ign_assignments = {}
+    ni_dir = inv_dir.parent / "topology" / "node-instructions"
+
     for node_name, dev in sorted(devices.items()):
         if node_name not in topo_nodes:
             continue
         if any(node_name.startswith(p) for p in SERVER_NI_SKIP_PREFIXES):
             continue
 
-        commands = build_server_ni_commands(node_name, dev, common)
-        if not commands:
-            continue
-        jobs.append({
-            "node_name": node_name,
-            "commands": commands,
-            "name": f"{node_name}-full-config",
-            "wait_for_network": False,
-        })
+        ign_file = ni_dir / f"{node_name}.ign"
+        if ign_file.exists():
+            uc = create_userconfig(
+                client, base_url, token,
+                name=f"{node_name}-ign",
+                content=ign_file.read_text(),
+                kind="cloud-init-user-data"
+            )
+            ign_assignments[node_name] = uc.id
+        else:
+            commands = build_server_ni_commands(node_name, dev, common)
+            if not commands:
+                continue
+            jobs.append({
+                "node_name": node_name,
+                "commands": commands,
+                "name": f"{node_name}-full-config",
+                "wait_for_network": False,
+            })
 
-    return _parallel_create_nis(client, base_url, token, sim_id, jobs)
+    if ign_assignments:
+        from rich.console import Console
+        Console().print(f"  {len(ign_assignments)} servers configured via Ignition user_data")
+        assign_node_userconfigs(client, base_url, token, sim_id, ign_assignments)
+
+    return _parallel_create_nis(client, base_url, token, sim_id, jobs) + len(ign_assignments)
 
 
 # ---------------------------------------------------------------------------
@@ -2106,7 +2131,6 @@ def main() -> int:
                         client, base_url, token, sim_id, inv_dir, topology_json,
                     )
                     if n_full:
-                        console.print(f"  {n_full} servers configured via Node Instructions")
                         console.print("  deploy-servers-via-jump is NOT needed for these nodes")
                     else:
                         console.print("  No servers to configure")

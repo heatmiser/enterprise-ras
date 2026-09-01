@@ -216,6 +216,7 @@ nv set vrf default router bgp peer-group overlay update-source lo
 # Peer-group: underlay
 nv set vrf default router bgp peer-group underlay address-family ipv4-unicast state enabled
 nv set vrf default router bgp peer-group underlay address-family ipv4-unicast policy outbound route-map WEIGHTED_ECMP
+nv set vrf default router bgp peer-group underlay address-family l2vpn-evpn state enabled
 nv set vrf default router bgp peer-group underlay bfd profile default
 nv set vrf default router bgp peer-group underlay remote-as external
 {% endif %}

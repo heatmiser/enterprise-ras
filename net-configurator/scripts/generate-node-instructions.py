@@ -99,13 +99,15 @@ def write_script(path: Path, content: str) -> None:
     print(f"  ✓ {path}")
 
 
-def generate_rhcos_ignition_payload(node_name: str, network_config: dict) -> str:
+def generate_rhcos_ignition_payload(node_name: str, network_config: dict, ssh_key: str | None = None) -> str:
     """Generate Ignition v3.4.0 JSON payload for RHCOS OpenStack qcow2 images.
 
     Ignition configures:
       1. /etc/hostname
       2. /etc/nmstate/network-config.yml (from OCP networkConfig)
       3. era-nmstate.service systemd unit that runs nmstatectl apply on first boot
+      4. serial-getty@ttyS0.service for live serial console in NVIDIA Air GUI
+      5. passwd.users core sshAuthorizedKeys (if ssh_key is provided)
     """
     nmstate_yaml = yaml.dump(network_config, default_flow_style=False, sort_keys=False)
 
@@ -116,8 +118,8 @@ def generate_rhcos_ignition_payload(node_name: str, network_config: dict) -> str
     systemd_unit = (
         "[Unit]\n"
         "Description=Apply ERA Stage 1 NMState Configuration\n"
-        "Before=network-pre.target\n"
-        "Wants=network-pre.target\n\n"
+        "After=NetworkManager.service\n"
+        "Requires=NetworkManager.service\n\n"
         "[Service]\n"
         "Type=oneshot\n"
         "ExecStart=/usr/bin/nmstatectl apply /etc/nmstate/network-config.yml\n"
@@ -126,9 +128,12 @@ def generate_rhcos_ignition_payload(node_name: str, network_config: dict) -> str
         "WantedBy=multi-user.target\n"
     )
 
-    ignition_cfg = {
+    ignition_cfg: dict = {
         "ignition": {
             "version": "3.4.0"
+        },
+        "kernelArguments": {
+            "shouldExist": ["console=ttyS0,115200n8"]
         },
         "storage": {
             "files": [
@@ -156,10 +161,24 @@ def generate_rhcos_ignition_payload(node_name: str, network_config: dict) -> str
                     "name": "era-nmstate.service",
                     "enabled": True,
                     "contents": systemd_unit
+                },
+                {
+                    "name": "serial-getty@ttyS0.service",
+                    "enabled": True
                 }
             ]
         }
     }
+
+    if ssh_key:
+        ignition_cfg["passwd"] = {
+            "users": [
+                {
+                    "name": "core",
+                    "sshAuthorizedKeys": [ssh_key.strip()]
+                }
+            ]
+        }
 
     return json.dumps(ignition_cfg, indent=2) + "\n"
 
@@ -506,6 +525,13 @@ def main() -> None:
         print(f"  Run 'make generate ARCH={args.arch}' first.")
         sys.exit(1)
 
+    # Remove stale files from a previous run with a different server_os so that
+    # air-deploy.py never sees both .ign and .sh for the same node.
+    if output_dir.is_dir():
+        stale_ext = ".sh" if args.server_os in ("rhcos", "rhel") else ".ign"
+        for stale in output_dir.glob(f"*{stale_ext}"):
+            stale.unlink()
+
     print(f"Generating Node Instructions for {args.arch} (site: {args.site})")
     print(f"  Reading inventory from {inventory}")
 
@@ -580,7 +606,20 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 continue
-            script = generate_rhcos_ignition_payload(node_name, net_cfg)
+
+            ssh_key = None
+            ocp_gv_path = base / "ocp" / "inventory" / "group_vars" / "all" / "ocp.yml"
+            ocp_gv = load_yaml(ocp_gv_path)
+            ssh_key_path = ocp_gv.get("ocp_ssh_key_path")
+            if ssh_key_path:
+                try:
+                    p = Path(ssh_key_path).expanduser()
+                    if p.exists():
+                        ssh_key = p.read_text().strip()
+                except Exception:
+                    pass
+
+            script = generate_rhcos_ignition_payload(node_name, net_cfg, ssh_key=ssh_key)
             out_file = output_dir / f"{node_name}.ign"
         else:
             commands = build_server_ni_commands(node_name, dev, common)

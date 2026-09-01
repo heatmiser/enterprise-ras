@@ -22,9 +22,9 @@ def sample_device_data():
         "mac": "00:11:22:33:44:00",
         "bond_ip": "10.78.221.10/24",
         "interfaces": {
-            "oob": ["eno1"],
-            "cpu": ["ens3f0np0", "ens3f1np0"],
-            "gpu": ["ens5f0np0", "ens5f1np0"],
+            "oob": ["eth0"],
+            "cpu": ["eth1", "eth2"],
+            "gpu": ["eth3", "eth4"],
         },
         "nic_map": {
             "oob": [{"kernel": "eno1", "mac": "00:11:22:33:44:00"}],

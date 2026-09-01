@@ -78,13 +78,13 @@ NODE_DEFAULTS = {
     "oob":     {"cpu": 1, "memory": 2048, "storage": 20},
     "air-oob": {"cpu": 1, "memory": 2048, "storage": 20},
     "edge":    {"cpu": 4, "memory": 4096, "storage": 20},  # cust-net-edge: SN5600-class L2 bridge + eBGP underlay; 2GB/1CPU left it unable to boot the bridge config
-    "compute": {"cpu": 1, "memory": 1024, "storage": 20},
-    "storage": {"cpu": 1, "memory": 1024, "storage": 20},
-    "support": {"cpu": 1, "memory": 1024, "storage": 20},
-    "k8s":     {"cpu": 1, "memory": 1024, "storage": 20},
-    "bcme":    {"cpu": 1, "memory": 1024, "storage": 20},
-    "infra":   {"cpu": 1, "memory": 1024, "storage": 20},
-    "unknown": {"cpu": 1, "memory": 1024, "storage": 20},
+    "compute": {"cpu": 1, "memory": 2048, "storage": 20},
+    "storage": {"cpu": 1, "memory": 2048, "storage": 20},
+    "support": {"cpu": 1, "memory": 2048, "storage": 20},
+    "k8s":     {"cpu": 1, "memory": 2048, "storage": 20},
+    "bcme":    {"cpu": 1, "memory": 2048, "storage": 20},
+    "infra":   {"cpu": 1, "memory": 2048, "storage": 20},
+    "unknown": {"cpu": 1, "memory": 2048, "storage": 20},
 }
 
 # Wire Map sheet column indices (1-based, openpyxl convention)
@@ -635,13 +635,18 @@ class TopologyGenerator:
             role_name = self._name_to_role.get(name, name)
             role = classify_node(role_name)
             defaults = NODE_DEFAULTS.get(role, NODE_DEFAULTS["support"])
+            node_os = self._resolve_os(name)
+            # RHCOS qemu images support legacy BIOS and boot fine without UEFI
+            # in Air simulation. Air's OVMF drops to a UEFI shell if it can't
+            # locate the EFI boot entry, leaving a blank unresponsive console.
+            is_uefi = False
             nodes[name] = {
                 "cpu": defaults["cpu"],
                 "memory": defaults["memory"],
                 "storage": defaults["storage"],
                 "positioning": {"x": 0, "y": 0},
-                "os": self._resolve_os(name),
-                "features": {"uefi": False, "tpm": False},
+                "os": node_os,
+                "features": {"uefi": is_uefi, "tpm": False},
                 "pxehost": False,
                 "secureboot": False,
                 "oob": False,
@@ -657,10 +662,13 @@ class TopologyGenerator:
         """Return the Air OS image string for a node.
 
         For servers returns self.server_image (defaults to SERVER_OS).
+        Infrastructure nodes (utility, external-conn, external-dhcp) always use SERVER_OS.
         For switches, looks up per-function image from _switch_os (populated from
         the Air_Only version mapping table when using new format).
         Falls back to SWITCH_OS_FALLBACK if no mapping is available.
         """
+        if name in ("utility", "external-conn", "external-dhcp", "oob-server-01", "dhcp-oob"):
+            return SERVER_OS
         role_name = self._name_to_role.get(name, name)
         if not is_switch(role_name):
             return self.server_image
@@ -1714,7 +1722,7 @@ class TopologyGenerator:
                 "memory": infra_defaults["memory"],
                 "storage": infra_defaults["storage"],
                 "positioning": {"x": 0, "y": 0},
-                "os": self.server_image,
+                "os": SERVER_OS,
                 "features": {"uefi": False, "tpm": False},
                 "pxehost": False,
                 "secureboot": False,
