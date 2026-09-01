@@ -9,12 +9,12 @@ Ansible inventory + Agent-Based Installer manifests under output/<arch>/<site>/o
 
 Node role resolution (priority order):
   1. ocp-settings.yml node_roles  (explicit, required for production)
-  2. Auto-inferred from hostname prefix (fallback — see warning below):
-       k8s-*       -> control_plane
-       su-*-node-* -> worker_gpu
-       storage-*   -> worker_storage
-       support-*   -> infra  (WARNING: support nodes may serve as control_plane;
-                               use ocp-settings.yml to assign the split explicitly)
+  2. Auto-inferred from hostname prefix or mid-name role indicator (fallback — see warning below):
+       k8s-* / *-k8s-*   -> control_plane
+       su-*-node-* / gpu-* / *-gpu-* -> worker_gpu
+       storage-*          -> worker_storage
+       support-*          -> infra  (WARNING: support nodes may serve as control_plane;
+                                     use ocp-settings.yml to assign the split explicitly)
 
 GPU node networking — Stage 1 / Stage 2 split:
   Stage 1 (ABI): agent-config.yaml networkConfig contains bond0 (CPU/N-S) only.
@@ -112,16 +112,20 @@ def write_yaml(path, data, header=None):
 
 
 def _parse_cidr(cidr):
-    """Return (ip_str, prefix_int) from '172.16.178.201/24'."""
-    ip, prefix = cidr.split("/")
-    return ip, int(prefix)
+    """Return (ip_str, prefix_int) from '172.16.178.201/24' or bare IP '10.78.220.141'."""
+    if not cidr:
+        return "", None
+    if "/" in str(cidr):
+        parts = str(cidr).split("/", 1)
+        return parts[0], int(parts[1])
+    return str(cidr), None
 
 
 def infer_ocp_role(hostname):
-    """Auto-infer OCP role from ERA hostname prefix."""
-    if hostname.startswith("k8s-"):
+    """Auto-infer OCP role from ERA hostname prefix or mid-name role indicator."""
+    if hostname.startswith("k8s-") or "-k8s-" in hostname:
         return "control_plane"
-    if re.match(r"su-\d+-node-", hostname):
+    if re.match(r"su-\d+-node-", hostname) or hostname.startswith("gpu-") or "-gpu-" in hostname:
         return "worker_gpu"
     if hostname.startswith("storage-"):
         return "worker_storage"
@@ -164,10 +168,9 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="rea
             entries = nic_map.get(profile_key, [])
             if entries:
                 return [e["kernel"] for e in entries]
-        elif nic_map and nic_mode == "kvm":
-            offset = _kvm_offset_for_profile(nic_map, profile_key)
-            count = len(nic_map.get(profile_key, []))
-            return [f"eth{offset + i}" for i in range(count)]
+        # KVM/Air: use topology-derived interface names (ifaces_map) directly.
+        # _kvm_offset_for_profile uses real-hw nic_map counts which can differ
+        # from the number of ports the topology actually wires up per profile.
         return ifaces_map.get(profile_key, [])
 
     def _bond(members, cidr, gateway):
@@ -183,7 +186,7 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="rea
                 "dhcp": False,
                 "address": [{"ip": ip, "prefix-length": prefix}],
             },
-            "link-aggregation": {"mode": "active-backup", "port": list(members)},
+            "link-aggregation": {"mode": "802.3ad", "port": list(members)},
         })
         if gateway:
             routes.append({
@@ -191,6 +194,25 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="rea
                 "next-hop-address": gateway,
                 "next-hop-interface": "bond0",
             })
+
+    # Add eth0 OOB management interface if eth0_ip is defined
+    eth0_ip = device_data.get("eth0_ip")
+    if eth0_ip:
+        ip, prefix = _parse_cidr(eth0_ip)
+        if not prefix:
+            oob_net = common.get("oob_network", "")
+            _, prefix = _parse_cidr(oob_net) if oob_net else ("", 24)
+            prefix = prefix or 24
+        interfaces.append({
+            "name": "eth0",
+            "type": "ethernet",
+            "state": "up",
+            "ipv4": {
+                "enabled": True,
+                "dhcp": False,
+                "address": [{"ip": ip, "prefix-length": prefix}],
+            },
+        })
 
     if ocp_role in ("control_plane", "infra"):
         members = _bond_members("support") or _bond_members("cpu")

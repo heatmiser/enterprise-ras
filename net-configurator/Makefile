@@ -647,28 +647,27 @@ teardown-kvm:  ## Teardown KVM digital twin (destroy VMs, bridges, storage)
 		$(if $(KVM_IMAGE_DIR),-e kvm_image_dir=$(KVM_IMAGE_DIR),) \
 		--ask-become-pass
 
-validate-air-fabric: ## Stage 1: Deploy ERA fabric with RHCOS VMs in Air and run ping matrix
+validate-air-fabric: ## Stage 1: Deploy ERA fabric in Air and run ping matrix (SERVER_OS=ubuntu|rhcos, default=ubuntu)
 	$(call check_ansible)
 	@test -n "$(ARCH)" || { echo "❌ ERROR: ARCH is required (e.g. make validate-air-fabric ARCH=2-8-5-200)"; exit 1; }
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo "  Stage 1 ERA Air Fabric Validation  arch=$(ARCH)  site=$(SITE)"
+	@echo "  Stage 1 ERA Air Fabric Validation  arch=$(ARCH)  site=$(SITE)  server-os=$(SERVER_OS)"
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@$(MAKE) --no-print-directory generate \
-		ARCH=$(ARCH) SITE=$(SITE) \
-		SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack)
+		ARCH=$(ARCH) SITE=$(SITE) SERVER_OS=$(SERVER_OS) \
+		$(if $(filter rhcos,$(SERVER_OS)),SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack),)
 	@$(MAKE) --no-print-directory generate-ocp \
 		ARCH=$(ARCH) SITE=$(SITE) NIC_MODE=kvm
-	python3 scripts/generate-node-instructions.py \
-		--arch $(ARCH) --site $(SITE) --server-os rhcos
-	python3 scripts/upload_rhcos_image.py \
+	$(if $(filter rhcos,$(SERVER_OS)),python3 scripts/upload_rhcos_image.py \
 		--ocp-version $(or $(OCP_VERSION),4.22) \
-		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack)
+		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack))
 	python3 scripts/air-deploy.py \
 		--arch $(ARCH) --site $(SITE) --no-ztp
+	$(MAKE) air-ssh-check ARCH=$(ARCH) SITE=$(SITE) FIX=1
 	ansible-playbook playbooks/validate-ping-matrix.yml \
 		-i output/$(ARCH)/$(SITE)/inventory/hosts \
 		$(if $(SITE_VARS),-e @$(SITE_VARS),) \
-		-e ansible_user=$(or $(SERVER_ANSIBLE_USER),core) \
+		-e server_ansible_user=$(or $(SERVER_ANSIBLE_USER),$(if $(filter rhcos,$(SERVER_OS)),core,ubuntu)) \
 		-e arch=$(ARCH) -e site=$(SITE)
 
 topology:  ## Generate Air topology only - requires ARCH, optional SITE

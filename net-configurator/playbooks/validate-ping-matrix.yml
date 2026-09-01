@@ -22,6 +22,21 @@
       debug:
         msg: "Ping matrix: {{ server_groups | length }} servers"
 
+    - name: Ensure sshpass is installed on jump host
+      ansible.builtin.apt:
+        name: sshpass
+        state: present
+        update_cache: false
+      become: true
+      ignore_errors: true
+
+    - name: Ensure SSH private key is present on jump host
+      ansible.builtin.copy:
+        src: "{{ ocp_ssh_key_path | default('~/.ssh/id_ed25519_ipp5-ocp') | regex_replace('\\.pub$', '') }}"
+        dest: "/home/ubuntu/.ssh/id_ed25519"
+        mode: "0600"
+      ignore_errors: true
+
     # ── Phase 1: Push + fire on all servers (parallel) ──
     # One Ansible task per server, fired with async+poll: 0 so they run in
     # parallel via Ansible's fork pool. Previously this was one giant
@@ -42,7 +57,16 @@
           (
             HOST='{{ hostvars[item].ansible_host }}'
             NAME='{{ item }}'
-            SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {{ server_ansible_user | default('ubuntu') }}@$HOST"
+            KEY_SSH="ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=10 {{ server_ansible_user | default('ubuntu') }}@$HOST"
+            PASS_SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {{ server_ansible_user | default('ubuntu') }}@$HOST"
+            if [ -f /home/ubuntu/.ssh/id_ed25519 ] && timeout 10 $KEY_SSH 'true' >/dev/null 2>&1; then
+              SSH_CMD="$KEY_SSH"
+            elif command -v sshpass >/dev/null 2>&1; then
+              SSH_CMD="$PASS_SSH"
+            else
+              echo "FIRE|$NAME|NO_AUTH"
+              exit 0
+            fi
 
             echo "CONNECT|$NAME|$HOST" >&2
 
@@ -56,7 +80,7 @@
             {% set src_is_compute = item in groups.get('nodes', []) %}
             {% set src_is_support = item in groups.get('support', []) %}
             {% set src_is_storage = item in groups.get('storage', []) %}
-            {% set src_inband_iface = 'bond0' if src_is_compute else ('bond0.' ~ common.support_vlan if src_is_support else ('bond0.' ~ common.storage_vlan if src_is_storage else '')) %}
+            {% set src_inband_iface = 'bond0' if src_is_compute else ('bond0.' ~ common.get('support_vlan', '') if src_is_support else ('bond0.' ~ common.get('storage_vlan', '') if src_is_storage else '')) %}
             {% set src_inband_ip = (src_dev.get('bond_ip', '') if src_is_compute else src_dev.get('bond_ip1', '')) | regex_replace('/.*', '') %}
             {# GPU IPs: dual-plane uses gpu_interfaces (list of {iface,plane,ip}); single-plane uses gpu_ips list #}
             {% set src_gpu_iface = src_ifaces.get('gpu', [''])[0] if src_ifaces.get('gpu', []) | length > 0 else '' %}
@@ -111,8 +135,8 @@
                merged into INBAND, the VRFs match and we keep the INBAND
                label so a same-VRF unreach surfaces as a real failure. #}
             {% set dst_is_storage = dst in groups.get('storage', []) %}
-            {% set _src_vrf = (common.storage_vrf if src_is_storage else common.get('cpu_vrf', 'INBAND')) %}
-            {% set _dst_vrf = (common.storage_vrf if dst_is_storage else common.get('cpu_vrf', 'INBAND')) %}
+            {% set _src_vrf = (common.get('storage_vrf', '') if src_is_storage else common.get('cpu_vrf', 'INBAND')) %}
+            {% set _dst_vrf = (common.get('storage_vrf', '') if dst_is_storage else common.get('cpu_vrf', 'INBAND')) %}
             {% set _l3_tag = 'CROSS-VRF' if (_src_vrf and _dst_vrf and _src_vrf != _dst_vrf) else 'INBAND' %}
             _p {{ dst_inband_ip }} {{ src_inband_ip }} && echo "PASS|{{ src_inband_iface }}({{ src_inband_ip }})|{{ dst }}|{{ dst_inband_ip }}|{{ _l3_tag }}" >> $R || echo "FAIL|{{ src_inband_iface }}({{ src_inband_ip }})|{{ dst }}|{{ dst_inband_ip }}|{{ _l3_tag }}" >> $R
             {% endif %}
@@ -233,7 +257,16 @@
         (
           HOST='{{ hostvars[item].ansible_host }}'
           NAME='{{ item }}'
-          SSH_CMD="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {{ server_ansible_user | default('ubuntu') }}@$HOST"
+          KEY_SSH="ssh -i /home/ubuntu/.ssh/id_ed25519 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=10 {{ server_ansible_user | default('ubuntu') }}@$HOST"
+          PASS_SSH="sshpass -e ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 {{ server_ansible_user | default('ubuntu') }}@$HOST"
+          if [ -f /home/ubuntu/.ssh/id_ed25519 ] && timeout 10 $KEY_SSH 'true' >/dev/null 2>&1; then
+            SSH_CMD="$KEY_SSH"
+          elif command -v sshpass >/dev/null 2>&1; then
+            SSH_CMD="$PASS_SSH"
+          else
+            echo "COLLECT|$NAME|NO_AUTH"
+            exit 0
+          fi
 
           CONTENT=$(timeout 15 $SSH_CMD 'cat /tmp/ping-matrix-results.txt 2>/dev/null' 2>/dev/null)
           if [ -z "$CONTENT" ] || ! echo "$CONTENT" | grep -q "DONE"; then
@@ -265,7 +298,7 @@
           Servers tested: {{ server_groups | length }}
 
           VRF ROUTING DOMAINS:
-            INBAND: Compute (VLAN {{ common.cpu_vlan }}), Support (VLAN {{ common.support_vlan }}), Storage (VLAN {{ common.storage_vlan }}) — all can cross-ping
+            INBAND: Compute (VLAN {{ common.get('cpu_vlan', 'N/A') }}), Support (VLAN {{ common.get('support_vlan', 'N/A') }}), Storage (VLAN {{ common.get('storage_vlan', 'N/A') }}) — all can cross-ping
             GPU:    Compute GPU interfaces (VLAN {{ common.get('gpu_vlan', common.get('gpu_plane1_vlan', 900)) }}) — isolated, only GPU ↔ GPU
             CROSS-VRF pings (INBAND → GPU) are expected to FAIL
             If a cross-VRF ping PASSES, that indicates a VRF leak (isolation broken)

@@ -2,11 +2,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
 """
-Download RHCOS OpenStack qcow2 image from mirror.openshift.com and upload to NVIDIA Air.
+Download RHCOS openstack qcow2 image from mirror.openshift.com and upload to NVIDIA Air.
 
-Downloads the official RHCOS OpenStack qcow2 image for a target OCP version
+Downloads the official RHCOS openstack qcow2 image for a target OCP version
 (e.g., 4.22), decompresses it locally, and uploads it to the NVIDIA Air org image
 catalog with `default_username="core"`.
+
+The openstack flavor is required for NVIDIA Air: RHCOS openstack images read Ignition
+via the OpenStack metadata service (169.254.169.254) which Air provides. The qemu
+flavor reads Ignition exclusively from QEMU fw_cfg, which Air does not populate.
 
 Usage:
     python3 scripts/upload_rhcos_image.py --ocp-version 4.22
@@ -25,7 +29,7 @@ MIRROR_BASE_URL = "https://mirror.openshift.com/pub/openshift-v4/dependencies/rh
 
 
 def find_rhcos_openstack_info(ocp_version: str) -> tuple[str, str | None]:
-    """Find the exact RHCOS OpenStack qcow2.gz filename and sha256 for a given OCP version.
+    """Find the exact RHCOS openstack qcow2.gz filename and sha256 for a given OCP version.
 
     Returns:
         tuple[filename, expected_sha256]
@@ -69,7 +73,7 @@ def verify_sha256(filepath: Path, expected_sha256: str) -> bool:
 
 
 def download_and_decompress_rhcos(ocp_version: str, cache_dir: Path, force: bool = False) -> Path:
-    """Download, verify SHA256, and decompress RHCOS OpenStack qcow2 image locally."""
+    """Download, verify SHA256, and decompress RHCOS openstack qcow2 image locally."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     uncompressed_path = cache_dir / f"rhcos-{ocp_version}-openstack.x86_64.qcow2"
 
@@ -81,7 +85,7 @@ def download_and_decompress_rhcos(ocp_version: str, cache_dir: Path, force: bool
     download_url = f"{MIRROR_BASE_URL}/{ocp_version}/latest/{gz_filename}"
     gz_path = cache_dir / gz_filename
 
-    print(f"Downloading RHCOS OpenStack image from {download_url} ...")
+    print(f"Downloading RHCOS openstack image from {download_url} ...")
     req = urllib.request.Request(download_url, headers={"User-Agent": "net-configurator"})
     with urllib.request.urlopen(req) as resp, open(gz_path, "wb") as out_file:
         total = int(resp.headers.get("Content-Length", 0))
@@ -119,6 +123,45 @@ def download_and_decompress_rhcos(ocp_version: str, cache_dir: Path, force: bool
     return uncompressed_path
 
 
+def _resolve_api_key() -> str | None:
+    """Resolve the Air API key from config, env var, or key file."""
+    api_key = None
+    try:
+        from airlib.env import load_air_config
+        config = load_air_config(arch="", site="")
+        api_key = config.get("api_key")
+    except Exception:
+        pass
+
+    if not api_key:
+        api_key = os.environ.get("AIR_API_KEY")
+        if not api_key:
+            key_file = os.environ.get("AIR_API_KEY_FILE", os.path.expanduser("~/.era-secrets/air-api-key"))
+            if os.path.exists(key_file):
+                api_key = Path(key_file).read_text().strip()
+
+    return api_key or None
+
+
+def air_image_exists(image_name: str) -> bool:
+    """Return True if image_name is already in Air catalog with a complete upload."""
+    try:
+        from air_sdk import AirApi
+        api_key = _resolve_api_key()
+        if not api_key:
+            return False
+        api = AirApi.with_api_key(api_key=api_key)
+        existing = next((img for img in api.images.list(search=image_name) if img.name == image_name), None)
+        if existing:
+            status = getattr(existing, "upload_status", "")
+            print(f"Air image {image_name!r} already present (id={existing.id}, upload_status={status!r}).")
+            return True
+        return False
+    except Exception as err:
+        print(f"  NOTE: Could not query Air image catalog ({err}); proceeding with upload.", file=sys.stderr)
+        return False
+
+
 def upload_to_air(local_qcow2: Path, image_name: str) -> None:
     """Upload qcow2 image to NVIDIA Air catalog if not already present."""
     try:
@@ -130,20 +173,19 @@ def upload_to_air(local_qcow2: Path, image_name: str) -> None:
             "  Install nv-air-sdk package or run in a virtualenv with nv-air-sdk installed."
         )
 
-    # Resolve API Key
-    api_key = os.environ.get("AIR_API_KEY")
+    api_key = _resolve_api_key()
     if not api_key:
-        key_file = os.environ.get("AIR_API_KEY_FILE", os.path.expanduser("~/.era-secrets/air-api-key"))
-        if os.path.exists(key_file):
-            api_key = Path(key_file).read_text().strip()
-
-    if not api_key:
-        sys.exit("ERROR: AIR_API_KEY env var or ~/.era-secrets/air-api-key required for Air upload.")
+        sys.exit("ERROR: AIR_API_KEY env var, shared vault (.era-secrets/air-secrets.yml), or ~/.era-secrets/air-api-key required for Air upload.")
 
     api = AirApi.with_api_key(api_key=api_key)
 
     existing = next((img for img in api.images.list(search=image_name) if img.name == image_name), None)
     if existing:
+        if not getattr(existing, "mountpoint", None):
+            try:
+                api.images.patch(existing.id, mountpoint="/dev/sda")
+            except Exception:
+                pass
         print(f"Air image {image_name!r} already exists (id={existing.id}, upload_status={existing.upload_status!r}). Skipping upload.")
         return
 
@@ -155,6 +197,7 @@ def upload_to_air(local_qcow2: Path, image_name: str) -> None:
         version="1.0.0",
         default_username="core",
         default_password="not-used-rhcos",
+        mountpoint="/dev/sda",
         cpu_arch="x86",
         provider="VM",
         filepath=str(local_qcow2),
@@ -173,9 +216,14 @@ def main():
     parser.add_argument("--skip-upload", action="store_true", help="Download and decompress locally only")
     args = parser.parse_args()
 
-    ver_nodots = args.ocp_version.replace(".", "")
+    parts = args.ocp_version.split(".")
+    ver_nodots = "".join(parts[:2]) if len(parts) >= 2 else args.ocp_version.replace(".", "")
     image_name = args.image_name or f"rhcos-{ver_nodots}-openstack"
     cache_dir = Path(args.cache_dir)
+
+    # Check Air first — skip the download entirely if the image is already there.
+    if not args.skip_upload and not args.force_download and air_image_exists(image_name):
+        return
 
     qcow2_path = download_and_decompress_rhcos(args.ocp_version, cache_dir, force=args.force_download)
 
