@@ -38,7 +38,7 @@ from utils import (
     build_nic_destinations,
     plane_for_switch,
 )
-from oob_reserved import AIR_MGMT_RESERVED_OCTETS
+from oob_reserved import AIR_MGMT_RESERVED_OCTETS, DEFAULT_AIR_MGMT_SUBNET
 
 # RFC1123-ish: node name used as a host_vars filename + a bare INI hosts token.
 _INV_HOSTNAME_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]*')
@@ -3918,7 +3918,16 @@ def generate_host_vars(nodes, vlans, output_dir, arch, settings, prefix_list_ove
 
     # Air management subnet for switch eth0 IPs
     air_settings = air_settings or {}
-    air_mgmt_subnet = air_settings.get('air_mgmt_subnet', '172.20.0.0/24')
+    air_mgmt_subnet = air_settings.get('air_mgmt_subnet', DEFAULT_AIR_MGMT_SUBNET)
+    # In L3 OOB mode air-deploy.py hardcodes the cust-net-edge bridge SVI and the
+    # L3 trio (external-dhcp:eth1 = .77/24, utility:eth2 = .78/24) to
+    # DEFAULT_AIR_MGMT_SUBNET (172.20.0.0/24) regardless of what the Excel
+    # Air_Only tab says.  Override so switch ansible_host IPs match the IPs DHCP
+    # actually hands out and utility can SSH to them via its eth2 foot on the bridge.
+    if _normalize_oob_uplink_mode(settings) == 'l3' and air_mgmt_subnet != DEFAULT_AIR_MGMT_SUBNET:
+        print(f"  ℹ  L3 OOB: air_mgmt_subnet {air_mgmt_subnet!r} → {DEFAULT_AIR_MGMT_SUBNET!r} "
+              f"(bridge hardcoded in air-deploy.py)")
+        air_mgmt_subnet = DEFAULT_AIR_MGMT_SUBNET
     air_mgmt_base = air_mgmt_subnet.split('/')[0].rsplit('.', 1)[0]
     settings['_air_mgmt_base'] = air_mgmt_base  # pass to switch host_vars generation
     # Switch eth0 mgmt IPs live in the air-mgmt /24. Historically assigned
@@ -4746,11 +4755,16 @@ def generate_group_vars(settings, vlans, vrfs, output_dir, arch, nodes=None, por
 
     # Generate ztp_interfaces from Air Management Subnet (for switch ZTP on air-oob-switch)
     air_settings = air_settings or {}
-    air_mgmt_subnet = air_settings.get('air_mgmt_subnet', '172.20.0.0/24')
+    air_mgmt_subnet = air_settings.get('air_mgmt_subnet', DEFAULT_AIR_MGMT_SUBNET)
+    # Mirror the same L3 OOB override applied in generate_host_vars() so that
+    # group_vars/all.yml (air_mgmt_subnet, ztp_interfaces, ztp_allow_subnets) is
+    # consistent with the host_vars switch ansible_host IPs.
+    if _normalize_oob_uplink_mode(settings) == 'l3' and air_mgmt_subnet != DEFAULT_AIR_MGMT_SUBNET:
+        air_mgmt_subnet = DEFAULT_AIR_MGMT_SUBNET
     _parsed_air = _parse_cidr(air_mgmt_subnet, context="Air_Only.air_mgmt_subnet")
     if not _parsed_air:
         # Fall back to default if the operator entered garbage.
-        air_mgmt_subnet = '172.20.0.0/24'
+        air_mgmt_subnet = DEFAULT_AIR_MGMT_SUBNET
         _parsed_air = _parse_cidr(air_mgmt_subnet)
     _air_ip, air_mgmt_prefix = _parsed_air
     air_mgmt_base = _air_ip.rsplit('.', 1)[0]  # e.g., "172.20.0"
@@ -5378,10 +5392,12 @@ def process_excel_template(excel_path, output_dir):
     host_vars_dir = output_dir / "host_vars"
     project_root = Path(excel_path).resolve().parent.parent.parent.parent
     # Air Management Subnet for virtual node IPs
-    _air_mgmt = air_settings.get('air_mgmt_subnet', '172.20.0.0/24')
+    _air_mgmt = air_settings.get('air_mgmt_subnet', DEFAULT_AIR_MGMT_SUBNET)
+    if _normalize_oob_uplink_mode(settings) == 'l3' and _air_mgmt != DEFAULT_AIR_MGMT_SUBNET:
+        _air_mgmt = DEFAULT_AIR_MGMT_SUBNET
     _parsed_air2 = _parse_cidr(_air_mgmt, context="Air_Only.air_mgmt_subnet")
     if not _parsed_air2:
-        _air_mgmt = '172.20.0.0/24'
+        _air_mgmt = DEFAULT_AIR_MGMT_SUBNET
         _parsed_air2 = _parse_cidr(_air_mgmt)
     _air_base = _parsed_air2[0].rsplit('.', 1)[0]
     _air_prefix = _parsed_air2[1]
