@@ -199,7 +199,7 @@ ztp_monitoring_config: |
 ztp_final_reboot: true  # Reboot after ZTP completes
 
 # SSH Configuration
-ssh_public_key_path: "~/.ssh/id_rsa.pub"
+ssh_key_path: "~/.ssh/id_rsa"
 
 # Miscellaneous
 # timezone is set per switch-group in group_vars/oob.yml and group_vars/core.yml

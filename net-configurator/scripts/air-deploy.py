@@ -22,6 +22,7 @@ Or via Makefile:
 import argparse
 import base64
 import datetime as _dt
+import ipaddress
 import json
 import shlex
 import shutil
@@ -68,6 +69,7 @@ from airlib.ext_storage_config import (
     discover_ext_storage_targets,
 )
 from oob_reserved import EXTERNAL_DHCP_OCTET, UTILITY_OCTET
+from airlib.rhcos import build_rhcos_nmstate_config, generate_rhcos_ignition_payload
 
 console = Console()
 
@@ -936,6 +938,343 @@ def _inject_external_conn_nat_ni(
     except AirError as exc:
         console.print(f"  [yellow]Warning:[/] external-conn NAT NI failed: {exc}")
         return False
+
+
+def _resolve_ssh_key(
+    cli_ssh_key: str | None,
+    common: dict,
+    all_vars: dict,
+) -> tuple[str | None, str | None]:
+    """Return (private_key_path_str, public_key_text) from highest-priority source.
+
+    Priority: CLI --ssh-key > ssh_key_path in inventory > ssh_public_key_path (legacy).
+    Public key is derived as <private>.pub unless the path already ends in .pub.
+    Returns (None, None) with a warning when no key is configured or pub file missing.
+    """
+    raw = (
+        cli_ssh_key
+        or common.get("ssh_key_path")
+        or all_vars.get("ssh_key_path")
+        or common.get("ssh_public_key_path")
+        or all_vars.get("ssh_public_key_path")
+    )
+    if not raw:
+        console.print("[yellow]Warning:[/] No ssh_key_path configured — nodes will not have SSH key provisioned")
+        return None, None
+
+    raw_path = Path(raw).expanduser()
+    if str(raw_path).endswith(".pub"):
+        pub_path = raw_path
+        priv_path = raw_path.with_suffix("")
+    else:
+        priv_path = raw_path
+        pub_path = Path(str(raw_path) + ".pub")
+
+    if not pub_path.exists():
+        console.print(f"[yellow]Warning:[/] SSH public key not found: {pub_path} — nodes will not have SSH key provisioned")
+        return str(priv_path), None
+
+    return str(priv_path), pub_path.read_text().strip()
+
+
+def _inject_rhcos_metadata_server_ni(
+    client: httpx.Client,
+    base_url: str,
+    token: str,
+    sim_id: str,
+    inv_dir: Path,
+    topology_json: dict,
+    ssh_key: str | None = None,
+) -> int:
+    """Deploy OpenStack metadata spoof on utility for RHCOS Ignition delivery.
+
+    Identifies RHCOS nodes (os field starts with 'rhcos'), generates per-node
+    Ignition payloads, and creates a utility Node Instruction that:
+      1. Adds oob_gateway/prefix to eth1 and 169.254.169.254/32 link-local alias
+      2. Installs dnsmasq with static DHCP leases for RHCOS initramfs IP assignment
+      3. Deploys /opt/era/ignition/<node>.ign + ip-map.json
+      4. Starts rhcos_metadata_server.py on port 80
+
+    Returns the number of RHCOS nodes configured.
+    """
+    nodes = topology_json.get("content", {}).get("nodes", {})
+    if "utility" not in nodes:
+        return 0
+
+    rhcos_nodes = [
+        n for n, nd in nodes.items()
+        if isinstance(nd.get("os"), str) and nd["os"].lower().startswith("rhcos")
+    ]
+    if not rhcos_nodes:
+        return 0
+
+    main_yml = inv_dir / "group_vars" / "all" / "main.yml"
+    if not main_yml.exists():
+        console.print(f"  [yellow]Warning:[/] {main_yml} not found — skipping RHCOS metadata server")
+        return 0
+    with open(main_yml) as f:
+        all_vars = yaml.safe_load(f) or {}
+    devices = all_vars.get("devices", {})
+    common = all_vars.get("common", {}) or {}
+
+    # Parse OOB subnet from inventory
+    oob_gateway: str = common.get("oob_gateway", "")
+    oob_network_str: str = common.get("oob_network", "")
+    try:
+        oob_net = ipaddress.IPv4Network(oob_network_str, strict=False)
+        oob_prefix_len = oob_net.prefixlen
+        oob_netmask = str(oob_net.netmask)
+        oob_network_addr = str(oob_net.network_address)
+    except (ValueError, TypeError):
+        oob_prefix_len, oob_netmask, oob_network_addr = 24, "255.255.255.0", "192.168.200.0"
+
+    _, pub_key_text = _resolve_ssh_key(ssh_key, common, all_vars)
+
+    IGNITION_DIR = "/opt/era/ignition"
+    ip_map: dict[str, str] = {}
+    dnsmasq_hosts: list[str] = []
+    ign_writes: list[str] = []
+
+    for node_name in sorted(rhcos_nodes):
+        dev = devices.get(node_name, {})
+        eth0_ip = dev.get("eth0_ip", "")
+        mac = dev.get("mac", "")
+        if not eth0_ip:
+            console.print(f"  [yellow]Warning:[/] {node_name}: no eth0_ip — skipping")
+            continue
+
+        net_cfg = build_rhcos_nmstate_config(
+            eth0_ip, prefix_len=oob_prefix_len, gateway=oob_gateway, mac=mac,
+        )
+        ign_json = generate_rhcos_ignition_payload(node_name, net_cfg, ssh_key=pub_key_text)
+        ign_filename = f"{node_name}.ign"
+        ign_path = f"{IGNITION_DIR}/{ign_filename}"
+        ip_map[eth0_ip] = ign_path
+
+        ign_b64 = base64.b64encode(ign_json.encode()).decode()
+        ign_writes.append(f"echo '{ign_b64}' | base64 -d > {shlex.quote(ign_path)}")
+
+        if mac:
+            dnsmasq_hosts.append(f"dhcp-host={mac},{node_name},{eth0_ip}")
+
+    if not ip_map:
+        return 0
+
+    # ip-map.json: {eth0_ip: ign_path}
+    ip_map_b64 = base64.b64encode(json.dumps(ip_map, indent=2).encode()).decode()
+
+    # dnsmasq config for RHCOS DHCP on OOB subnet (static leases only).
+    dnsmasq_cfg_lines = [
+        f"# ERA RHCOS DHCP — fixed leases on OOB subnet ({oob_network_str})",
+        "port=0",  # disable DNS; DHCP only (port 53 is held by systemd-resolved)
+        "interface=eth1",
+        "bind-interfaces",
+        f"dhcp-range={oob_network_addr},static,{oob_netmask},1h",
+        f"dhcp-option=3,{oob_gateway}",
+        "dhcp-option=6,8.8.8.8",
+        # RFC 3442 classless static route: push 169.254.169.254/32 as directly
+        # connected so RHCOS initramfs can reach the OpenStack metadata spoof on
+        # utility without a default gateway to the OOB subnet being required first.
+        "dhcp-option=121,169.254.169.254/32,0.0.0.0",
+        "no-hosts",
+        "log-dhcp",
+        "log-facility=/var/log/dnsmasq-rhcos.log",
+    ]
+    dnsmasq_cfg_lines += dnsmasq_hosts
+    dnsmasq_cfg_b64 = base64.b64encode(("\n".join(dnsmasq_cfg_lines) + "\n").encode()).decode()
+
+    # Embed the metadata server script from the repo
+    server_script_path = Path(__file__).resolve().parent / "airlib" / "rhcos_metadata_server.py"
+    server_b64 = base64.b64encode(server_script_path.read_bytes()).decode()
+
+    commands = [
+        "# RHCOS metadata spoof: deploy Ignition server on utility",
+        f"mkdir -p {IGNITION_DIR}",
+        f"ip addr add {oob_gateway}/{oob_prefix_len} dev eth1 2>/dev/null || true",
+        f"echo '{server_b64}' | base64 -d > {IGNITION_DIR}/rhcos_metadata_server.py",
+        *ign_writes,
+        f"echo '{ip_map_b64}' | base64 -d > {IGNITION_DIR}/ip-map.json",
+        f"echo '{dnsmasq_cfg_b64}' | base64 -d > {IGNITION_DIR}/dnsmasq-rhcos.conf",
+        "apt-get update -q && apt-get install -y -q dnsmasq",
+        "systemctl mask dnsmasq 2>/dev/null || true",
+        "systemctl stop dnsmasq 2>/dev/null || true",
+        f"dnsmasq --conf-file={IGNITION_DIR}/dnsmasq-rhcos.conf"
+        f" --pid-file=/var/run/dnsmasq-rhcos.pid",
+        "ip addr add 169.254.169.254/32 dev eth1 2>/dev/null || true",
+        f"nohup python3 {IGNITION_DIR}/rhcos_metadata_server.py"
+        f" > /var/log/era-metadata.log 2>&1 &",
+        f"echo 'RHCOS metadata server started for {len(ip_map)} nodes'",
+    ]
+
+    try:
+        create_node_instruction(
+            client, base_url, token, sim_id,
+            node_name="utility",
+            commands=commands,
+            name="utility-rhcos-metadata-server",
+            wait_for_network=False,
+        )
+        console.print(
+            f"  utility: RHCOS metadata server NI queued"
+            f" ({len(ip_map)} nodes, 169.254.169.254/32 on eth1)"
+        )
+        return len(ip_map)
+    except AirError as exc:
+        console.print(f"  [yellow]Warning:[/] utility RHCOS metadata NI failed: {exc}")
+        return 0
+
+
+def _inject_oob_switch_cloud_config(
+    client: httpx.Client,
+    base_url: str,
+    token: str,
+    sim_id: str,
+    topology_json: dict,
+) -> int:
+    """Assign OOB switch bridge cloud-config before first boot via NoCloud userconfig.
+
+    Delivers #cloud-config bootcmd that adds all swp ports to br_default in VLAN 1
+    access mode, enabling L2 forwarding of RHCOS DHCP frames to utility's eth1.
+
+    bootcmd runs very early in cloud-init (before runcmd, before networking modules),
+    getting the bridge up ~60-90s sooner than runcmd — necessary because RHCOS ignition
+    has a hardcoded ~120s fetch timeout and the bridge must be up before that expires.
+
+    No-op when no RHCOS nodes are present (safe for Ubuntu sim topologies).
+    Must be called while sim is INACTIVE (before start_simulation()).
+    Returns the number of OOB switches configured.
+    """
+    nodes = topology_json.get("content", {}).get("nodes", {})
+
+    rhcos_nodes = [
+        n for n, nd in nodes.items()
+        if isinstance(nd.get("os"), str) and nd["os"].lower().startswith("rhcos")
+    ]
+    if not rhcos_nodes:
+        return 0
+
+    oob_switches = [
+        n for n in nodes
+        if "oob-switch" in n and "air-oob" not in n
+    ]
+    if not oob_switches:
+        return 0
+
+    cloud_config = (
+        "#cloud-config\n"
+        "bootcmd:\n"
+        "  - for i in $(seq 1 48); do ip link set swp$i master br_default up 2>/dev/null || true; done\n"
+        "  - for i in $(seq 1 48); do bridge vlan add dev swp$i vid 1 pvid untagged master 2>/dev/null || true; done\n"
+        "  - bridge vlan add dev br_default vid 1 self 2>/dev/null || true\n"
+        "  - ip link set br_default up\n"
+    )
+
+    from airlib.api import create_userconfig, assign_node_userconfigs
+
+    assignments: dict[str, str] = {}
+    for sw_name in oob_switches:
+        uc = create_userconfig(
+            client, base_url, token,
+            name=f"{sw_name}-bridge-init",
+            content=cloud_config,
+            kind="cloud-init-user-data",
+        )
+        assignments[sw_name] = uc.id
+
+    if assignments:
+        assign_node_userconfigs(client, base_url, token, sim_id, assignments)
+
+    return len(assignments)
+
+
+def _inject_oob_quick_bridge_ni(
+    client: httpx.Client,
+    base_url: str,
+    token: str,
+    sim_id: str,
+    topology_json: dict,
+) -> int:
+    """Inject a fast iproute2 VLAN 200 bridge on OOB switches before era-apply.service.
+
+    RHCOS initramfs DHCP times out (~180s) before the full NVUE era-apply
+    (BGP, EVPN, VRF, BFD) completes on first boot. This NI adds server-facing
+    swp ports to br_default (the Cumulus VLAN-aware bridge, already present at
+    boot) as VLAN 200 access ports in seconds — giving RHCOS a working L2 path
+    to the dnsmasq DHCP server on utility immediately.
+
+    Must be injected BEFORE _inject_switch_config_via_ni() so Air executes it
+    first in the per-node NI queue. era-apply.service then reconfigures
+    br_default with the full NVUE config (VLAN-aware, EVPN, BGP) idempotently.
+
+    Returns the number of OOB switches configured.
+    """
+    nodes = topology_json.get("content", {}).get("nodes", {})
+    oob_switches = sorted(
+        n for n in nodes
+        if n.startswith("oob-switch-") and not n.startswith("air-oob-switch")
+    )
+    if not oob_switches:
+        return 0
+
+    def _swp_num(p: str) -> int:
+        rest = p[3:] if p.startswith("swp") else p
+        if "s" in rest:
+            parent, sub = rest.split("s", 1)
+            return int(parent) * 1000 + int(sub)
+        return int(rest) if rest.isdigit() else 9999
+
+    configured = 0
+    for switch_name in oob_switches:
+        # Collect swp ports that face ethernet-interface peers (servers + infra).
+        # Exclude ports facing other switches (swp* peers) — those are BGP uplinks.
+        eth_ports: set[str] = set()
+        for link in topology_json.get("content", {}).get("links", []):
+            if not (isinstance(link[0], dict) and isinstance(link[1], dict)):
+                continue
+            for i, ep in enumerate(link):
+                if (ep.get("node") == switch_name
+                        and ep.get("interface", "").startswith("swp")):
+                    peer_iface = link[1 - i].get("interface", "")
+                    if peer_iface.startswith("eth"):
+                        eth_ports.add(ep["interface"])
+
+        if not eth_ports:
+            continue
+
+        port_list = sorted(eth_ports, key=_swp_num)
+
+        commands = [
+            f"# Quick VLAN 200 bridge — runs before era-apply.service",
+            f"# Gives RHCOS nodes a DHCP path to utility within seconds of boot",
+            "set -x",
+            "ip link set br_default up || true",
+        ]
+        for port in port_list:
+            commands += [
+                f"ip link set {port} up 2>/dev/null || true",
+                f"ip link set {port} master br_default 2>/dev/null || true",
+                f"bridge vlan add dev {port} vid 200 pvid untagged 2>/dev/null || true",
+            ]
+
+        try:
+            create_node_instruction(
+                client, base_url, token, sim_id,
+                node_name=switch_name,
+                commands=commands,
+                name=f"{switch_name}-quick-bridge",
+                wait_for_network=False,
+            )
+            console.print(
+                f"  {switch_name}: quick VLAN 200 bridge queued "
+                f"({len(port_list)} access ports)"
+            )
+            configured += 1
+        except AirError as exc:
+            console.print(
+                f"  [yellow]Warning:[/] {switch_name} quick bridge NI failed: {exc}"
+            )
+
+    return configured
 
 
 def _inject_ubuntu_node_instructions(
@@ -1833,6 +2172,10 @@ def main() -> int:
                              "Default 0 = no retry (current behavior).")
     parser.add_argument("--retry-delay", type=int, default=300, metavar="SECONDS",
                         help="Seconds to wait between capacity retries. Default 300 (5 min).")
+    parser.add_argument("--ssh-key", metavar="PATH",
+                        help="Private SSH key for node provisioning (overrides ssh_key_path in "
+                             "inventory). Public key derived as <PATH>.pub. Also used as the "
+                             "Air jump-host key when provided.")
     args = parser.parse_args()
 
     # NOZTP implies full server config: the L2-era pipeline always brought
@@ -1880,7 +2223,7 @@ def main() -> int:
         return exc.exit_code
 
     base_url = config["base_url"]
-    ssh_key_path = config.get("ssh_key_path", "~/.ssh/id_ed25519")
+    ssh_key_path = args.ssh_key or config.get("ssh_key_path", "~/.ssh/id_ed25519")
 
     # SSH key reminder
     try:
@@ -2065,6 +2408,17 @@ def main() -> int:
                 _inject_external_conn_nat_ni(
                     client, base_url, token, sim_id, topology_json,
                 )
+                # RHCOS metadata spoof: deploy Ignition server on utility when
+                # any server node uses an RHCOS image.
+                console.print("Checking for RHCOS nodes (OpenStack metadata spoof)...")
+                n_rhcos = _inject_rhcos_metadata_server_ni(
+                    client, base_url, token, sim_id, inv_dir, topology_json,
+                    ssh_key=args.ssh_key,
+                )
+                if n_rhcos:
+                    console.print(f"  RHCOS metadata server queued for {n_rhcos} nodes")
+                else:
+                    console.print("  No RHCOS nodes — skipping metadata server")
 
             # Disable unattended-upgrades on Ubuntu nodes
             console.print("Disabling unattended-upgrades on Ubuntu nodes...")
@@ -2122,6 +2476,16 @@ def main() -> int:
                         "  L3 infra-node netplan already injected via first-boot NI "
                         "(utility/external-* eth1+) — no extra NOZTP step needed."
                     )
+
+            # Pre-configure OOB switch bridge via cloud-init (before first boot)
+            console.print("Pre-configuring OOB switch bridge via cloud-config...")
+            n_oob = _inject_oob_switch_cloud_config(
+                client, base_url, token, sim_id, topology_json,
+            )
+            if n_oob:
+                console.print(f"  {n_oob} OOB switch(es) bridge config assigned (cloud-init bootcmd)")
+            else:
+                console.print("  No OOB switches for RHCOS — skipping")
 
             # Server configuration: either full config (--server-config) or just eth0 IPs
             if args.server_config:

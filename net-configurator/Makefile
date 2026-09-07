@@ -655,12 +655,12 @@ validate-air-fabric: ## Stage 1: Deploy ERA fabric in Air and run ping matrix (S
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@$(MAKE) --no-print-directory generate \
 		ARCH=$(ARCH) SITE=$(SITE) SERVER_OS=$(SERVER_OS) \
-		$(if $(filter rhcos,$(SERVER_OS)),SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack),)
+		$(if $(filter rhcos,$(SERVER_OS)),SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-qemu),)
 	@$(MAKE) --no-print-directory generate-ocp \
 		ARCH=$(ARCH) SITE=$(SITE) NIC_MODE=kvm
 	$(if $(filter rhcos,$(SERVER_OS)),python3 scripts/upload_rhcos_image.py \
 		--ocp-version $(or $(OCP_VERSION),4.22) \
-		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack))
+		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-qemu))
 	python3 scripts/air-deploy.py \
 		--arch $(ARCH) --site $(SITE) --no-ztp
 	$(MAKE) air-ssh-check ARCH=$(ARCH) SITE=$(SITE) FIX=1
@@ -767,11 +767,11 @@ air-auth-test:  ## Test Air API credentials and connectivity - requires ARCH
 
 air-deploy:  ## Create Air simulation, configure SSH, and connect - requires ARCH
 	$(call check_arch,$@)
-	@python3 scripts/air-deploy.py --arch $(ARCH) --site $(SITE) $(if $(SERVER_CONFIG),--server-config,) $(if $(NOZTP),--no-ztp,) $(if $(RETRIES),--retry-on-capacity $(RETRIES),) $(if $(RETRY_DELAY),--retry-delay $(RETRY_DELAY),)
+	@python3 scripts/air-deploy.py --arch $(ARCH) --site $(SITE) $(if $(SERVER_CONFIG),--server-config,) $(if $(NOZTP),--no-ztp,) $(if $(RETRIES),--retry-on-capacity $(RETRIES),) $(if $(RETRY_DELAY),--retry-delay $(RETRY_DELAY),) $(if $(SSH_KEY),--ssh-key $(SSH_KEY),)
 
 air-deploy-retry:  ## Same as air-deploy but retries on capacity errors - RETRIES=3 RETRY_DELAY=300 by default
 	$(call check_arch,$@)
-	@python3 scripts/air-deploy.py --arch $(ARCH) --site $(SITE) $(if $(SERVER_CONFIG),--server-config,) $(if $(NOZTP),--no-ztp,) --retry-on-capacity $(or $(RETRIES),3) --retry-delay $(or $(RETRY_DELAY),300)
+	@python3 scripts/air-deploy.py --arch $(ARCH) --site $(SITE) $(if $(SERVER_CONFIG),--server-config,) $(if $(NOZTP),--no-ztp,) --retry-on-capacity $(or $(RETRIES),3) --retry-delay $(or $(RETRY_DELAY),300) $(if $(SSH_KEY),--ssh-key $(SSH_KEY),)
 
 air-deploy-switches-only:  ## Deploy a switches-only, no-ZTP Air sim (no server VMs; full switch config + unconnected stubs) - requires ARCH
 	$(call check_arch,$@)
@@ -966,7 +966,7 @@ deploy:  ## One-command deployment: import Excel + generate + create Air sim + Z
 		echo "  Step 4/8: Creating Air simulation + injecting server config..."; \
 	fi && \
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" && \
-	python3 scripts/air-deploy.py --arch $$_ARCH --site $$_SITE --server-config $(if $(NOZTP),--no-ztp,) && \
+	python3 scripts/air-deploy.py --arch $$_ARCH --site $$_SITE --server-config $(if $(NOZTP),--no-ztp,) $(if $(SSH_KEY),--ssh-key $(SSH_KEY),) && \
 	echo "" && \
 	echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" && \
 	echo "  Step 4b/8: Injecting SSH key into Air jump hosts..." && \
