@@ -636,22 +636,24 @@ class TopologyGenerator:
             role = classify_node(role_name)
             defaults = NODE_DEFAULTS.get(role, NODE_DEFAULTS["support"])
             node_os = self._resolve_os(name)
-            # RHCOS qemu images support legacy BIOS and boot fine without UEFI
-            # in Air simulation. Air's OVMF drops to a UEFI shell if it can't
-            # locate the EFI boot entry, leaving a blank unresponsive console.
-            is_uefi = False
+            is_rhcos = isinstance(node_os, str) and node_os.lower().startswith("rhcos")
+            # RHCOS 9.x (RHEL 9 baseline) requires x86_64-v2 CPU minimum.
+            # Air's default QEMU Virtual CPU 2.5+ is x86_64-v1 and cannot run
+            # RHCOS at all. host-passthrough exposes the bare-metal CPU to the VM.
+            cpu_mode = "host-passthrough" if is_rhcos else None
             nodes[name] = {
                 "cpu": defaults["cpu"],
                 "memory": defaults["memory"],
                 "storage": defaults["storage"],
                 "positioning": {"x": 0, "y": 0},
                 "os": node_os,
-                "features": {"uefi": is_uefi, "tpm": False},
+                "features": {"uefi": False, "tpm": False},
                 "pxehost": False,
                 "secureboot": False,
                 "oob": False,
                 "emulation_type": None,
                 "network_pci": {},
+                **({"cpu_mode": cpu_mode, "cpu_options": []} if cpu_mode else {}),
             }
 
         # Layout is applied later (in generate()) once air-oob-switch
@@ -1494,13 +1496,30 @@ class TopologyGenerator:
         Design doc: docs/plans/2026-05-20-l3-oob-air-topology.md
         """
         EDGE = "cust-net-edge-01"
-        OOB = "oob-switch-01"
-        if OOB not in nodes:
-            for n in nodes:
-                role = self._name_to_role.get(n, '')
-                if role == 'oob-switch' or classify_node(n) == 'oob':
-                    OOB = n
-                    break
+        # Pick the OOB switch that has the most server eth0 connections in
+        # the current (display_in_air-filtered) links. In a two-OOB-switch
+        # topology the Wire Map often marks server iDRAC ports on switch-02
+        # and BMC/NIC ports on switch-01 as "No" — so switch-01 ends up with
+        # zero visible server connections while switch-02 has all of them.
+        # Connecting utility to the busiest OOB switch puts dnsmasq and the
+        # metadata server on the same L2 segment as the servers that need them.
+        _oob_candidates = [
+            n for n in nodes
+            if self._name_to_role.get(n, '') == 'oob-switch'
+            or classify_node(n) == 'oob'
+        ]
+        if _oob_candidates:
+            _eth0_counts: dict = {n: 0 for n in _oob_candidates}
+            for _lnk in links:
+                if not (isinstance(_lnk[0], dict) and isinstance(_lnk[1], dict)):
+                    continue
+                for _ep, _other in ((_lnk[0], _lnk[1]), (_lnk[1], _lnk[0])):
+                    if (_ep["node"] in _eth0_counts
+                            and _other.get("interface") == "eth0"):
+                        _eth0_counts[_ep["node"]] += 1
+            OOB = max(_oob_candidates, key=lambda n: _eth0_counts[n])
+        else:
+            OOB = "oob-switch-01"
 
         if OOB not in nodes:
             print(f"    [WARN] L3 OOB mode requested but OOB switch anchor "
