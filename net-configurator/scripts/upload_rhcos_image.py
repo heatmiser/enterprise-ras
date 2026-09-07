@@ -8,8 +8,9 @@ Downloads the official RHCOS openstack qcow2 image for a target OCP version
 (e.g., 4.22), decompresses it locally, and uploads it to the NVIDIA Air org image
 catalog with `default_username="core"`.
 
-The openstack flavor is required for NVIDIA Air: RHCOS openstack images read Ignition
-via the OpenStack metadata service (169.254.169.254) which Air provides. The qemu
+The openstack flavor is required: it reads Ignition from
+http://169.254.169.254/openstack/latest/user_data, which the utility node spoofs
+on the OOB L2 segment so the stock image works with zero modification. The qemu
 flavor reads Ignition exclusively from QEMU fw_cfg, which Air does not populate.
 
 Usage:
@@ -214,12 +215,25 @@ def main():
     parser.add_argument("--cache-dir", default=".cache", help="Cache directory (default: .cache)")
     parser.add_argument("--force-download", action="store_true", help="Force re-downloading local image")
     parser.add_argument("--skip-upload", action="store_true", help="Download and decompress locally only")
+    parser.add_argument(
+        "--local-image", default=None, metavar="PATH",
+        help="Skip download; upload this local qcow2 directly (e.g. a patched copy)",
+    )
     args = parser.parse_args()
 
     parts = args.ocp_version.split(".")
     ver_nodots = "".join(parts[:2]) if len(parts) >= 2 else args.ocp_version.replace(".", "")
     image_name = args.image_name or f"rhcos-{ver_nodots}-openstack"
     cache_dir = Path(args.cache_dir)
+
+    # --local-image: bypass download entirely, upload the provided file directly.
+    if args.local_image:
+        qcow2_path = Path(args.local_image)
+        if not qcow2_path.exists():
+            sys.exit(f"ERROR: --local-image path does not exist: {qcow2_path}")
+        print(f"Using local image: {qcow2_path}")
+        upload_to_air(qcow2_path, image_name)
+        return
 
     # Check Air first — skip the download entirely if the image is already there.
     if not args.skip_upload and not args.force_download and air_image_exists(image_name):

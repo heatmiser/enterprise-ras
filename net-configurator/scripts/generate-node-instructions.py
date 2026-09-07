@@ -50,6 +50,8 @@ build_server_ni_commands = _air_deploy.build_server_ni_commands
 build_switch_ni_commands = _air_deploy.build_switch_ni_commands
 SERVER_NI_SKIP_PREFIXES = _air_deploy.SERVER_NI_SKIP_PREFIXES
 
+from airlib.rhcos import build_rhcos_nmstate_config, generate_rhcos_ignition_payload  # noqa: E402
+
 
 def write_file_cmd(path: str, content: str) -> str:
     """Return a single-line bash command that writes `content` to `path`.
@@ -99,88 +101,8 @@ def write_script(path: Path, content: str) -> None:
     print(f"  ✓ {path}")
 
 
-def generate_rhcos_ignition_payload(node_name: str, network_config: dict, ssh_key: str | None = None) -> str:
-    """Generate Ignition v3.4.0 JSON payload for RHCOS OpenStack qcow2 images.
-
-    Ignition configures:
-      1. /etc/hostname
-      2. /etc/nmstate/network-config.yml (from OCP networkConfig)
-      3. era-nmstate.service systemd unit that runs nmstatectl apply on first boot
-      4. serial-getty@ttyS0.service for live serial console in NVIDIA Air GUI
-      5. passwd.users core sshAuthorizedKeys (if ssh_key is provided)
-    """
-    nmstate_yaml = yaml.dump(network_config, default_flow_style=False, sort_keys=False)
-
-    def _data_url(content: str) -> str:
-        b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
-        return f"data:text/plain;charset=utf-8;base64,{b64}"
-
-    systemd_unit = (
-        "[Unit]\n"
-        "Description=Apply ERA Stage 1 NMState Configuration\n"
-        "After=NetworkManager.service\n"
-        "Requires=NetworkManager.service\n\n"
-        "[Service]\n"
-        "Type=oneshot\n"
-        "ExecStart=/usr/bin/nmstatectl apply /etc/nmstate/network-config.yml\n"
-        "RemainAfterExit=yes\n\n"
-        "[Install]\n"
-        "WantedBy=multi-user.target\n"
-    )
-
-    ignition_cfg: dict = {
-        "ignition": {
-            "version": "3.4.0"
-        },
-        "kernelArguments": {
-            "shouldExist": ["console=ttyS0,115200n8"]
-        },
-        "storage": {
-            "files": [
-                {
-                    "overwrite": True,
-                    "path": "/etc/hostname",
-                    "mode": 420,  # 0644 octal
-                    "contents": {
-                        "source": _data_url(f"{node_name}\n")
-                    }
-                },
-                {
-                    "overwrite": True,
-                    "path": "/etc/nmstate/network-config.yml",
-                    "mode": 420,  # 0644 octal
-                    "contents": {
-                        "source": _data_url(nmstate_yaml)
-                    }
-                }
-            ]
-        },
-        "systemd": {
-            "units": [
-                {
-                    "name": "era-nmstate.service",
-                    "enabled": True,
-                    "contents": systemd_unit
-                },
-                {
-                    "name": "serial-getty@ttyS0.service",
-                    "enabled": True
-                }
-            ]
-        }
-    }
-
-    if ssh_key:
-        ignition_cfg["passwd"] = {
-            "users": [
-                {
-                    "name": "core",
-                    "sshAuthorizedKeys": [ssh_key.strip()]
-                }
-            ]
-        }
-
-    return json.dumps(ignition_cfg, indent=2) + "\n"
+# generate_rhcos_ignition_payload and build_rhcos_nmstate_config live in
+# airlib.rhcos and are imported above.
 
 
 # ---------------------------------------------------------------------------
