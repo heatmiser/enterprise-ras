@@ -1030,6 +1030,23 @@ def _inject_rhcos_metadata_server_ni(
 
     _, pub_key_text = _resolve_ssh_key(ssh_key, common, all_vars)
 
+    cpu_gateway: str = common.get("cpu_gateway", "")
+    support_gateway: str = common.get("support_gateway", "")
+
+    # Build {node: {eth_name: mac}} from topology links for MAC-based NMState matching.
+    # Links are 2-element lists; stubs may be bare dicts — normalise both.
+    node_iface_macs: dict[str, dict[str, str]] = {}
+    for link in topology_json.get("content", {}).get("links", []):
+        endpoints = link if isinstance(link, list) else ([link] if isinstance(link, dict) else [])
+        for ep in endpoints:
+            if not isinstance(ep, dict):
+                continue
+            nname = ep.get("node", "")
+            iname = ep.get("interface", "")
+            emac = ep.get("mac", "")
+            if nname and iname and emac:
+                node_iface_macs.setdefault(nname, {})[iname] = emac
+
     IGNITION_DIR = "/opt/era/ignition"
     ip_map: dict[str, str] = {}
     dnsmasq_hosts: list[str] = []
@@ -1043,8 +1060,38 @@ def _inject_rhcos_metadata_server_ni(
             console.print(f"  [yellow]Warning:[/] {node_name}: no eth0_ip — skipping")
             continue
 
+        # Bond member MACs from topology links (eth1/eth2 as wired in Air topology)
+        iface_macs = node_iface_macs.get(node_name, {})
+        cpu_members = dev.get("interfaces", {}).get("cpu", [])
+        bond_mac1 = iface_macs.get(cpu_members[0], "") if len(cpu_members) > 0 else ""
+        bond_mac2 = iface_macs.get(cpu_members[1], "") if len(cpu_members) > 1 else ""
+
+        # GPU nodes use bond_ip (CPU VLAN); k8s/infra nodes use bond_ip1 (support VLAN)
+        raw_bond_ip = dev.get("bond_ip") or dev.get("bond_ip1", "")
+        bond_gw = cpu_gateway if dev.get("bond_ip") else support_gateway
+        # k8s switch ports are trunks with native VLAN 300; support traffic must be
+        # 802.1Q-tagged so the switch places it in the correct VLAN 400 domain.
+        bond_vlan = int(common.get("support_vlan", 400)) if dev.get("bond_ip1") else None
+
+        gpu_iface_list: list[dict] = dev.get("gpu_interfaces") or []
+        gpu_macs_map: dict[str, str] = {
+            gi["iface"]: iface_macs.get(gi["iface"], "")
+            for gi in gpu_iface_list if gi.get("iface")
+        }
+
         net_cfg = build_rhcos_nmstate_config(
-            eth0_ip, prefix_len=oob_prefix_len, gateway=oob_gateway, mac=mac,
+            eth0_ip,
+            prefix_len=oob_prefix_len,
+            gateway=oob_gateway,
+            mac=mac,
+            bond_ip=raw_bond_ip,
+            bond_gateway=bond_gw,
+            bond_mac1=bond_mac1,
+            bond_mac2=bond_mac2,
+            bond_mode="active-backup",
+            bond_vlan=bond_vlan,
+            gpu_ifaces=gpu_iface_list or None,
+            gpu_macs=gpu_macs_map or None,
         )
         ign_json = generate_rhcos_ignition_payload(node_name, net_cfg, ssh_key=pub_key_text)
         ign_filename = f"{node_name}.ign"
