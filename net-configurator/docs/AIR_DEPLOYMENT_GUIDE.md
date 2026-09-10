@@ -12,6 +12,12 @@ Step-by-step instructions for deploying ERA switch configurations in NVIDIA Air 
 - Python 3 with openpyxl, httpx, rich (`pip install openpyxl httpx rich`)
 - An SSH key pair (see Step 3 below)
 
+> **Deployment modes** — two server OS targets are supported:
+> - **Ubuntu** (default): standard path; servers configured via cloud-init / netplan.
+> - **RHCOS** (Red Hat CoreOS): for OCP pre-production fabric validation. Requires an
+>   additional one-time image preparation step before the first deployment.
+>   See [RHCOS Deployment Mode](#rhcos-deployment-mode) below.
+
 ---
 
 ## Getting Started
@@ -293,6 +299,199 @@ make air-destroy           # Teardown + cleanup
 | 10 | Generate | `make generate` (uses .era-context from import) |
 | 11 | Deploy | `make air-deploy` then `make air-ssh-check` then `make switch-ztp-deploy` |
 | 12 | Manage | `make air-list`, `make air-ssh-check`, `make air-destroy` |
+
+---
+
+## Deploying with a Custom Lab Excel File
+
+ERA is driven entirely by an Excel workbook that encodes your specific hardware
+inventory — hostnames, IP subnets, BGP ASNs, VLAN IDs, cabling (wire map), and
+optional features (LDAP, status page, Air deployment parameters).
+
+### Getting the right template
+
+Every architecture ships a committed blank template:
+
+| Architecture | Template path |
+|---|---|
+| `2-8-5-200` | `input/2-8-5-200/default/2-8-5-200.xlsx` |
+| `2-4-3-200` | `input/2-4-3-200/default/2-4-3-200.xlsx` |
+| `2-8-9-400` | `input/2-8-9-400/default/2-8-9-400.xlsx` |
+| *(others)* | `input/<arch>/default/<arch>.xlsx` |
+
+Ready-to-use pre-filled samples are also available (`input/sample-<arch>.xlsx`,
+`input/largescale-<arch>.xlsx`) as a starting point.
+
+### Filling out the workbook
+
+The key tabs to complete for an Air deployment:
+
+| Tab | What to fill in |
+|---|---|
+| **Settings** | `site_name` (unique label for this deployment, e.g. `acme-lab`), BGP ASNs, management subnets, `server_os` (`ubuntu` or `rhcos`), Air deployment URL/credentials section |
+| **VLANs & Profiles** | VLAN IDs, port profiles, port speeds |
+| **Wire Map** | Server-to-switch cabling per node (port, speed, VLAN membership) |
+
+> **`site_name`** — this becomes the directory name under `input/<arch>/` and the
+> simulation title prefix in Air. Use a short, filesystem-safe string (no spaces).
+
+### Importing your workbook
+
+```bash
+# Validate + import; arch/site auto-detected from the Settings tab
+make import EXCEL=/path/to/your-lab-config.xlsx
+
+# Override the site name (useful if site_name is blank in the workbook)
+make import EXCEL=/path/to/your-lab-config.xlsx SITE=my-lab
+
+# Check what was imported
+make show-context
+```
+
+After import, the file is copied to `input/<arch>/<site>/<arch>.xlsx` and
+`.era-context` is written so all subsequent `make` commands pick up the right
+arch/site automatically.
+
+### Full deployment from a custom Excel
+
+```bash
+# One-command: validate → import → generate → Air deploy → ZTP
+make deploy EXCEL=/path/to/your-lab-config.xlsx
+
+# Or step by step (after make import sets context):
+make generate                       # Excel → inventory + switch configs + topology
+make air-deploy NOZTP=1             # For RHCOS sites (see below)
+make switch-ztp-deploy              # OOB + ZTP server setup
+make validate-ping-matrix SERVER_ANSIBLE_USER=core   # RHCOS: use core
+```
+
+### Re-running after edits
+
+Edit your Excel file on your workstation, then re-import and regenerate:
+
+```bash
+make import EXCEL=/path/to/updated-lab-config.xlsx
+make generate
+# Re-deploy: destroy old sim first, then air-deploy
+make air-destroy && make air-deploy
+```
+
+---
+
+## RHCOS Deployment Mode
+
+RHCOS (Red Hat CoreOS) deployment validates the complete ERA fabric by booting
+actual RHCOS nodes that will later run OpenShift. It is used for pre-production
+fabric validation before bare-metal OCP installation.
+
+### How RHCOS ignition works in Air
+
+RHCOS reads its Ignition configuration from the OpenStack metadata endpoint:
+```
+http://169.254.169.254/openstack/latest/user_data
+```
+The `utility` node in the Air L3 OOB topology runs `rhcos_metadata_server.py`,
+which spoof-serves this endpoint over the OOB network. DHCP option 121 delivers
+a host route to `169.254.169.254/32` with each DHCP ACK so RHCOS can reach the
+server as soon as the OOB switch bridge is operational (~131 s after power-on).
+
+The OpenStack qcow2 flavor is required — the qemu flavor reads Ignition from QEMU
+fw_cfg, which Air does not populate.
+
+### Why a patched image is needed
+
+Two modifications are required to make the stock RHCOS OpenStack image work in Air:
+
+| Patch | Why |
+|---|---|
+| **GRUB boot delay (30 s)** | Air powers on all VMs simultaneously. OOB switch bridges take ~131 s to become operational. A 30 s GRUB delay shifts kernel start to T+30 s, so the bridge is ready at relative T ≈ 101 s — inside ignition's default 2-minute window. |
+| **Ignition fetch timeout (5 m)** | `ignition-fetch.service` uses `${IGNITION_ARGS}`, which the ignition generator never populates, so ignition silently uses its compiled-in 2 m fetch timeout. The patch replaces `${IGNITION_ARGS}` with `--fetch-timeout 5m` in the zstd-compressed initramfs CPIO, giving ignition enough margin to survive the switch boot delay. |
+
+### One-time image preparation
+
+Run this once per Air org (or when upgrading RHCOS version). The command is
+idempotent — it checks the Air image catalog first and skips download/patch/upload
+if the image already exists.
+
+```bash
+# Requires: guestfish (libguestfs-tools) + zstd
+make rhcos-image-prep
+```
+
+Or with explicit options:
+
+```bash
+make rhcos-image-prep OCP_VERSION=4.22 RHCOS_IMAGE_NAME=rhcos-422-openstack-grubdelay
+
+# Force re-download and re-patch (e.g. after an RHCOS errata update)
+make rhcos-image-prep RHCOS_FORCE_DOWNLOAD=1 RHCOS_FORCE_REPATCH=1
+
+# Prepare locally only (skip upload — useful for airgapped environments)
+make rhcos-image-prep RHCOS_SKIP_UPLOAD=1
+```
+
+System dependencies:
+
+```bash
+# RHEL/Fedora
+sudo dnf install libguestfs-tools zstd
+
+# Ubuntu/Debian
+sudo apt install libguestfs-tools zstd
+```
+
+The script downloads the base image from `mirror.openshift.com`, applies both
+patches, and uploads the result to Air as `rhcos-422-openstack-grubdelay`.
+Local copies are cached under `.cache/` (gitignored) so subsequent runs reuse them.
+
+### RHCOS deployment workflow
+
+Use this instead of the standard `make deploy` / `make air-full-deploy` when
+`server_os = rhcos` in your Excel workbook:
+
+```bash
+# Step 1 (one-time): prepare patched RHCOS image in Air
+make rhcos-image-prep
+
+# Step 2: import your custom Excel
+make import EXCEL=/path/to/your-rhcos-lab.xlsx
+
+# Step 3: generate all artifacts
+make generate SERVER_OS=rhcos SERVER_IMAGE=rhcos-422-openstack-grubdelay
+make generate-ocp NIC_MODE=kvm
+
+# Step 4: deploy Air simulation (NOZTP — switch configs injected as Node Instructions)
+make air-deploy NOZTP=1
+
+# Step 5: configure OOB + status page
+make switch-ztp-deploy NOZTP=1
+
+# Step 6: validate (SSH as 'core', not 'ubuntu')
+make validate-ping-matrix SERVER_ANSIBLE_USER=core
+```
+
+Or as a single command (all steps combined):
+
+```bash
+make validate-air-fabric ARCH=2-8-5-200 SITE=rhcos01 SERVER_OS=rhcos
+```
+
+`validate-air-fabric` runs `make rhcos-image-prep` automatically if `SERVER_OS=rhcos`
+is set, so the image preparation step is handled for you.
+
+### RHCOS boot timeline (Air)
+
+Understanding the timing helps diagnose issues:
+
+| Time (abs) | Event |
+|---|---|
+| T=0 s | All VMs power on simultaneously |
+| T=0–30 s | RHCOS at GRUB menu (30 s boot delay) |
+| T=30 s | Kernel starts; ignition-fetch begins (5 m timeout) |
+| T=30–131 s | OOB switch bridge building; 169.254.169.254 unreachable |
+| T≈131 s | OOB DHCP lease arrives; route to 169.254.169.254 installed |
+| T≈134 s | RHCOS fetches Ignition from utility metadata server |
+| T≈8–10 min | All RHCOS nodes at login prompt; NMState fabric config applied |
 
 ---
 

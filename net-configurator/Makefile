@@ -14,7 +14,8 @@ SHELL := /bin/bash
         validate-ping-matrix validate-requirements extract-requirements \
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
-        deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric
+        deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
+        rhcos-image-prep
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -647,6 +648,18 @@ teardown-kvm:  ## Teardown KVM digital twin (destroy VMs, bridges, storage)
 		$(if $(KVM_IMAGE_DIR),-e kvm_image_dir=$(KVM_IMAGE_DIR),) \
 		--ask-become-pass
 
+rhcos-image-prep:  ## Prepare and upload patched RHCOS image to Air (idempotent — skips if image exists)
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo "  RHCOS Image Preparation  image=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-grubdelay)"
+	@echo "  Checks Air catalog first — downloads/patches/uploads only if absent."
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	python3 scripts/prepare_rhcos_image.py \
+		--ocp-version $(or $(OCP_VERSION),4.22) \
+		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-grubdelay) \
+		$(if $(RHCOS_FORCE_REPATCH),--force-repatch,) \
+		$(if $(RHCOS_FORCE_DOWNLOAD),--force-download,) \
+		$(if $(RHCOS_SKIP_UPLOAD),--skip-upload,)
+
 validate-air-fabric: ## Stage 1: Deploy ERA fabric in Air and run ping matrix (SERVER_OS=ubuntu|rhcos, default=ubuntu)
 	$(call check_ansible)
 	@test -n "$(ARCH)" || { echo "❌ ERROR: ARCH is required (e.g. make validate-air-fabric ARCH=2-8-5-200)"; exit 1; }
@@ -655,12 +668,12 @@ validate-air-fabric: ## Stage 1: Deploy ERA fabric in Air and run ping matrix (S
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@$(MAKE) --no-print-directory generate \
 		ARCH=$(ARCH) SITE=$(SITE) SERVER_OS=$(SERVER_OS) \
-		$(if $(filter rhcos,$(SERVER_OS)),SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-qemu),)
+		$(if $(filter rhcos,$(SERVER_OS)),SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-grubdelay),)
 	@$(MAKE) --no-print-directory generate-ocp \
 		ARCH=$(ARCH) SITE=$(SITE) NIC_MODE=kvm
-	$(if $(filter rhcos,$(SERVER_OS)),python3 scripts/upload_rhcos_image.py \
-		--ocp-version $(or $(OCP_VERSION),4.22) \
-		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-qemu))
+	$(if $(filter rhcos,$(SERVER_OS)),$(MAKE) --no-print-directory rhcos-image-prep \
+		OCP_VERSION=$(or $(OCP_VERSION),4.22) \
+		RHCOS_IMAGE_NAME=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-grubdelay))
 	python3 scripts/air-deploy.py \
 		--arch $(ARCH) --site $(SITE) --no-ztp
 	$(MAKE) air-ssh-check ARCH=$(ARCH) SITE=$(SITE) FIX=1
