@@ -2460,7 +2460,7 @@ def main() -> int:
                 console.print("Checking for RHCOS nodes (OpenStack metadata spoof)...")
                 n_rhcos = _inject_rhcos_metadata_server_ni(
                     client, base_url, token, sim_id, inv_dir, topology_json,
-                    ssh_key=args.ssh_key,
+                    ssh_key=ssh_key_path,
                 )
                 if n_rhcos:
                     console.print(f"  RHCOS metadata server queued for {n_rhcos} nodes")

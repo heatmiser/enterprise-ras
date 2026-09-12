@@ -163,8 +163,12 @@ def air_image_exists(image_name: str) -> bool:
         return False
 
 
-def upload_to_air(local_qcow2: Path, image_name: str) -> None:
-    """Upload qcow2 image to NVIDIA Air catalog if not already present."""
+def upload_to_air(local_qcow2: Path, image_name: str, force: bool = False) -> None:
+    """Upload qcow2 image to NVIDIA Air catalog.
+
+    If the image already exists and force=False, skip upload.
+    If force=True, delete the existing image first and re-upload.
+    """
     try:
         from air_sdk import AirApi
         from air_sdk.utils import wait_for_state
@@ -182,13 +186,18 @@ def upload_to_air(local_qcow2: Path, image_name: str) -> None:
 
     existing = next((img for img in api.images.list(search=image_name) if img.name == image_name), None)
     if existing:
-        if not getattr(existing, "mountpoint", None):
-            try:
-                api.images.patch(existing.id, mountpoint="/dev/sda")
-            except Exception:
-                pass
-        print(f"Air image {image_name!r} already exists (id={existing.id}, upload_status={existing.upload_status!r}). Skipping upload.")
-        return
+        if force:
+            print(f"  --force-upload: deleting existing Air image {image_name!r} (id={existing.id}) ...")
+            api.images.delete(existing.id)
+            print(f"  Deleted. Proceeding with upload.")
+        else:
+            if not getattr(existing, "mountpoint", None):
+                try:
+                    api.images.patch(existing.id, mountpoint="/dev/sda")
+                except Exception:
+                    pass
+            print(f"Air image {image_name!r} already exists (id={existing.id}, upload_status={existing.upload_status!r}). Skipping upload.")
+            return
 
     size_gb = local_qcow2.stat().st_size / (1024**3)
     print(f"Uploading {local_qcow2} ({size_gb:.2f} GB) to Air as image {image_name!r} ...")

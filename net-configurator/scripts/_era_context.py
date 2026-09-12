@@ -34,6 +34,7 @@ import sys
 from pathlib import Path
 
 VALID_ARCHS = {"2-4-3-200", "2-4-5-800", "2-8-5-200", "2-8-9-400", "2-8-9-800", "2-8-9-400-SP"}
+VALID_SERVER_OS = {"ubuntu", "rhcos"}
 # Site names end up in filesystem paths (input/<arch>/<site>/...), so
 # require a conservative allowlist — no slashes, no dots-only, no spaces.
 SITE_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
@@ -55,6 +56,7 @@ def main() -> int:
 
     arch = None
     site = None
+    server_os = None
     for raw_line in CONTEXT_PATH.read_text().splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -66,6 +68,10 @@ def main() -> int:
         m = re.match(r"^site:\s*(\S+)\s*$", line)
         if m:
             site = m.group(1)
+            continue
+        m = re.match(r"^server_os:\s*(\S+)\s*$", line)
+        if m:
+            server_os = m.group(1)
             continue
 
     if arch is None:
@@ -86,10 +92,18 @@ def main() -> int:
     if ".." in site or site in ("", ".", ".."):
         die(f"invalid site {site!r} in .era-context — disallowed value")
 
+    if server_os is not None and server_os not in VALID_SERVER_OS:
+        die(
+            f"invalid server_os {server_os!r} in .era-context — must be one of: "
+            + ", ".join(sorted(VALID_SERVER_OS))
+        )
+
     # shlex.quote preserves single quotes if the value ever contains any,
     # though the regex above already forbids them.
     print(f"_ARCH={shlex.quote(arch)}")
     print(f"_SITE={shlex.quote(site)}")
+    if server_os is not None:
+        print(f"_SERVER_OS={shlex.quote(server_os)}")
     return 0
 
 

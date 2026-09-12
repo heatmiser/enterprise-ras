@@ -421,7 +421,7 @@ make rhcos-image-prep
 Or with explicit options:
 
 ```bash
-make rhcos-image-prep OCP_VERSION=4.22 RHCOS_IMAGE_NAME=rhcos-422-openstack-grubdelay
+make rhcos-image-prep OCP_VERSION=4.22 RHCOS_IMAGE_NAME=rhcos-422-openstack-gd
 
 # Force re-download and re-patch (e.g. after an RHCOS errata update)
 make rhcos-image-prep RHCOS_FORCE_DOWNLOAD=1 RHCOS_FORCE_REPATCH=1
@@ -441,7 +441,7 @@ sudo apt install libguestfs-tools zstd
 ```
 
 The script downloads the base image from `mirror.openshift.com`, applies both
-patches, and uploads the result to Air as `rhcos-422-openstack-grubdelay`.
+patches, and uploads the result to Air as `rhcos-422-openstack-gd`.
 Local copies are cached under `.cache/` (gitignored) so subsequent runs reuse them.
 
 ### RHCOS deployment workflow
@@ -457,7 +457,7 @@ make rhcos-image-prep
 make import EXCEL=/path/to/your-rhcos-lab.xlsx
 
 # Step 3: generate all artifacts
-make generate SERVER_OS=rhcos SERVER_IMAGE=rhcos-422-openstack-grubdelay
+make generate SERVER_OS=rhcos SERVER_IMAGE=rhcos-422-openstack-gd
 make generate-ocp NIC_MODE=kvm
 
 # Step 4: deploy Air simulation (NOZTP — switch configs injected as Node Instructions)

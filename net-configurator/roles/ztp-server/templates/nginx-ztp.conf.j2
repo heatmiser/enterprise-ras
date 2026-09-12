@@ -1,8 +1,8 @@
 {# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved. #}
 {# SPDX-License-Identifier: MIT #}
 server {
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen {{ nginx_ztp_port | default(80) }} default_server;
+    listen [::]:{{ nginx_ztp_port | default(80) }} default_server;
 
     root /var/www/ztp;
     index index.html;

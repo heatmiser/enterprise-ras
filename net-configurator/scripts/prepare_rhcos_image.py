@@ -45,7 +45,7 @@ Usage
   python3 scripts/prepare_rhcos_image.py --force-download --force-repatch
 
   # Custom version or name
-  python3 scripts/prepare_rhcos_image.py --ocp-version 4.22 --image-name rhcos-422-openstack-grubdelay
+  python3 scripts/prepare_rhcos_image.py --ocp-version 4.22 --image-name rhcos-422-openstack-gd
 """
 
 import argparse
@@ -65,9 +65,9 @@ from upload_rhcos_image import (
     upload_to_air,
 )
 
-DEFAULT_IMAGE_NAME = "rhcos-422-openstack-grubdelay"
-DEFAULT_GRUB_DELAY = 30         # seconds
-DEFAULT_FETCH_TIMEOUT = "5m"    # ignition --fetch-timeout value
+DEFAULT_IMAGE_NAME = "rhcos-422-openstack-gd"
+DEFAULT_GRUB_DELAY = 90         # seconds — Air OOB bridge ~131s wall; 90s GRUB shift ensures NM DHCP window covers bridge-ready event
+DEFAULT_FETCH_TIMEOUT = "12m"   # ignition --fetch-timeout value
 _IGN_SERVICE = "usr/lib/systemd/system/ignition-fetch.service"
 
 
@@ -358,12 +358,13 @@ def prepare_rhcos_image(
     fetch_timeout: str,
     force_repatch: bool,
     force_download: bool,
+    force_upload: bool,
     skip_upload: bool,
 ) -> None:
     """Full pipeline: Air check → download → patch → upload."""
 
     # --- Step 0: check whether the image is already in Air ---
-    if not skip_upload and not force_repatch and air_image_exists(image_name):
+    if not skip_upload and not force_repatch and not force_upload and air_image_exists(image_name):
         print(f"\n✓ '{image_name}' already in Air — nothing to do.\n")
         return
 
@@ -408,7 +409,7 @@ def prepare_rhcos_image(
         return
 
     print(f"\n── Step 4/4: Upload to Air as '{image_name}' ───────────────────────")
-    upload_to_air(patched_image, image_name)
+    upload_to_air(patched_image, image_name, force=force_upload)
     print(f"\n✓ '{image_name}' is ready in Air.\n")
 
 
@@ -453,6 +454,10 @@ def main() -> None:
         "--skip-upload", action="store_true",
         help="Prepare image locally only; do not upload to Air",
     )
+    parser.add_argument(
+        "--force-upload", action="store_true",
+        help="Delete existing Air image and re-upload (use with --force-repatch to replace a patched image)",
+    )
     args = parser.parse_args()
 
     prepare_rhcos_image(
@@ -463,6 +468,7 @@ def main() -> None:
         fetch_timeout=args.fetch_timeout,
         force_repatch=args.force_repatch,
         force_download=args.force_download,
+        force_upload=args.force_upload,
         skip_upload=args.skip_upload,
     )
 
