@@ -111,7 +111,7 @@
               done
               return 1
             }
-            {% set _wait_gw = common.get("cpu_gateway") or common.get("support_gateway") %}
+            {% set _wait_gw = common.get("cpu_gateway") if src_is_compute else (common.get("support_gateway") if src_is_support else common.get("storage_gateway", "")) %}
             {% if _wait_gw and src_inband_ip %}
             _wait_gateway {{ _wait_gw }} {{ src_inband_ip }} || true
             {% endif %}

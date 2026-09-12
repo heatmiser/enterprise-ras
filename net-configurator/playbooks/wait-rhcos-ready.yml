@@ -1,0 +1,80 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Block until all RHCOS compute nodes (nodes + support groups) are SSH-reachable
+# from the utility jump host and era-nmstate.service has applied successfully.
+#
+# RHCOS nodes are only reachable via the utility node (OOB subnet not routed
+# to the operator workstation), so all SSH polling runs from the jump host —
+# matching the pattern used by validate-ping-matrix.yml.
+#
+# Usage:
+#   make wait-rhcos-ready                   # server_os auto-detected from .era-context
+#   make wait-rhcos-ready SERVER_OS=rhcos   # explicit
+- name: Wait for RHCOS nodes to be SSH-ready and NMState applied
+  hosts: jump
+  gather_facts: false
+  vars:
+    rhcos_nodes: "{{ groups.get('nodes', []) + groups.get('support', []) }}"
+    ssh_user: "{{ server_ansible_user | default('core') }}"
+    ssh_key: "/home/ubuntu/.ssh/id_ed25519"
+  tasks:
+    - name: Show wait plan
+      ansible.builtin.debug:
+        msg: "Waiting for {{ rhcos_nodes | length }} RHCOS node(s): {{ rhcos_nodes | join(', ') }}"
+
+    - name: Ensure SSH private key is present on jump host
+      ansible.builtin.copy:
+        src: "{{ ocp_ssh_key_path | default('~/.ssh/id_ed25519_ipp5-ocp') | regex_replace('\\.pub$', '') }}"
+        dest: "{{ ssh_key }}"
+        mode: "0600"
+      ignore_errors: true
+
+    # Poll each node in parallel (async + poll:0). Each async job runs a shell
+    # loop on the utility: SSH to the node every 15 s until era-nmstate shows
+    # ExecMainStatus=0, or until 30 min timeout.
+    - name: Poll nodes for SSH + era-nmstate ready (parallel)
+      ansible.builtin.shell: |
+        NODE="{{ hostvars[item].ansible_host }}"
+        SSH_CMD="ssh -i {{ ssh_key }} \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          -o BatchMode=yes \
+          {{ ssh_user }}@${NODE}"
+        for i in $(seq 1 120); do
+          STATUS=$($SSH_CMD \
+            "systemctl show era-nmstate --property=ActiveState,ExecMainStatus --no-pager" \
+            2>/dev/null)
+          if echo "$STATUS" | grep -q "ExecMainStatus=0"; then
+            echo "{{ item }}: ready (attempt ${i})"
+            exit 0
+          fi
+          echo "{{ item }}: not ready yet (attempt ${i}) — ${STATUS:-no SSH}"
+          sleep 15
+        done
+        echo "{{ item }}: TIMEOUT after 30 min"
+        exit 1
+      loop: "{{ rhcos_nodes }}"
+      loop_control:
+        label: "{{ item }}"
+      async: 1800
+      poll: 0
+      register: poll_async
+      changed_when: false
+
+    - name: Wait for all nodes to report ready
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ poll_async.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      register: poll_result
+      until: poll_result.finished
+      retries: 120
+      delay: 15
+      failed_when: poll_result.rc is defined and poll_result.rc != 0
+
+    - name: Report all nodes ready
+      ansible.builtin.debug:
+        msg: "All {{ rhcos_nodes | length }} RHCOS nodes are SSH-reachable and NMState has applied."

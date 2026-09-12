@@ -11,7 +11,7 @@ SHELL := /bin/bash
         use show-context clear-context import \
         topology validate-topology validate validate-excel validate-ztp validate-ztp-direct \
         validate-config validate-servers validate-oob-bgp fix-ext-storage \
-        validate-ping-matrix validate-requirements extract-requirements \
+        validate-ping-matrix wait-rhcos-ready validate-requirements extract-requirements \
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
@@ -76,6 +76,14 @@ ifneq ($(wildcard .era-context),)
         _CTX_SITE := $(subst ',,$(_CTX_SITE))
         ifneq ($(_CTX_SITE),)
             SITE := $(_CTX_SITE)
+        endif
+    endif
+    ifndef SERVER_OS
+        _CTX_SERVER_OS := $(patsubst _SERVER_OS=%,%,$(filter _SERVER_OS=%,$(_CTX)))
+        _CTX_SERVER_OS := $(subst ',,$(_CTX_SERVER_OS))
+        _CTX_SERVER_OS := $(filter ubuntu rhcos,$(_CTX_SERVER_OS))
+        ifneq ($(_CTX_SERVER_OS),)
+            SERVER_OS := $(_CTX_SERVER_OS)
         endif
     endif
 endif
@@ -577,6 +585,16 @@ else
 	@echo "Step 5: Cross-check netplan ↔ topology eth-numbering..."
 	@python3 scripts/check-eth-consistency.py --arch $(ARCH) --site $(SITE)
 endif
+	@if [ -f ".era-context" ]; then \
+		if grep -q '^server_os:' .era-context; then \
+			sed -i 's/^server_os:.*$$/server_os: $(SERVER_OS)/' .era-context; \
+		else \
+			echo "server_os: $(SERVER_OS)" >> .era-context; \
+		fi; \
+	else \
+		printf '# ERA Deployment Context\narch: $(ARCH)\nsite: $(SITE)\nserver_os: $(SERVER_OS)\n' > .era-context; \
+	fi
+	@echo "  ↳ server_os=$(SERVER_OS) saved to .era-context"
 
 generate-ocp:  ## Generate OCP Ansible inventory + ABI manifests from ERA inventory - requires ARCH, optional SITE
 	$(call check_arch,$@)
@@ -650,14 +668,15 @@ teardown-kvm:  ## Teardown KVM digital twin (destroy VMs, bridges, storage)
 
 rhcos-image-prep:  ## Prepare and upload patched RHCOS image to Air (idempotent — skips if image exists)
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-	@echo "  RHCOS Image Preparation  image=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-grubdelay)"
+	@echo "  RHCOS Image Preparation  image=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-gd)"
 	@echo "  Checks Air catalog first — downloads/patches/uploads only if absent."
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	python3 scripts/prepare_rhcos_image.py \
 		--ocp-version $(or $(OCP_VERSION),4.22) \
-		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-grubdelay) \
+		--image-name $(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-gd) \
 		$(if $(RHCOS_FORCE_REPATCH),--force-repatch,) \
 		$(if $(RHCOS_FORCE_DOWNLOAD),--force-download,) \
+		$(if $(RHCOS_FORCE_UPLOAD),--force-upload,) \
 		$(if $(RHCOS_SKIP_UPLOAD),--skip-upload,)
 
 validate-air-fabric: ## Stage 1: Deploy ERA fabric in Air and run ping matrix (SERVER_OS=ubuntu|rhcos, default=ubuntu)
@@ -668,15 +687,20 @@ validate-air-fabric: ## Stage 1: Deploy ERA fabric in Air and run ping matrix (S
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@$(MAKE) --no-print-directory generate \
 		ARCH=$(ARCH) SITE=$(SITE) SERVER_OS=$(SERVER_OS) \
-		$(if $(filter rhcos,$(SERVER_OS)),SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-grubdelay),)
+		$(if $(filter rhcos,$(SERVER_OS)),SERVER_IMAGE=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-gd),)
 	@$(MAKE) --no-print-directory generate-ocp \
 		ARCH=$(ARCH) SITE=$(SITE) NIC_MODE=kvm
 	$(if $(filter rhcos,$(SERVER_OS)),$(MAKE) --no-print-directory rhcos-image-prep \
 		OCP_VERSION=$(or $(OCP_VERSION),4.22) \
-		RHCOS_IMAGE_NAME=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-grubdelay))
+		RHCOS_IMAGE_NAME=$(or $(RHCOS_IMAGE_NAME),rhcos-422-openstack-gd))
 	python3 scripts/air-deploy.py \
 		--arch $(ARCH) --site $(SITE) --no-ztp
 	$(MAKE) air-ssh-check ARCH=$(ARCH) SITE=$(SITE) FIX=1
+	$(MAKE) --no-print-directory switch-ztp-deploy \
+		ARCH=$(ARCH) SITE=$(SITE) NOZTP=1 SERVER_OS=$(SERVER_OS) AUTO_CONFIRM=1
+	$(if $(filter rhcos,$(SERVER_OS)),\
+		$(MAKE) --no-print-directory wait-rhcos-ready \
+			ARCH=$(ARCH) SITE=$(SITE) SERVER_OS=$(SERVER_OS))
 	ansible-playbook playbooks/validate-ping-matrix.yml \
 		-i output/$(ARCH)/$(SITE)/inventory/hosts \
 		$(if $(SITE_VARS),-e @$(SITE_VARS),) \
@@ -1415,7 +1439,8 @@ validate-ping-matrix:  ## Run full server-to-server ping matrix (all VLANs) - re
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	@ansible-playbook playbooks/validate-ping-matrix.yml \
 		-i $(INVENTORY_DIR)/hosts \
-		-e '{"local_report": "$(CURDIR)/$(REPORT_DIR)/ping-matrix-report.txt"}' && \
+		-e '{"local_report": "$(CURDIR)/$(REPORT_DIR)/ping-matrix-report.txt"}' \
+		-e server_ansible_user=$(or $(SERVER_ANSIBLE_USER),$(if $(filter rhcos,$(SERVER_OS)),core,ubuntu)) && \
 	echo "" && \
 	cat $(REPORT_DIR)/ping-matrix-report.txt && \
 	_STATUS_PAGE=$$(grep -q 'status_page_enabled.*[Yy]es\|status_page_enabled.*[Tt]rue' $(INVENTORY_DIR)/group_vars/all/main.yml 2>/dev/null && echo 1); \
@@ -1427,6 +1452,15 @@ validate-ping-matrix:  ## Run full server-to-server ping matrix (all VLANs) - re
 			echo "  ✅ Report uploaded to ZTP status page" || \
 			echo "  ⚠️  Report upload failed (non-critical)"; \
 	fi
+
+wait-rhcos-ready:  ## Block until all RHCOS nodes are SSH-reachable and era-nmstate has applied - requires ARCH
+	$(call check_arch,$@)
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo "  Waiting for RHCOS nodes  arch=$(ARCH)  site=$(SITE)"
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@ansible-playbook playbooks/wait-rhcos-ready.yml \
+		-i $(INVENTORY_DIR)/hosts \
+		-e server_ansible_user=$(or $(SERVER_ANSIBLE_USER),$(if $(filter rhcos,$(SERVER_OS)),core,ubuntu))
 
 validate-all:  ## Run all 5 validations: topology + config (canary) + ZTP + switch-health + servers (Servers N/A for switches-only) - requires ARCH
 	$(call check_arch,$@)
@@ -1663,7 +1697,8 @@ switch-ztp-deploy:  ## Complete ZTP deployment - requires ARCH, optional SITE LD
 	@echo "  Status page is independent of ZTP — runs even in NOZTP=1 so the"
 	@echo "  operator dashboard + /reports/ landing zone exist for validate-*."
 	@ansible-playbook playbooks/setup-status-page.yml -i $(INVENTORY_DIR)/hosts \
-		-e "config_output_dir=../$(CONFIG_OUTPUT_DIR)"
+		-e "config_output_dir=../$(CONFIG_OUTPUT_DIR)" \
+		$(if $(filter rhcos,$(SERVER_OS)),-e nginx_ztp_port=8080,)
 	@echo ""
 	@if [ "$(NOZTP)" = "1" ]; then \
 		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
