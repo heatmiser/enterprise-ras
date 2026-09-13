@@ -1,0 +1,72 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Block until all Ubuntu server nodes are SSH-reachable from the utility jump host.
+#
+# Ubuntu nodes have no long-running config service to gate on — netplan is applied
+# synchronously by the Node Instruction script during cloud-init, so SSH reachability
+# is the only readiness signal needed.
+#
+# Usage:
+#   make wait-ubuntu-ready                    # server_os auto-detected from .era-context
+- name: Wait for Ubuntu nodes to be SSH-ready
+  hosts: jump
+  gather_facts: false
+  vars:
+    server_nodes: "{{ groups.get('nodes', []) + groups.get('support', []) }}"
+    ssh_user: "{{ server_ansible_user | default('ubuntu') }}"
+    ssh_key: "/home/ubuntu/.ssh/id_era_server"
+  tasks:
+    - name: Show wait plan
+      ansible.builtin.debug:
+        msg: "Waiting for {{ server_nodes | length }} Ubuntu node(s): {{ server_nodes | join(', ') }}"
+
+    - name: Ensure SSH private key is present on jump host
+      ansible.builtin.copy:
+        src: "{{ ssh_key_path | default('~/.ssh/id_rsa') | regex_replace('\\.pub$', '') }}"
+        dest: "{{ ssh_key }}"
+        mode: "0600"
+      ignore_errors: true
+
+    - name: Poll nodes for SSH reachability (parallel)
+      ansible.builtin.shell: |
+        NODE="{{ hostvars[item].ansible_host }}"
+        SSH_CMD="ssh -i {{ ssh_key }} \
+          -o StrictHostKeyChecking=no \
+          -o ConnectTimeout=10 \
+          -o BatchMode=yes \
+          {{ ssh_user }}@${NODE}"
+        for i in $(seq 1 80); do
+          if $SSH_CMD "true" 2>/dev/null; then
+            echo "{{ item }}: ready (attempt ${i})"
+            exit 0
+          fi
+          echo "{{ item }}: not ready yet (attempt ${i})"
+          sleep 15
+        done
+        echo "{{ item }}: TIMEOUT after 20 min"
+        exit 1
+      loop: "{{ server_nodes }}"
+      loop_control:
+        label: "{{ item }}"
+      async: 1200
+      poll: 0
+      register: poll_async
+      changed_when: false
+
+    - name: Wait for all nodes to report ready
+      ansible.builtin.async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ poll_async.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      register: poll_result
+      until: poll_result.finished
+      retries: 80
+      delay: 15
+      failed_when: poll_result.rc is defined and poll_result.rc != 0
+
+    - name: Report all nodes ready
+      ansible.builtin.debug:
+        msg: "All {{ server_nodes | length }} Ubuntu nodes are SSH-reachable."

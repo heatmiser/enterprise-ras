@@ -30,6 +30,7 @@ import argparse
 import base64
 import importlib
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -50,6 +51,7 @@ build_server_ni_commands = _air_deploy.build_server_ni_commands
 build_switch_ni_commands = _air_deploy.build_switch_ni_commands
 SERVER_NI_SKIP_PREFIXES = _air_deploy.SERVER_NI_SKIP_PREFIXES
 
+from airlib.env import _load_shared_air_vault
 from airlib.rhcos import build_rhcos_nmstate_config, generate_rhcos_ignition_payload  # noqa: E402
 
 
@@ -434,6 +436,13 @@ def main() -> None:
         help="Server OS for Node Instructions: ubuntu (default) generates netplan .sh; "
              "rhcos/rhel generates Ignition v3.4.0 JSON for RHCOS OpenStack qcow2 images.",
     )
+    parser.add_argument(
+        "--ssh-key",
+        default=None,
+        metavar="PRIVATE_KEY_PATH",
+        help="Path to the ERA SSH private key (default: ssh_key_path from inventory, "
+             "then ~/.ssh/id_rsa). Public key is derived by appending .pub.",
+    )
     args = parser.parse_args()
 
     base = Path("output") / args.arch / args.site
@@ -509,6 +518,39 @@ def main() -> None:
     common = global_vars.get("common", {})
 
     # Server NIs ----------------------------------------------------------
+    # Resolve the ERA SSH public key once — used by both ubuntu (authorized_keys
+    # injection) and rhcos (ignition payload) paths so both OS modes inject the
+    # same key. Priority: --ssh-key CLI arg → air_ssh_key_path from vault
+    # (.era-secrets/air-secrets.yml) → ssh_key_path from main.yml →
+    # ~/.ssh/id_rsa default. Public key is derived from private key by appending .pub.
+    _pub_key_text: str | None = None
+    try:
+        # Read vault directly (no defaults) so _vault_key is None when
+        # air_ssh_key_path is not explicitly set, allowing ~/.ssh/id_rsa fallback.
+        _vault = _load_shared_air_vault()
+        _vault_key = (
+            _vault.get("air_ssh_key_path")
+            or os.environ.get("AIR_SSH_KEY_PATH")
+        ) or None
+    except Exception:
+        _vault_key = None
+    _raw_key_path = (
+        args.ssh_key
+        or _vault_key
+        or global_vars.get("common", {}).get("ssh_key_path")
+        or global_vars.get("ssh_key_path")
+        or "~/.ssh/id_rsa"
+    )
+    try:
+        _priv = Path(_raw_key_path).expanduser()
+        _pub = _priv.with_suffix(".pub") if not str(_priv).endswith(".pub") else _priv
+        if _pub.exists():
+            _pub_key_text = _pub.read_text().strip()
+        else:
+            print(f"  Warning: SSH public key not found at {_pub}; skipping key injection.", file=sys.stderr)
+    except Exception as _e:
+        print(f"  Warning: could not resolve SSH key from {_raw_key_path}: {_e}", file=sys.stderr)
+
     server_count = 0
     ocp_hv_dir = base / "ocp" / "inventory" / "host_vars"
     for node_name, dev in sorted(devices.items()):
@@ -529,22 +571,10 @@ def main() -> None:
                 )
                 continue
 
-            ssh_key = None
-            ocp_gv_path = base / "ocp" / "inventory" / "group_vars" / "all" / "ocp.yml"
-            ocp_gv = load_yaml(ocp_gv_path)
-            ssh_key_path = ocp_gv.get("ocp_ssh_key_path")
-            if ssh_key_path:
-                try:
-                    p = Path(ssh_key_path).expanduser()
-                    if p.exists():
-                        ssh_key = p.read_text().strip()
-                except Exception:
-                    pass
-
-            script = generate_rhcos_ignition_payload(node_name, net_cfg, ssh_key=ssh_key)
+            script = generate_rhcos_ignition_payload(node_name, net_cfg, ssh_key=_pub_key_text)
             out_file = output_dir / f"{node_name}.ign"
         else:
-            commands = build_server_ni_commands(node_name, dev, common)
+            commands = build_server_ni_commands(node_name, dev, common, pub_key=_pub_key_text)
             if not commands:
                 continue
             script = "#!/bin/bash\n" + (

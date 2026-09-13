@@ -101,7 +101,9 @@ NVIDIA Air uses NGC (NVIDIA GPU Cloud) for authentication.
 
 ### Step 3: Create an SSH Key Pair (if you don't have one)
 
-The Air deploy script distributes your SSH public key to all nodes in the simulation, enabling passwordless access.
+The Air deploy script distributes your SSH public key to all nodes in the simulation,
+enabling passwordless access. Both Ubuntu servers (via `authorized_keys`) and RHCOS
+nodes (via the ignition payload) receive the key at deploy time.
 
 ```bash
 # Generate an ed25519 key (recommended)
@@ -110,6 +112,18 @@ ssh-keygen -t ed25519 -C "your-email@company.com"
 # Or check if you already have one
 ls ~/.ssh/id_ed25519.pub
 ```
+
+**Key resolution — runtime precedence:**
+
+| Priority | Source | Notes |
+|----------|--------|-------|
+| 1 | `--ssh-key <path>` CLI arg | `make air-deploy SSH_KEY=~/.ssh/my-key` |
+| 2 | `AIR_SSH_KEY_PATH` environment variable | CI/CD pipelines |
+| 3 | `air_ssh_key_path` in `.era-secrets/air-secrets.yml` | Set via `make air-setup`; omit to use the default |
+| 4 | `~/.ssh/id_rsa` | Hard default — no vault entry needed for this key |
+
+The public key is derived by appending `.pub` to the private key path. Both files must exist.
+`air_ssh_key_path` in the vault is **optional** — only set it when using a non-default key.
 
 ### Step 4: Register Your SSH Key in Air
 
