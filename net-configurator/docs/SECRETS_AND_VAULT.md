@@ -51,6 +51,32 @@ the shared vault alongside the credentials, selected during `make air-setup`. Th
 per-deployment Excel and inventory do not carry Air credentials or URLs — one
 checkout, one Air instance.
 
+### SSH key resolution
+
+The ERA deploy and node-instruction scripts embed your SSH public key into every
+simulation node (Ubuntu `authorized_keys`; RHCOS ignition payload). The key is
+resolved at runtime using this priority chain:
+
+| Priority | Source | Notes |
+|----------|--------|-------|
+| 1 | `--ssh-key <path>` CLI argument | Overrides everything; pass to `make air-deploy` as `SSH_KEY=<path>` |
+| 2 | `AIR_SSH_KEY_PATH` environment variable | Useful for CI/CD |
+| 3 | `air_ssh_key_path` in `.era-secrets/air-secrets.yml` | Set via `make air-setup`; omit to use the default |
+| 4 | `~/.ssh/id_rsa` | Hard default — no vault entry needed for this key |
+
+**`air_ssh_key_path` is optional.** If you use `~/.ssh/id_rsa` as your ERA key,
+leave `air_ssh_key_path` unset in the vault — the scripts fall through to the
+default automatically.
+
+If you use a non-default key (e.g., `~/.ssh/id_ed25519_lab`), set it once:
+
+```bash
+make air-setup   # enter the private key path when prompted for SSH key
+```
+
+Both the private key (`<path>`) and its public companion (`<path>.pub`) must exist.
+The public key is derived by appending `.pub` to the private key path.
+
 ### Edit, view, or rotate
 
 ```bash

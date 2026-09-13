@@ -59,11 +59,21 @@ echo 'export NVIDIA_AIR_TOKEN=<your-token>' >> ~/.bashrc
 
 ### D. Configure your SSH key
 
-The cluster embeds an Ed25519 public key into each RHCOS ignition config, authorizing
-the `core` user for SSH and Ansible access. The key path is read from
-`.era-secrets/air-secrets.yml` under `air_ssh_key_path` — set there by `make air-setup`.
+The cluster embeds an SSH public key into each RHCOS ignition config, authorizing
+the `core` user for SSH and Ansible access. Ubuntu nodes receive the same key via
+`authorized_keys` injection. The key is resolved using this priority chain:
 
-Verify the setting and confirm both key files exist:
+| Priority | Source | Notes |
+|----------|--------|-------|
+| 1 | `--ssh-key <path>` CLI arg | `make air-deploy SSH_KEY=~/.ssh/my-key` |
+| 2 | `AIR_SSH_KEY_PATH` environment variable | CI/CD pipelines |
+| 3 | `air_ssh_key_path` in `.era-secrets/air-secrets.yml` | Set via `make air-setup`; omit to use the default |
+| 4 | `~/.ssh/id_rsa` | Hard default — no vault entry needed for this key |
+
+**`air_ssh_key_path` is optional.** Only set it when using a non-default key pair.
+The public key is derived by appending `.pub` to the private key path — both files must exist.
+
+Verify the current setting and confirm both files exist:
 ```bash
 ansible-vault view .era-secrets/air-secrets.yml | grep air_ssh_key_path
 ls -la ~/.ssh/<your-key> ~/.ssh/<your-key>.pub
@@ -74,7 +84,7 @@ If you need to change the key, re-run:
 make air-setup
 ```
 
-and enter the path to your existing Ed25519 private key when prompted. If no suitable
+and enter the path to your existing private key when prompted. If no suitable
 key exists, generate one first:
 ```bash
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_lab -N ""
@@ -220,26 +230,24 @@ This command blocks until every RHCOS node (GPU and k8s) is SSH-reachable **and*
 `era-nmstate.service` has applied network config successfully (exit status 0).
 It polls every 15 seconds with a 30-minute overall timeout.
 
-RHCOS boot is intentionally slow in Air due to OOB bridge initialization time.
-The patched image accounts for this — the full timeline:
+RHCOS boot in Air is gated on OOB bridge initialization time.
+The patched image accounts for this — the nominal timeline:
 
 | Time from power-on | Event |
 |--------------------|-------|
 | T + 0 s | All VMs power on simultaneously |
 | T + 90 s | RHCOS kernel starts (GRUB delay expires) |
 | T ≈ 131 s | Air OOB bridge operational |
-| T ≈ 134 s | DHCP lease delivered to OOB interface; DHCP option 121 installs `169.254.169.254/32` host route |
-| T ≈ 136 s | DHCP DISCOVER sent — dnsmasq not yet ready; NM schedules 5-minute retry |
-| T ≈ 8 min | dnsmasq DHCP ACK delivered with option 121 (169.254.169.254/32 route) |
-| T ≈ 8 min | Ignition fetches config from utility metadata server |
-| T ≈ 15–17 min | NMState network config applied; node fully booted and SSH-ready |
+| T ≈ 131–134 s | DHCP ACK delivered; DHCP option 121 installs `169.254.169.254/32` host route |
+| T ≈ 134–136 s | Ignition fetches config from utility metadata server |
+| T ≈ 3–5 min | NMState network config applied; node fully booted and SSH-ready |
 
 > **Why 90 s GRUB delay?** NetworkManager's DHCP client starts at kernel boot with a 90 s timeout.
 > The Air OOB bridge becomes operational at T≈131 s wall time. With a 30 s GRUB delay, the kernel
 > starts at T≈30 s and NM's DHCP window closes at T≈124 s — 7 seconds before the bridge is ready.
-> This causes NM to miss the first attempt and enter a ~300 s backoff, which pushes DHCP success
-> to T≈424 s — well past the ignition fetch timeout. A 90 s GRUB delay starts the kernel at T≈90 s,
-> so the OOB bridge becomes ready 37 s into NM's DHCP window, guaranteeing success on the first try.
+> This causes NM to miss the first attempt and enter a ~300 s backoff, making ignition fetch fail.
+> A 90 s GRUB delay starts the kernel at T≈90 s, so the OOB bridge becomes ready 37 s into NM's
+> DHCP window, guaranteeing success on the first try and keeping total boot time under 5 minutes.
 
 ---
 
@@ -308,13 +316,17 @@ If fewer than 80 paths pass:
 
 ### SSH key rejected
 
-Confirm the key path in `.era-secrets/air-secrets.yml` and that the `.pub` file exists:
+The deploy script resolves the key using this priority chain: `--ssh-key` CLI arg →
+`AIR_SSH_KEY_PATH` env var → `air_ssh_key_path` in vault → `~/.ssh/id_rsa` default.
+
+Check which key is active and confirm both the private key and `.pub` companion exist:
 ```bash
 ansible-vault view .era-secrets/air-secrets.yml | grep air_ssh_key_path
-ls -la ~/.ssh/<your-key>.pub
+ls -la ~/.ssh/<your-key> ~/.ssh/<your-key>.pub
 ```
 
 If the path is wrong, re-run `make air-setup` to correct it, then redeploy from Step 4.
+If `air_ssh_key_path` is not set in the vault, the scripts use `~/.ssh/id_rsa` by default.
 
 ---
 
@@ -372,7 +384,7 @@ Two patches in the boot image are required to survive Air's OOB bridge timing:
 | Patch | What it changes | Why |
 |-------|----------------|-----|
 | GRUB boot delay (90 s) | `set timeout=90` + `set timeout_style=menu` in `/boot/grub2/grub.cfg` | Delays kernel start so that the Air OOB bridge (ready at T≈131 s wall time) becomes available 37 s into NetworkManager's 90 s DHCP window, guaranteeing a first-attempt DHCP success. A shorter delay (e.g. 30 s) causes NM's DHCP to time out 7 s before the bridge is ready, triggering a ~300 s retry backoff and pushing DHCP delivery past the ignition fetch timeout. |
-| Ignition fetch timeout (12 m) | `--fetch-timeout 12m` replacing `${IGNITION_ARGS}` in `ignition-fetch.service` inside the initramfs zstd CPIO | The compiled-in default is 2 minutes. `${IGNITION_ARGS}` is never populated by the ignition generator (it only writes `PLATFORM_ID`), so the timeout silently remains 2 m. The ERA metadata server (dnsmasq + rhcos_metadata_server.py) starts on the utility VM alongside the RHCOS nodes; the utility takes ~3 minutes to run its Node Instruction script, and NetworkManager's DHCP retry interval after an unanswered first attempt is ~5 minutes. In practice the first successful DHCP ACK with option 121 (the `169.254.169.254/32` host route) arrives ~8 minutes after power-on — well beyond the old 5-minute window. 12 minutes provides sufficient margin. |
+| Ignition fetch timeout (12 m) | `--fetch-timeout 12m` replacing `${IGNITION_ARGS}` in `ignition-fetch.service` inside the initramfs zstd CPIO | The compiled-in default is 2 minutes. `${IGNITION_ARGS}` is never populated by the ignition generator (it only writes `PLATFORM_ID`), so the timeout silently remains 2 m. The ERA metadata server (dnsmasq + rhcos_metadata_server.py) starts on the utility VM alongside the RHCOS nodes; with the 90 s GRUB delay ensuring first-attempt DHCP success, ignition fetches its config at T≈134 s. The 12-minute timeout provides ample margin against slower Air environments. |
 
 ### GPU NIC configuration pipeline (Air digital twin)
 

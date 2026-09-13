@@ -11,7 +11,7 @@ SHELL := /bin/bash
         use show-context clear-context import \
         topology validate-topology validate validate-excel validate-ztp validate-ztp-direct \
         validate-config validate-servers validate-oob-bgp fix-ext-storage \
-        validate-ping-matrix wait-rhcos-ready validate-requirements extract-requirements \
+        validate-ping-matrix wait-rhcos-ready wait-ubuntu-ready validate-requirements extract-requirements \
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
@@ -700,7 +700,9 @@ validate-air-fabric: ## Stage 1: Deploy ERA fabric in Air and run ping matrix (S
 		ARCH=$(ARCH) SITE=$(SITE) NOZTP=1 SERVER_OS=$(SERVER_OS) AUTO_CONFIRM=1
 	$(if $(filter rhcos,$(SERVER_OS)),\
 		$(MAKE) --no-print-directory wait-rhcos-ready \
-			ARCH=$(ARCH) SITE=$(SITE) SERVER_OS=$(SERVER_OS))
+			ARCH=$(ARCH) SITE=$(SITE) SERVER_OS=$(SERVER_OS),\
+		$(MAKE) --no-print-directory wait-ubuntu-ready \
+			ARCH=$(ARCH) SITE=$(SITE))
 	ansible-playbook playbooks/validate-ping-matrix.yml \
 		-i output/$(ARCH)/$(SITE)/inventory/hosts \
 		$(if $(SITE_VARS),-e @$(SITE_VARS),) \
@@ -1461,6 +1463,15 @@ wait-rhcos-ready:  ## Block until all RHCOS nodes are SSH-reachable and era-nmst
 	@ansible-playbook playbooks/wait-rhcos-ready.yml \
 		-i $(INVENTORY_DIR)/hosts \
 		-e server_ansible_user=$(or $(SERVER_ANSIBLE_USER),$(if $(filter rhcos,$(SERVER_OS)),core,ubuntu))
+
+wait-ubuntu-ready:  ## Block until all Ubuntu server nodes are SSH-reachable - requires ARCH
+	$(call check_arch,$@)
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@echo "  Waiting for Ubuntu nodes  arch=$(ARCH)  site=$(SITE)"
+	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+	@ansible-playbook playbooks/wait-ubuntu-ready.yml \
+		-i $(INVENTORY_DIR)/hosts \
+		-e server_ansible_user=$(or $(SERVER_ANSIBLE_USER),ubuntu)
 
 validate-all:  ## Run all 5 validations: topology + config (canary) + ZTP + switch-health + servers (Servers N/A for switches-only) - requires ARCH
 	$(call check_arch,$@)

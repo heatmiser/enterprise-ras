@@ -1387,14 +1387,14 @@ def _inject_server_ip_instructions(
     with open(main_yml) as f:
         all_vars = yaml.safe_load(f) or {}
     devices = all_vars.get("devices", {})
+    common = all_vars.get("common", {})
     if not devices:
         return 0
 
     # Determine which nodes are in the topology (skip devices not in simulation)
     topo_nodes = set(topology_json.get("content", {}).get("nodes", {}).keys())
 
-    # Gateway is the OOB server IP (first oob_server_interface, or default .1)
-    gateway = "192.168.200.1"
+    gateway = common.get("oob_gateway", "192.168.200.1")
 
     configured = 0
     for node_name, dev in sorted(devices.items()):
@@ -1445,6 +1445,13 @@ def _render_server_netplan(node_name: str, dev: dict, common: dict) -> str:
     if not eth0_ip:
         return ""
 
+    # OOB gateway from inventory — must be in the same subnet as eth0_ip so
+    # networkd accepts the route.  The legacy fallback "192.168.200.1" only
+    # works for L2-mode Air sims; L3-mode sims (used by all current sites)
+    # assign server OOB IPs from the ERA workbook subnet (e.g. 10.78.220.0/24)
+    # whose gateway lives in that same subnet (e.g. 10.78.220.129).
+    oob_gateway = common.get("oob_gateway", "192.168.200.1")
+
     def _init_cfg():
         """Start a netplan config dict with eth0 static management IP.
 
@@ -1460,7 +1467,7 @@ def _render_server_netplan(node_name: str, dev: dict, common: dict) -> str:
                 "dhcp6": False,
                 "accept-ra": False,
                 "addresses": [f"{eth0_ip}/24"],
-                "routes": [{"to": "0.0.0.0/0", "via": "192.168.200.1"}],
+                "routes": [{"to": "0.0.0.0/0", "via": oob_gateway}],
             },
         }}}
         return cfg
@@ -1674,11 +1681,16 @@ def _render_server_netplan(node_name: str, dev: dict, common: dict) -> str:
 SERVER_NI_SKIP_PREFIXES = ("core-", "oob-switch-", "oob-server", "dhcp-", "cust-net-edge", "air-oob")
 
 
-def build_server_ni_commands(node_name: str, dev: dict, common: dict) -> list[str]:
+def build_server_ni_commands(node_name: str, dev: dict, common: dict,
+                             pub_key: str | None = None) -> list[str]:
     """Build the Node Instruction command list for one server node.
 
     Shared by air-deploy.py (runtime injection) and generate-node-instructions.py
     (review-time .sh file emission) so both produce identical content.
+
+    pub_key: Ed25519 public key text to add to ubuntu's authorized_keys.
+             Mirrors the SSH key injection that RHCOS receives via ignition.
+             Pass None to skip (e.g. when the key is unknown at review time).
 
     Returns [] if the node has no eth0_ip (nothing to configure).
     """
@@ -1706,6 +1718,17 @@ def build_server_ni_commands(node_name: str, dev: dict, common: dict) -> list[st
         commands.append(f"echo '{b64}' | base64 -d > /etc/netplan/10-netcfg.yaml")
         commands.append("chmod 600 /etc/netplan/10-netcfg.yaml")
         commands.append("netplan apply || true")
+
+    # SSH key — inject the ERA deployment public key into the ubuntu user's
+    # authorized_keys so that Ansible and the ping matrix can use key auth.
+    # Equivalent to what RHCOS gets via the ignition storage.files stanza.
+    if pub_key:
+        commands.append(
+            "mkdir -p /home/ubuntu/.ssh && chmod 700 /home/ubuntu/.ssh && "
+            f"echo {shlex.quote(pub_key)} >> /home/ubuntu/.ssh/authorized_keys && "
+            "chmod 600 /home/ubuntu/.ssh/authorized_keys && "
+            "chown -R ubuntu:ubuntu /home/ubuntu/.ssh"
+        )
 
     # ARP-flux fix — hosts with multiple L3 interfaces in the SAME subnet need
     # strict ARP so Linux doesn't answer/announce on the "wrong" NIC. Without
@@ -1760,6 +1783,7 @@ def _inject_server_full_config(
     sim_id: str,
     inv_dir: Path,
     topology_json: dict,
+    cli_ssh_key: str | None = None,
 ) -> int:
     """Inject full server configuration (hostname + netplan + lldp) via Node Instructions.
 
@@ -1775,6 +1799,12 @@ def _inject_server_full_config(
     common = all_vars.get("common", {})
     if not devices:
         return 0
+
+    # Resolve the ERA SSH public key — same source as RHCOS ignition injection.
+    # cli_ssh_key carries the vault-resolved path from the outer deploy scope,
+    # ensuring the correct key is injected even when inventory ssh_key_path
+    # points to a file that doesn't exist on this machine.
+    _, pub_key_text = _resolve_ssh_key(cli_ssh_key, common, all_vars)
 
     topo_nodes = set(topology_json.get("content", {}).get("nodes", {}).keys())
 
@@ -1799,7 +1829,7 @@ def _inject_server_full_config(
             )
             ign_assignments[node_name] = uc.id
         else:
-            commands = build_server_ni_commands(node_name, dev, common)
+            commands = build_server_ni_commands(node_name, dev, common, pub_key=pub_key_text)
             if not commands:
                 continue
             jobs.append({
@@ -2540,6 +2570,7 @@ def main() -> int:
                 try:
                     n_full = _inject_server_full_config(
                         client, base_url, token, sim_id, inv_dir, topology_json,
+                        cli_ssh_key=ssh_key_path,
                     )
                     if n_full:
                         console.print("  deploy-servers-via-jump is NOT needed for these nodes")
