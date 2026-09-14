@@ -15,7 +15,7 @@ SHELL := /bin/bash
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
-        rhcos-image-prep
+        rhcos-image-prep generate-ocp-iso
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -613,6 +613,57 @@ generate-ocp:  ## Generate OCP Ansible inventory + ABI manifests from ERA invent
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	python3 scripts/generate-ocp-inventory.py --arch $(ARCH) --site $(SITE) --nic-mode $(NIC_MODE) \
 		$(if $(OCP_SETTINGS),--ocp-settings $(OCP_SETTINGS),)
+
+generate-ocp-iso:  ## Generate ABI ISO via openshift-install agent create image - requires ARCH, optional SITE OCP_EE_IMAGE= or OPENSHIFT_INSTALL=
+	$(call check_arch,$@)
+	@OCP_DIR="output/$(ARCH)/$(SITE)/ocp"; \
+	if [ ! -f "$$OCP_DIR/agent-config.yaml" ] || [ ! -f "$$OCP_DIR/install-config.yaml" ]; then \
+		echo "❌ ERROR: ABI manifests not found for arch=$(ARCH) site=$(SITE)"; \
+		echo "   Both agent-config.yaml and install-config.yaml are required."; \
+		echo "   Run 'make generate-ocp ARCH=$(ARCH) SITE=$(SITE)' first."; \
+		echo "   Note: ocp-settings.yml must exist in input/$(ARCH)/$(SITE)/ to generate ABI manifests."; \
+		exit 1; \
+	fi; \
+	ISO_STAGE="output/$(ARCH)/$(SITE)/ocp-iso"; \
+	mkdir -p "$$ISO_STAGE"; \
+	cp "$$OCP_DIR/agent-config.yaml" "$$ISO_STAGE/"; \
+	cp "$$OCP_DIR/install-config.yaml" "$$ISO_STAGE/"; \
+	ABS_STAGE="$$(realpath $$ISO_STAGE)"; \
+	if [ -n "$(OCP_EE_IMAGE)" ]; then \
+		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+		echo "  Generating OCP ABI ISO  arch=$(ARCH)  site=$(SITE)"; \
+		echo "  Staging dir: $$ABS_STAGE"; \
+		echo "  openshift-install: $(OCP_EE_IMAGE) (container)"; \
+		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+		podman run --rm \
+			--userns=keep-id \
+			-v "$$ABS_STAGE:$$ABS_STAGE:Z" \
+			"$(OCP_EE_IMAGE)" \
+			openshift-install --dir "$$ABS_STAGE" agent create image || exit 1; \
+	else \
+		OCP_BIN="$(or $(OPENSHIFT_INSTALL),openshift-install)"; \
+		if ! command -v "$$OCP_BIN" >/dev/null 2>&1; then \
+			echo "❌ ERROR: openshift-install not found. Provide one of:"; \
+			echo "   make generate-ocp-iso ARCH=$(ARCH) SITE=$(SITE) OCP_EE_IMAGE=quay.io/s4v0/dcm-ocp-ee-4.22"; \
+			echo "   make generate-ocp-iso ARCH=$(ARCH) SITE=$(SITE) OPENSHIFT_INSTALL=/path/to/openshift-install"; \
+			exit 1; \
+		fi; \
+		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+		echo "  Generating OCP ABI ISO  arch=$(ARCH)  site=$(SITE)"; \
+		echo "  Staging dir: $$ABS_STAGE"; \
+		echo "  openshift-install: $$OCP_BIN ($$($$OCP_BIN version 2>/dev/null | head -1))"; \
+		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
+		"$$OCP_BIN" --dir "$$ABS_STAGE" agent create image; \
+	fi; \
+	ISO_PATH="$$ABS_STAGE/agent.x86_64.iso"; \
+	if [ ! -f "$$ISO_PATH" ]; then \
+		echo "❌ openshift-install exited but $$ISO_PATH was not created"; \
+		exit 1; \
+	fi; \
+	echo "" && \
+	echo "✅ ABI ISO generated: $$ISO_PATH" && \
+	echo "   Size: $$(du -sh "$$ISO_PATH" | cut -f1)" && \
+	echo "   Boot this ISO on all cluster nodes to begin the OCP installation."
 
 init-ocp-settings:  ## Bootstrap ocp-settings.yml from ERA inventory - requires ARCH, optional SITE FORCE=1
 	$(call check_arch,$@)

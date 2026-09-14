@@ -537,7 +537,7 @@ before generation.
 
 | Column | Header | Required | Type | Description |
 |--------|--------|----------|------|-------------|
-| A | `Display in Air` | No | Yes/No | Whether to include this connection in the NVIDIA Air virtual topology. Set `No` for physical-only connections that Air cannot simulate (real-HW LOM Port 1, iLO, iDRAC, XCC). **CRA OOB rule**: each active server must have exactly ONE Display=Yes OOB row (the BMC). Air's plain Ubuntu can't bond two OOB links — a second Display=Yes OOB row will be flagged by `validate-excel`. |
+| A | `Display in Air` | No | Yes/No | Whether to include this connection in the NVIDIA Air virtual topology. Set `No` for physical-only connections that Air cannot simulate (real-HW LOM Port 1, iLO, iDRAC, XCC, Open Compute Project 3.0 NIC ports, GPU NIC BMC ports). **CRA OOB rule**: each active server must have exactly ONE Display=Yes OOB row (the BMC). Air's plain Ubuntu can't bond two OOB links — a second Display=Yes OOB row will be flagged by `validate-excel`. See [Physical NIC Taxonomy and Wire Map Display in Air Rows](OCP_PREPRODUCTION_VALIDATION.md#physical-nic-taxonomy-and-wire-map-display-in-air-rows) for a detailed breakdown of what `No` rows represent for ERA GPU nodes and how they map to physical deployment. |
 | B | `System Name (A)` | **Yes** | String | Hostname of the device on the "A" side of the cable (matches `Name` from the Nodes sheet). Older Excels' `System Role` / `Function (A)` headers also accepted via aliases. |
 | C | `Port (A)` | **Yes** | String | Port identifier on the device side. For servers: `eth0`, `eth1`, …. For switches: `swp1`, `swp1s0`, …. |
 | D | `Port Side (A)` | No | String | Physical port side label for cabling crew documentation. Parser ignores. |

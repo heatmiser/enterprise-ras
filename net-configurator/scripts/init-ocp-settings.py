@@ -25,6 +25,12 @@ import ipaddress
 import sys
 from pathlib import Path
 
+try:
+    from airlib.env import _load_shared_air_vault
+except ImportError:
+    def _load_shared_air_vault(*_args, **_kwargs):
+        return {}
+
 def find_excel(arch, site):
     """Return the first *.xlsx found in input/<arch>/<site>/, or None."""
     candidates = list((Path("input") / arch / site).glob("*.xlsx"))
@@ -52,6 +58,48 @@ def read_support_vlan(excel_path):
     except Exception:
         pass
     return None, None
+
+
+# Section headers that signal the end of the OPENSHIFT block.
+_KNOWN_SECTIONS = {
+    "GENERAL", "AIR DEPLOYMENT", "NETWORK", "MANAGEMENT",
+    "TELEMETRY", "ADVANCED", "VERSIONS",
+}
+
+
+def read_ocp_settings(excel_path):
+    """Read OPENSHIFT section from Settings tab, return dict of ocp_* values.
+
+    Returns an empty dict when the section is absent or openpyxl is unavailable.
+    Only non-empty cell values are included — blank cells are omitted so callers
+    can fall back to derived or TODO defaults.
+    """
+    try:
+        import openpyxl
+    except ImportError:
+        return {}
+    try:
+        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        ws = wb["Settings"]
+        in_section = False
+        result = {}
+        for row in ws.iter_rows(values_only=True):
+            key = row[0]
+            if key == "OPENSHIFT":
+                in_section = True
+                continue
+            if not in_section:
+                continue
+            if key == "Setting":       # column header row
+                continue
+            if key is None or key in _KNOWN_SECTIONS:
+                break                  # blank row or next section — done
+            val = row[1]
+            if val is not None and str(val).strip():
+                result[str(key).strip()] = str(val).strip()
+        return result
+    except Exception:
+        return {}
 
 
 def suggest_vips(subnet_str):
@@ -116,14 +164,48 @@ def format_node_roles_yaml(role_map):
     return "\n".join(lines)
 
 
-def write_settings(out_path, arch, site, node_roles_yaml, api_vip="", ingress_vip=""):
-    if api_vip and ingress_vip:
-        vip_comment = "# suggested from support subnet — confirm with IPAM before deploy"
-        api_line      = f"  api_vip: \"{api_vip}\"  {vip_comment}\n"
-        ingress_line  = f"  ingress_vip: \"{ingress_vip}\"  {vip_comment}\n"
+def write_settings(out_path, arch, site, node_roles_yaml,
+                   api_vip="", ingress_vip="", ocp=None, ssh_key_pub=None):
+    """Write ocp-settings.yml, preferring values from the spreadsheet OPENSHIFT section.
+
+    Priority for each field:
+      1. Spreadsheet OPENSHIFT section value (ocp dict)
+      2. Derived heuristic (VIPs from support subnet, passed as api_vip/ingress_vip)
+      3. TODO placeholder
+    """
+    ocp = ocp or {}
+
+    # domain
+    domain = ocp.get("ocp_cluster_domain", "")
+    if domain:
+        domain_line = f'  domain: "{domain}"\n'
     else:
-        api_line      = f"  api_vip: \"\"                 # TODO: set API VIP  (reserved IP in the support subnet)\n"
-        ingress_line  = f"  ingress_vip: \"\"             # TODO: set Ingress VIP (reserved IP in the support subnet)\n"
+        domain_line = '  domain: "era.example.com"  # TODO: set base domain\n'
+
+    # version
+    version = ocp.get("ocp_version", "")
+    if version:
+        version_line = f'  version: "{version}"\n'
+    else:
+        version_line = '  version: "4.17.0"  # TODO: set OCP version\n'
+
+    # VIPs: spreadsheet > derived heuristic > TODO
+    xl_api_vip     = ocp.get("ocp_api_vip", "")
+    xl_ingress_vip = ocp.get("ocp_ingress_vip", "")
+    if xl_api_vip and xl_ingress_vip:
+        api_line     = f'  api_vip: "{xl_api_vip}"\n'
+        ingress_line = f'  ingress_vip: "{xl_ingress_vip}"\n'
+    elif api_vip and ingress_vip:
+        comment      = "# suggested from support subnet — confirm with IPAM before deploy"
+        api_line     = f'  api_vip: "{api_vip}"  {comment}\n'
+        ingress_line = f'  ingress_vip: "{ingress_vip}"  {comment}\n'
+    else:
+        api_line     = '  api_vip: ""  # TODO: set API VIP (reserved IP in the support subnet)\n'
+        ingress_line = '  ingress_vip: ""  # TODO: set Ingress VIP (reserved IP in the support subnet)\n'
+
+    # OEM
+    oem_val  = ocp.get("ocp_oem", "")
+    oem_line = f'oem: {oem_val}\n' if oem_val else 'oem: dell  # TODO: verify OEM (dell | hpe | lenovo)\n'
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
@@ -131,16 +213,18 @@ def write_settings(out_path, arch, site, node_roles_yaml, api_vip="", ingress_vi
         f"# Fill in every field marked TODO before running: make generate-ocp ARCH={arch} SITE={site}\n"
         f"\n"
         f"cluster:\n"
-        f"  name: ocp-{site}            # TODO: set cluster name\n"
-        f"  domain: era.example.com     # TODO: set base domain\n"
-        f"  version: \"4.17.0\"           # TODO: set OCP version\n"
+        f"  name: ocp-{site}\n"
+        + domain_line
+        + version_line
         + api_line
         + ingress_line
         + f"\n"
+        f"# Pull secret: vault key 'ocp_pull_secret' in .era-secrets/air-secrets.yml takes precedence.\n"
+        f"# Fallback: path below is read only when the vault key is absent.\n"
         f"pull_secret_path: ~/.era-secrets/pull-secret.json\n"
-        f"ssh_key_path: ~/.ssh/id_ed25519.pub\n"
-        f"oem: dell                     # TODO: verify OEM  (dell | hpe | lenovo)\n"
-        f"\n"
+        f"ssh_key_path: {ssh_key_pub or '~/.ssh/id_ed25519.pub'}\n"
+        + oem_line
+        + f"\n"
         f"node_roles:\n"
         f"{node_roles_yaml}\n"
         f"\n"
@@ -188,28 +272,54 @@ def main():
     excel_path = find_excel(args.arch, args.site)
     support_subnet, support_gateway = read_support_vlan(excel_path) if excel_path else (None, None)
     api_vip, ingress_vip = suggest_vips(support_subnet) if support_subnet else ("", "")
+    ocp = read_ocp_settings(excel_path) if excel_path else {}
+
+    vault = _load_shared_air_vault()
+    air_ssh_key = vault.get("air_ssh_key_path", "")
+    ssh_key_pub = (air_ssh_key + ".pub") if air_ssh_key else None
 
     write_settings(out_path, args.arch, args.site, node_roles_yaml,
-                   api_vip=api_vip, ingress_vip=ingress_vip)
+                   api_vip=api_vip, ingress_vip=ingress_vip, ocp=ocp,
+                   ssh_key_pub=ssh_key_pub)
 
     print(f"\n  Wrote {out_path}")
     print(f"\n  Node roles populated from ERA inventory:")
     for role, hosts in node_roles.items():
         print(f"    {role:16s}: {', '.join(hosts)}")
-    print(f"\n  TODO — fill in before running 'make generate-ocp':")
-    print(f"    cluster.domain      base domain (e.g. era.example.com)")
-    print(f"    cluster.version     OCP version (e.g. 4.17.0)")
-    if api_vip and ingress_vip:
-        print(f"    cluster.api_vip     {api_vip}  ← suggested from support subnet {support_subnet} — confirm with IPAM")
-        print(f"    cluster.ingress_vip {ingress_vip}  ← suggested from support subnet {support_subnet} — confirm with IPAM")
-    else:
-        reason = "Excel not found" if not excel_path else "support VLAN not identified in spreadsheet"
-        print(f"    cluster.api_vip     (set manually — {reason})")
-        print(f"    cluster.ingress_vip (set manually — {reason})")
-    print(f"    oem                 dell | hpe | lenovo")
+
+    # Report which fields came from the spreadsheet vs still need manual input
+    todos = []
+    if not ocp.get("ocp_cluster_domain"):
+        todos.append("cluster.domain      base domain (e.g. era.example.com)")
+    if not ocp.get("ocp_version"):
+        todos.append("cluster.version     OCP version (e.g. 4.22.0)")
+    if not (ocp.get("ocp_api_vip") or api_vip):
+        reason = "Excel not found" if not excel_path else "support VLAN not in spreadsheet"
+        todos.append(f"cluster.api_vip     (set manually — {reason})")
+    if not (ocp.get("ocp_ingress_vip") or ingress_vip):
+        todos.append(f"cluster.ingress_vip (set manually — same reason as api_vip)")
+    if not ocp.get("ocp_oem"):
+        todos.append("oem                 dell | hpe | lenovo")
+
+    if ocp:
+        print(f"\n  Spreadsheet OPENSHIFT section values applied:")
+        for k, v in ocp.items():
+            print(f"    {k}: {v}")
+
+    if todos:
+        print(f"\n  TODO — fill in before running 'make generate-ocp':")
+        for t in todos:
+            print(f"    {t}")
+    elif not (ocp.get("ocp_api_vip") and ocp.get("ocp_ingress_vip")) and api_vip and ingress_vip:
+        print(f"\n  VIPs suggested from support subnet {support_subnet} — confirm with IPAM:")
+        print(f"    cluster.api_vip:     {api_vip}")
+        print(f"    cluster.ingress_vip: {ingress_vip}")
+
+    _ssh_hint = (air_ssh_key + ".pub") if air_ssh_key else "~/.ssh/id_ed25519.pub"
     print(f"\n  Credentials (create before running generate-ocp):")
-    print(f"    ~/.era-secrets/pull-secret.json  (from cloud.redhat.com)")
-    print(f"    ~/.ssh/id_ed25519.pub            (or update ssh_key_path)")
+    print(f"    pull_secret: vault key ocp_pull_secret in .era-secrets/air-secrets.yml (or pull-secret.json fallback)")
+    print(f"    ssh_key_path: {_ssh_hint}  (from vault air_ssh_key_path)" if air_ssh_key else
+          f"    ssh_key_path: {_ssh_hint}  (update if different)")
     print()
 
 

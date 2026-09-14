@@ -71,6 +71,136 @@ Stage 2 — Air (ERA fabric + OCP install)
 All logical config (VLANs, bond structure, IP addressing, PBR tables 901-904) is
 identical between modes. Only the interface name strings change.
 
+### Physical NIC Taxonomy and Wire Map Display in Air Rows
+
+> **Terminology note — "OCP" is ambiguous in ERA documentation:**
+> - **OpenShift Container Platform (OCP)** — the Kubernetes distribution being installed.
+> - **Open Compute Project (OCP) 3.0** — a PCIe card mechanical form-factor specification
+>   used in Dell PowerEdge servers. Unrelated to OpenShift.
+>
+> This section uses the full name in every instance to avoid confusion.
+
+#### Wire Map `Display in Air` Column — What `No` Rows Represent
+
+The Wire Map `Display in Air` column (column A) controls whether a cable connection is
+included in the NVIDIA Air virtual topology. Rows marked `No` are invisible to the Air
+simulator — `topology_generator.py`'s `_build_connected_links()` skips them entirely,
+so they receive no `ethN` assignment and generate no virtual link in the Air JSON.
+
+However, **`Display in Air = No` rows are not ignored by the real-hardware pipeline.**
+`build_nic_map()` in `scripts/utils.py` processes all Wire Map rows that carry a kernel
+NIC name (column K), regardless of the `Display in Air` value. In `--nic-mode real-hw`,
+those kernel names and MACs appear in the `agent-config.yaml interfaces:` block used for
+Agent-Based Installer (ABI) host identification.
+
+`Display in Air = No` rows exist for one purpose: **physical cabling documentation**. They
+record real hardware connections that NVIDIA Air cannot simulate, so that the Wire Map
+remains the single source of truth for both the digital twin and the physical lab.
+
+For ERA GPU nodes (e.g., `ipp5-285-rh-gpu-01`), three categories of `No` rows exist:
+
+---
+
+#### Category 1 — Open Compute Project 3.0 NIC P1/P2: North-South Cluster Network
+
+The **Open Compute Project (OCP) 3.0** designation refers to a PCIe Small Form Factor
+mechanical specification — it is a slot type on the Dell PowerEdge motherboard, not a
+network function. The actual hardware occupying that slot is the
+**NVIDIA ConnectX-6 Lx dual-port 25GbE adapter** (part number `07GGY4` / `0DN78C`):
+
+| Wire Map label | Kernel name | Physical role |
+|---|---|---|
+| OCP 3.0 NIC P1 | `eno8303np0` | ConnectX-6 Lx port 0, `bond0` member 1 |
+| OCP 3.0 NIC P2 | `eno8403np1` | ConnectX-6 Lx port 1, `bond0` member 2 |
+
+These are the **primary OpenShift Container Platform machine network interfaces** —
+the North-South (N-S) path for all cluster traffic: API server, Ingress, pod CIDR
+egress. They connect to the leaf switches and form `bond0` (802.3ad) for the cluster
+machine network.
+
+**Why `Display in Air = No`:** The Air simulation represents the same `bond0` connectivity
+using virtual interfaces generated from the "CPU/In-Band" Wire Map rows (which ARE
+`Display in Air = Yes` and receive `eth1`/`eth2` assignments). The Open Compute Project 3.0
+NIC rows document the physical hardware backing those virtual connections. Air cannot
+model PCIe form-factor differences; the logical bond is identical in both worlds — only
+the kernel interface names change:
+
+| Context | `bond0` members | Effect |
+|---|---|---|
+| Air / KVM simulation (`--nic-mode kvm`) | `eth1`, `eth2` | Virtio NICs assigned by topology generator |
+| Physical hardware (`--nic-mode real-hw`) | `eno8303np0`, `eno8403np1` | ConnectX-6 Lx physical ports |
+
+This is visible in the generated `host_vars` — for example,
+`output/2-8-5-200/rhcos01/ocp/inventory/host_vars/ipp5-285-rh-k8s-01.yml` shows
+`bond0` built from `[eth1, eth2]` in simulation mode. For a physical deployment, the
+same NMState would reference `eno8303np0`/`eno8403np1` as the bond members.
+
+> **Source:** The Open Compute Project 3.0 NIC model strings and their North-South role
+> were confirmed from `k8s-launch-kit/pkg/presets/data/` topology definitions for the
+> PowerEdge R760xa and XE7745 platforms.
+
+**"OOB" in k8s-launch-kit context:** The `k8s-launch-kit` topology YAML files label these
+interfaces as `# N-S: ConnectX-6 Lx dual-port 25GbE — OOB / management`. Here "OOB"
+means **out of the GPU east-west fabric** — traffic that is not GPU rail data — not
+true out-of-band server management. See the OOB terminology table below.
+
+---
+
+#### Category 2 — B3220 BMC: GPU NIC Out-of-Band Administration
+
+Each BlueField-3 SuperNIC (B3140/B3220) contains an embedded **Baseboard Management
+Controller (BMC)** — a separate ARM-based management processor distinct from both the
+server iDRAC and the DPU data-plane ARM cores. This BMC provides:
+
+- GPU NIC firmware updates
+- BlueField-3 DPU ARM core console and lifecycle access
+- NIC health monitoring and diagnostics
+- RDMA / InfiniBand fabric parameter configuration
+
+The B3220 BMC connects to the OOB switch on a dedicated 1GbE port. It carries no
+OpenShift Container Platform cluster traffic and has no Air simulation equivalent.
+`Display in Air = No` — Air has no model for an embedded DPU BMC port.
+
+For physical deployment automation, B3220 BMC access requires a management plane path
+through the OOB switch network, separate from the cluster machine network.
+
+---
+
+#### Category 3 — iDRAC: Server Out-of-Band Management
+
+The **iDRAC** (Integrated Dell Remote Access Controller) is the server BMC — a separate
+management controller independent of all NIC hardware. It provides:
+
+- Remote power control (on/off/reset/PXE-next-boot)
+- Serial-over-LAN (SOL) console access during OS installation
+- Hardware health monitoring and alerting
+- BIOS and firmware update orchestration
+
+The iDRAC appears in the Wire Map as **`Display in Air = Yes`** (exactly one row per
+server), mapping to `eth0` in the Air topology. This is the single OOB link that Air
+simulates — the management path used by Air Node Instructions for first-boot configuration
+delivery. In the physical lab, the iDRAC port connects to the OOB switch at a known
+management IP, providing the same function.
+
+---
+
+#### OOB Terminology Reference
+
+The term "OOB" (out-of-band) is used with three distinct meanings across ERA
+documentation and tooling:
+
+| Context | "OOB" means | Interfaces involved | In-band equivalent |
+|---|---|---|---|
+| k8s-launch-kit `topology.yaml` N-S comment | Out of the GPU east-west fabric; cluster machine network traffic | `eno8303np0`, `eno8403np1` (ConnectX-6 Lx 25GbE) | East-west GPU rail (BlueField-3 B3140) |
+| ERA net-configurator Wire Map / topology | Dedicated server BMC management path (iDRAC, one per server) | iDRAC 1GbE port → OOB switch | Cluster machine network (`bond0`) |
+| GPU NIC administration | BlueField-3 DPU embedded BMC (B3220) for NIC firmware / lifecycle | B3220 BMC 1GbE port → OOB switch | GPU rail data plane |
+
+When reading ERA documentation or k8s-launch-kit source, determine which definition
+applies from context: N-S/management traffic direction, server BMC access, or GPU NIC
+administration.
+
+---
+
 ### RHCOS OpenStack Image Selection
 
 Stage 1 downloads the official **RHCOS OpenStack qcow2** image directly from

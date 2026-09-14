@@ -52,6 +52,12 @@ from pathlib import Path
 
 import yaml
 
+try:
+    from airlib.env import _load_shared_air_vault
+except ImportError:
+    def _load_shared_air_vault(*_args, **_kwargs):
+        return {}
+
 # ---------------------------------------------------------------------------
 # Architecture-level GPU boot disk defaults.
 # OEM-specific control_plane/infra/storage disks come from ocp-settings.yml.
@@ -215,9 +221,9 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="rea
         })
 
     if ocp_role in ("control_plane", "infra"):
-        members = _bond_members("support") or _bond_members("cpu")
-        cidr    = device_data.get("bond_ip1") or device_data.get("bond_ip")
-        gw      = common.get("support_gateway") or common.get("cpu_gateway")
+        members = _bond_members("cpu") or _bond_members("support")
+        cidr    = device_data.get("bond_ip") or device_data.get("bond_ip1")
+        gw      = common.get("cpu_gateway") or common.get("support_gateway")
         _bond(members, cidr, gw)
 
     elif ocp_role == "worker_gpu":
@@ -528,20 +534,39 @@ def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch, n
     }
 
 
-def build_install_config(ocp_settings, site_vars, role_map):
+def read_pull_secret(ocp_settings, vault=None):
+    """Return the OCP pull secret string.
+
+    Precedence:
+      1. ``ocp_pull_secret`` field in .era-secrets/air-secrets.yml (vault)
+      2. File at ``pull_secret_path`` from ocp-settings.yml
+
+    Returns (pull_secret_str, source_description) or raises OSError/KeyError.
+    """
+    vault = vault or {}
+    if vault.get("ocp_pull_secret"):
+        return vault["ocp_pull_secret"].strip(), "vault (.era-secrets/air-secrets.yml)"
+    path = os.path.expanduser(ocp_settings.get("pull_secret_path", ""))
+    if not path:
+        raise FileNotFoundError("pull_secret_path not set in ocp-settings.yml")
+    content = open(path).read().strip()
+    return content, f"file ({path})"
+
+
+def build_install_config(ocp_settings, site_vars, role_map, vault=None):
     """Render install-config.yaml dict.  Returns None if pull_secret unreadable."""
     cluster = ocp_settings.get("cluster", {})
     common  = site_vars.get("common", {})
 
-    pull_secret_path = os.path.expanduser(ocp_settings.get("pull_secret_path", ""))
-    ssh_key_path     = os.path.expanduser(ocp_settings.get("ssh_key_path", ""))
-
     try:
-        pull_secret = open(pull_secret_path).read().strip()
+        pull_secret, ps_source = read_pull_secret(ocp_settings, vault)
+        print(f"  pull secret: {ps_source}", file=sys.stderr)
     except (FileNotFoundError, OSError) as exc:
         print(f"  NOTE: pull secret not readable ({exc}) — skipping install-config.yaml generation",
               file=sys.stderr)
         return None
+
+    ssh_key_path = os.path.expanduser(ocp_settings.get("ssh_key_path", ""))
 
     try:
         ssh_key = open(ssh_key_path).read().strip()
@@ -627,6 +652,9 @@ def main():
     else:
         print(f"  No ocp-settings.yml found at {settings_path} — using auto-inference")
 
+    # Load shared vault for credentials (ocp_pull_secret takes precedence over pull_secret_path)
+    vault = _load_shared_air_vault()
+
     print(f"Generating OCP inventory for {args.arch} (site: {args.site})")
 
     role_map = build_role_map(ocp_settings, devices, args.arch, args.site)
@@ -700,7 +728,7 @@ def main():
         write_yaml(ac_path, agent_cfg)
         print(f"  ✓ {ac_path}")
 
-        install_cfg = build_install_config(ocp_settings, site_vars, role_map)
+        install_cfg = build_install_config(ocp_settings, site_vars, role_map, vault=vault)
         if install_cfg:
             ic_path = ocp_dir / "install-config.yaml"
             write_yaml(ic_path, install_cfg)

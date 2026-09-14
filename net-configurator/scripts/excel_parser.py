@@ -765,7 +765,7 @@ def build_devices(nodes, vlans, mgmt_subnets, node_oob_mapping=None, wiremap_row
     support_base = subnet_base(subnet_map.get('support'))
 
     # Track per-role indices for sequential IP assignment
-    role_index = {'compute': 0, 'storage': 0, 'support': 0}
+    role_index = {'compute': 0, 'storage': 0, 'support': 0, 'k8s': 0}
 
     for node in nodes:
         name = node.get('name', '')
@@ -978,27 +978,37 @@ def build_devices(nodes, vlans, mgmt_subnets, node_oob_mapping=None, wiremap_row
             role_index['storage'] += 1
 
         elif role in ('support', 'k8s', 'bcme') and (support_base or cpu_base):
-            idx = role_index['support']
-            support_subnet = subnet_map.get('support')
-            if support_base and support_subnet:
-                # Allocate host IPs from within the support subnet so they share
-                # a prefix with the switch SVI (gateway+1, switch SVIs at +2/+3).
-                # Start at offset +10 from the network address to clear infra IPs,
-                # then 2 addresses per node (bond_ip1 / bond_ip2).
-                net = ipaddress.ip_network(support_subnet, strict=False)
-                pfx = net.prefixlen
-                h1 = net.network_address + 10 + 2 * idx
-                h2 = h1 + 1
-                if h1 in net and h2 in net:
-                    entry['bond_ip1'] = f"{h1}/{pfx}"
-                    entry['bond_ip2'] = f"{h2}/{pfx}"
+            is_k8s = name.startswith('k8s-') or '-k8s-' in name
+            if is_k8s and cpu_base:
+                # k8s nodes use the CPU/In-Band port profile (VLAN 300 untagged);
+                # assign bond_ip from cpu_network to match the switch PVID.
+                idx = role_index['k8s']
+                host_offset = 101 + idx
+                if host_offset <= 254:
+                    entry['bond_ip'] = f"{cpu_base}.{host_offset}/24"
+                role_index['k8s'] += 1
             else:
-                base = cpu_base
-                host_offset = 101 + 2 * idx
-                if host_offset + 1 <= 254:
-                    entry['bond_ip1'] = f"{base}.{host_offset}/24"
-                    entry['bond_ip2'] = f"{base}.{host_offset + 1}/24"
-            role_index['support'] += 1
+                idx = role_index['support']
+                support_subnet = subnet_map.get('support')
+                if support_base and support_subnet:
+                    # Allocate host IPs from within the support subnet so they share
+                    # a prefix with the switch SVI (gateway+1, switch SVIs at +2/+3).
+                    # Start at offset +10 from the network address to clear infra IPs,
+                    # then 2 addresses per node (bond_ip1 / bond_ip2).
+                    net = ipaddress.ip_network(support_subnet, strict=False)
+                    pfx = net.prefixlen
+                    h1 = net.network_address + 10 + 2 * idx
+                    h2 = h1 + 1
+                    if h1 in net and h2 in net:
+                        entry['bond_ip1'] = f"{h1}/{pfx}"
+                        entry['bond_ip2'] = f"{h2}/{pfx}"
+                else:
+                    base = cpu_base
+                    host_offset = 101 + 2 * idx
+                    if host_offset + 1 <= 254:
+                        entry['bond_ip1'] = f"{base}.{host_offset}/24"
+                        entry['bond_ip2'] = f"{base}.{host_offset + 1}/24"
+                role_index['support'] += 1
 
         devices[name] = entry
 
