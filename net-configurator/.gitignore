@@ -93,8 +93,10 @@ output/*/*/
 # node-instructions) belong in version control.
 output/*/default/reports/
 output/*/default/topology/node-instructions/
+output/*/default/ocp-iso/
 output/*/largescale/reports/
 output/*/largescale/topology/node-instructions/
+output/*/largescale/ocp-iso/
 
 # Local IDE/agent state
 .claude/

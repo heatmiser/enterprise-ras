@@ -408,6 +408,37 @@ def prompt_ngc_org(current: str | None = None) -> str:
     return val
 
 
+def prompt_pull_secret(current: str | None = None) -> str:
+    """Prompt for the OCP pull secret JSON string."""
+    print("  OCP pull secret — download from cloud.redhat.com/openshift/install/pull-secret")
+    print("  Paste the JSON string and press Enter twice (or Enter once if single-line):")
+    if current:
+        keep = input("  Keep existing pull secret? [Y/n]: ").strip().lower()
+        if keep in ("", "y", "yes"):
+            return current
+    lines = []
+    while True:
+        line = input()
+        if not line and lines:
+            break
+        if line:
+            lines.append(line)
+    raw = "".join(lines).strip()
+    if not raw:
+        if current:
+            return current
+        warn("Pull secret is required for ABI ISO generation.")
+        return ""
+    import json as _json
+    try:
+        parsed = _json.loads(raw)
+        if "auths" not in parsed:
+            warn("Pull secret JSON does not contain 'auths' key — stored anyway, verify before use.")
+    except ValueError:
+        warn("Pull secret does not appear to be valid JSON — stored anyway, verify before use.")
+    return raw
+
+
 AIR_INSTANCES = {
     "1": ("Public NGC Air", "https://air-ngc.nvidia.com"),
     "2": ("Internal (air-inside)", "https://ngc.air-inside.nvidia.com"),
@@ -451,6 +482,7 @@ def prompt_air_url(current: str | None = None) -> str:
 
 def choose_fields_to_update(existing: dict) -> list[str]:
     """Ask the user which fields to update. Returns the list of field names."""
+    ps_current = existing.get("ocp_pull_secret", "")
     print()
     print("  Current values:")
     print(f"    air_api_key:       {mask(existing.get('air_api_key', ''))}")
@@ -458,6 +490,7 @@ def choose_fields_to_update(existing: dict) -> list[str]:
     print(f"    air_username:      {existing.get('air_username') or '(empty)'}")
     print(f"    air_ssh_key_path:  {existing.get('air_ssh_key_path') or '(none)'}")
     print(f"    air_org:           {existing.get('air_org') or '(none)'}")
+    print(f"    ocp_pull_secret:   {mask(ps_current)}")
     print()
     print("  Which fields do you want to update?")
     print("    [1] All")
@@ -465,20 +498,22 @@ def choose_fields_to_update(existing: dict) -> list[str]:
     print("    [3] air_url (Air instance)")
     print("    [4] username")
     print("    [5] ssh_key")
-    print("    [6] Nothing (exit)")
+    print("    [6] pull_secret (OCP)")
+    print("    [7] Nothing (exit)")
     while True:
         raw = input("  Choice [1]: ").strip() or "1"
         mapping = {
-            "1": ["api_key", "air_url", "username", "ssh_key"],
+            "1": ["api_key", "air_url", "username", "ssh_key", "pull_secret"],
             "2": ["api_key"],
             "3": ["air_url"],
             "4": ["username"],
             "5": ["ssh_key"],
-            "6": [],
+            "6": ["pull_secret"],
+            "7": [],
         }
         if raw in mapping:
             return mapping[raw]
-        warn("Enter 1-6.")
+        warn("Enter 1-7.")
 
 
 # ---------- main wizard ----------
@@ -501,7 +536,7 @@ def run_interactive() -> int:
     existing_path = find_existing_vault()
     existing_data: dict = {}
     existing_password: str | None = None
-    fields_to_update: list[str] = ["api_key", "air_url", "username", "ssh_key"]
+    fields_to_update: list[str] = ["api_key", "air_url", "username", "ssh_key", "pull_secret"]
 
     if existing_path is not None:
         banner("Existing vault detected")
@@ -539,12 +574,16 @@ def run_interactive() -> int:
         banner("SSH Key")
         new_data["air_ssh_key_path"] = prompt_ssh_key(existing_data.get("air_ssh_key_path"))
 
+    if "pull_secret" in fields_to_update:
+        banner("OCP Pull Secret")
+        new_data["ocp_pull_secret"] = prompt_pull_secret(existing_data.get("ocp_pull_secret"))
+
     # Optional NGC org (nv-ngc-org header). Blank preserves the existing value,
     # so this is a no-op Enter on partial updates that don't touch it.
     banner("NGC Org (optional)")
     new_data["air_org"] = prompt_ngc_org(existing_data.get("air_org"))
 
-    for k in ("air_api_key", "air_url", "air_username", "air_ssh_key_path", "air_org"):
+    for k in ("air_api_key", "air_url", "air_username", "air_ssh_key_path", "air_org", "ocp_pull_secret"):
         new_data.setdefault(k, existing_data.get(k, ""))
 
     banner("Vault Password")
