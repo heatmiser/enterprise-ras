@@ -129,6 +129,12 @@ OPTIONAL_SETTINGS_KEYS = [
     "ldap_organization",
     "pre_login_message",
     "post_login_message",
+    "openshift",
+    "ocp_api_vip",
+    "ocp_ingress_vip",
+    "ocp_cluster_domain",
+    "ocp_version",
+    "ocp_oem",
 ]
 
 # R4-06: keys that are accepted by historical templates but have ZERO
