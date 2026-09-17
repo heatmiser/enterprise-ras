@@ -45,6 +45,8 @@ From the `net-configurator/` directory:
 pip install -r requirements.txt
 ```
 
+If you need to invoke `make rhcos-image-prep` step, please also run `pip install nv-air-sdk`
+
 ### C. Set your Air API token
 
 Obtain your token from the NVIDIA Air portal (Account → API Tokens), then export it:
