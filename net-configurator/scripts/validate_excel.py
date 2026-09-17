@@ -26,7 +26,8 @@ import openpyxl
 # Re-use the parser's canonical-role helpers so the validator and parser
 # share one source of truth for category resolution.
 from excel_parser import (CANONICAL_ROLES, canonical_category, extract_role_index,
-                          build_wiremap_column_map, parse_air_settings)
+                          build_wiremap_column_map, parse_air_settings,
+                          load_workbook_safe)
 from oob_reserved import (OOB_SUBNET, DEFAULT_AIR_MGMT_SUBNET,
                           find_oob_collisions, air_mgmt_intruders,
                           oob_reserved_for_mode)
@@ -3676,7 +3677,7 @@ def validate_excel(xlsx_path):
     print(f"{'='*60}")
 
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb = load_workbook_safe(path, data_only=True)
     except Exception as e:
         result.error("File", f"Cannot open workbook: {e}")
         return result
