@@ -32,7 +32,7 @@
 
     - name: Ensure SSH private key is present on jump host
       ansible.builtin.copy:
-        src: "{{ ocp_ssh_key_path | default('~/.ssh/id_ed25519_ipp5-ocp') | regex_replace('\\.pub$', '') }}"
+        src: "{{ ocp_ssh_key_path | default('~/.ssh/id_ed25519') | regex_replace('\\.pub$', '') }}"
         dest: "/home/ubuntu/.ssh/id_ed25519"
         mode: "0600"
       ignore_errors: true
