@@ -40,7 +40,8 @@ import yaml
 
 from utils import generate_mac, classify_node, is_switch, is_valid_hostname
 from excel_parser import (build_wiremap_column_map, _wm_cell_ws,
-                          parse_nodes, build_nodes_function_map)
+                          parse_nodes, build_nodes_function_map,
+                          load_workbook_safe)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -182,7 +183,7 @@ def parse_wiremap_excel(excel_path: Path) -> List[WiremapRow]:
     cells get their roles resolved from the single source of truth
     (matches `excel_parser._build_wiremap_row_list` behavior).
     """
-    wb = openpyxl.load_workbook(excel_path, data_only=True)
+    wb = load_workbook_safe(excel_path, data_only=True)
     if "Wire Map" not in wb.sheetnames:
         raise ValueError(f"Sheet 'Wire Map' not found in {excel_path}")
 
@@ -414,7 +415,7 @@ class TopologyGenerator:
         self.switches_only = switches_only
         self.server_image = server_image or SERVER_OS
 
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        wb = load_workbook_safe(excel_path, data_only=True)
         new_format = "Air_Only" in wb.sheetnames
 
         # Wire Map rows — always present
@@ -1270,7 +1271,7 @@ class TopologyGenerator:
 
         Returns list of subnet strings, e.g., ['192.168.200.0/24', '192.168.210.0/24'].
         """
-        wb = openpyxl.load_workbook(self.excel_path, data_only=True)
+        wb = load_workbook_safe(self.excel_path, data_only=True)
         ws = wb["Settings"] if "Settings" in wb.sheetnames else None
         result = []
         if ws:
@@ -2138,7 +2139,7 @@ class TopologyValidator:
         # intentionally dropped — don't flag them as "missing nodes".
         self.switches_only = switches_only
         self.server_image = server_image or SERVER_OS
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        wb = load_workbook_safe(excel_path, data_only=True)
         self.rows = parse_wiremap_excel(excel_path)
         if "Air_Only" in wb.sheetnames:
             self.rows = parse_air_only_sheet(wb) + self.rows
