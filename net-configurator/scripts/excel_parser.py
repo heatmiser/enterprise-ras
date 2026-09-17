@@ -66,6 +66,12 @@ def load_workbook_safe(path, **kwargs):
     friendly SystemExit instead of an uncaught traceback (issue #7)."""
     try:
         return openpyxl.load_workbook(path, **kwargs)
+    except TypeError:
+        # openpyxl 3.1.5 regression: data-validation sqref entries with empty cell
+        # ranges raise TypeError during parse. Strip <dataValidations> blocks from
+        # worksheet XML in-memory and reload — data validations are UI-only hints
+        # and carry no data ERA needs.
+        return _load_workbook_strip_dv(path, **kwargs)
     except (openpyxl.utils.exceptions.InvalidFileException,
             zipfile.BadZipFile, KeyError, OSError) as exc:
         raise SystemExit(
@@ -75,6 +81,28 @@ def load_workbook_safe(path, **kwargs):
             f"   ({type(exc).__name__}: {exc})\n"
             f"   → Re-export it from the ERA template and try again."
         )
+
+
+def _load_workbook_strip_dv(path, **kwargs):
+    """Reload an xlsx after stripping <dataValidations> blocks from worksheet XML.
+    Used as a fallback when openpyxl refuses to parse malformed sqref entries."""
+    import io
+    import re
+    buf = io.BytesIO()
+    with zipfile.ZipFile(path, 'r') as zin, \
+         zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for item in zin.infolist():
+            data = zin.read(item.filename)
+            if item.filename.startswith('xl/worksheets/') and item.filename.endswith('.xml'):
+                data = re.sub(
+                    rb'<dataValidations\b[^>]*(?:/>|>.*?</dataValidations>)',
+                    b'',
+                    data,
+                    flags=re.DOTALL,
+                )
+            zout.writestr(item, data)
+    buf.seek(0)
+    return openpyxl.load_workbook(buf, **kwargs)
 
 
 # Default disabled interfaces (fallback if not in Settings)
