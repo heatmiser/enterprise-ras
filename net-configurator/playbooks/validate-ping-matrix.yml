@@ -80,8 +80,9 @@
             {% set src_is_compute = item in groups.get('nodes', []) %}
             {% set src_is_support = item in groups.get('support', []) %}
             {% set src_is_storage = item in groups.get('storage', []) %}
-            {% set src_inband_iface = 'bond0' if src_is_compute else ('bond0.' ~ common.get('support_vlan', '') if src_is_support else ('bond0.' ~ common.get('storage_vlan', '') if src_is_storage else '')) %}
-            {% set src_inband_ip = (src_dev.get('bond_ip', '') if src_is_compute else src_dev.get('bond_ip1', '')) | regex_replace('/.*', '') %}
+            {% set _src_support_ip = src_dev.get('bond_ip1') or src_dev.get('bond_ip', '') %}
+            {% set src_inband_iface = 'bond0' if src_is_compute else ('bond0.' ~ common.get('support_vlan', '') if (src_is_support and src_dev.get('bond_ip1')) else 'bond0' if src_is_support else ('bond0.' ~ common.get('storage_vlan', '') if src_is_storage else '')) %}
+            {% set src_inband_ip = (src_dev.get('bond_ip', '') if src_is_compute else _src_support_ip) | regex_replace('/.*', '') %}
             {# GPU IPs: dual-plane uses gpu_interfaces (list of {iface,plane,ip}); single-plane uses gpu_ips list #}
             {% set src_gpu_iface = src_ifaces.get('gpu', [''])[0] if src_ifaces.get('gpu', []) | length > 0 else '' %}
             {% set _src_gpu_ifaces = src_dev.get('gpu_interfaces', []) %}
@@ -121,7 +122,7 @@
             {% if dst != item %}
             {% set dst_dev = devices.get(dst, {}) %}
             {% set dst_is_compute = dst in groups.get('nodes', []) %}
-            {% set dst_inband_ip = (dst_dev.get('bond_ip', '') if dst_is_compute else dst_dev.get('bond_ip1', '')) | regex_replace('/.*', '') %}
+            {% set dst_inband_ip = (dst_dev.get('bond_ip', '') if dst_is_compute else (dst_dev.get('bond_ip1') or dst_dev.get('bond_ip', ''))) | regex_replace('/.*', '') %}
             {% set _dst_gpu_ifaces = dst_dev.get('gpu_interfaces', []) %}
             {% set first_dst_gpu = (_dst_gpu_ifaces[0].ip | regex_replace('/.*', '')) if _dst_gpu_ifaces | length > 0
                                    else ((dst_dev.get('gpu_ips', [])[0] | regex_replace('/.*', '')) if dst_dev.get('gpu_ips', []) | length > 0 else '') %}
