@@ -51,12 +51,13 @@ def main() -> int:
         return 0  # no Excel yet (common early in the pipeline)
 
     try:
-        import openpyxl
+        import openpyxl  # noqa: F401
+        from excel_parser import load_workbook_safe
     except ImportError:
         return 0
 
     try:
-        wb = openpyxl.load_workbook(path, data_only=True)
+        wb = load_workbook_safe(path, data_only=True)
     except Exception:
         return 0
 

@@ -40,11 +40,12 @@ def find_excel(arch, site):
 def read_support_vlan(excel_path):
     """Read VLANs & Profiles sheet and return (subnet, gateway) for the Support VLAN, or (None, None)."""
     try:
-        import openpyxl
+        import openpyxl  # noqa: F401
+        from excel_parser import load_workbook_safe
     except ImportError:
         return None, None
     try:
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        wb = load_workbook_safe(excel_path, data_only=True)
         ws = wb["VLANs & Profiles"]
         for row in ws.iter_rows(values_only=True):
             # Row layout: VLAN ID, Name, Purpose, Subnet, Gateway, VRF, ...
@@ -75,11 +76,12 @@ def read_ocp_settings(excel_path):
     can fall back to derived or TODO defaults.
     """
     try:
-        import openpyxl
+        import openpyxl  # noqa: F401
+        from excel_parser import load_workbook_safe
     except ImportError:
         return {}
     try:
-        wb = openpyxl.load_workbook(excel_path, data_only=True)
+        wb = load_workbook_safe(excel_path, data_only=True)
         ws = wb["Settings"]
         in_section = False
         result = {}
