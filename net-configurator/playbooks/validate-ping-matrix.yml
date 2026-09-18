@@ -16,6 +16,11 @@
   vars:
     server_groups: "{{ groups.get('nodes', []) + groups.get('storage', []) + groups.get('support', []) }}"
     local_report: "/tmp/ping-matrix-report.txt"
+    # Collection starts after the initial convergence wait, but a host may
+    # still be writing its results or temporarily refuse SSH.  Keep the
+    # outcome explicit instead of folding every condition into NODATA.
+    collect_retries: 18
+    collect_delay_seconds: 5
   tasks:
 
     - name: Show test plan
@@ -269,16 +274,28 @@
             exit 0
           fi
 
-          CONTENT=$(timeout 15 $SSH_CMD 'cat /tmp/ping-matrix-results.txt 2>/dev/null' 2>/dev/null)
-          if [ -z "$CONTENT" ] || ! echo "$CONTENT" | grep -q "DONE"; then
-            echo "COLLECT|$NAME|NODATA"
-          else
-            echo "$CONTENT" | while IFS= read -r line; do
-              case "$line" in
-                PASS\|*|FAIL\|*) echo "FROM:$NAME|$line" ;;
-              esac
-            done
-          fi
+          STATUS="EMPTY"
+          for ATTEMPT in $(seq 1 {{ collect_retries }}); do
+            CONTENT=$(timeout 15 $SSH_CMD 'cat /tmp/ping-matrix-results.txt 2>/dev/null' 2>/dev/null)
+            READ_RC=$?
+            if [ "$READ_RC" -ne 0 ]; then
+              STATUS="SSH_FAILED"
+            elif [ -z "$CONTENT" ]; then
+              STATUS="EMPTY"
+            elif ! printf '%s\n' "$CONTENT" | grep -q '^DONE$'; then
+              STATUS="INCOMPLETE"
+            else
+              echo "COLLECT|$NAME|COMPLETE|attempt=$ATTEMPT"
+              echo "$CONTENT" | while IFS= read -r line; do
+                case "$line" in
+                  PASS\|*|FAIL\|*) echo "FROM:$NAME|$line" ;;
+                esac
+              done
+              exit 0
+            fi
+            [ "$ATTEMPT" -lt {{ collect_retries }} ] && sleep {{ collect_delay_seconds }}
+          done
+          echo "COLLECT|$NAME|$STATUS|attempts={{ collect_retries }}"
         ) &
         {% endfor %}
         wait
@@ -310,11 +327,12 @@
           {% set ns = namespace(total=0, pass_count=0, fail_count=0, expected_fail=0, nodata=0) %}
           {% set failed_list = [] %}
           {% for server in server_groups %}
-          {%   set nodata_line = all_lines | select('match', 'COLLECT\\|' ~ server ~ '\\|NODATA') | list %}
+          {%   set collect_lines = all_lines | select('match', 'COLLECT\\|' ~ server ~ '\\|') | list %}
+          {%   set collect_status = collect_lines[-1].split('|')[2] if collect_lines | length > 0 else 'UNKNOWN' %}
           {%   set result_lines = all_lines | select('match', '^FROM:' ~ server ~ '\\|') | list %}
-          {%   if nodata_line | length > 0 %}
+          {%   if collect_status != 'COMPLETE' %}
           {%     set ns.nodata = ns.nodata + 1 %}
-          ⚠️  {{ server }}  — no results (unreachable or script didn't complete)
+          ⚠️  {{ server }}  — collection {{ collect_status | lower | replace('_', ' ') }}
           {%   elif result_lines | length > 0 %}
           {%     set server_pass = namespace(n=0) %}
           {%     set server_fail = namespace(n=0) %}
@@ -376,6 +394,8 @@
 
           {% if ns.fail_count == 0 and ns.nodata == 0 %}
           ✅ Full mesh connectivity verified! ({{ ns.expected_fail }} cross-VRF failures are by design)
+          {% elif ns.fail_count == 0 %}
+          ⚠️  Connectivity validation incomplete: {{ ns.nodata }} server(s) did not return completed results.
           {% else %}
           ❌ {{ ns.fail_count }} unexpected connectivity issues detected.
           {% endif %}
