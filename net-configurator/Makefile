@@ -15,7 +15,7 @@ SHELL := /bin/bash
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
-        rhcos-image-prep generate-ocp-iso
+        rhcos-image-prep generate-ocp-iso generate-inspection-nmstate
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -273,6 +273,7 @@ help:  ## Show this help message
 	@echo ""
 	@echo "OCP / KVM Digital Twin:"
 	@echo "  make generate-ocp ARCH=2-8-5-200  # Generate OCP ABI manifests + NMState"
+	@echo "  make generate-inspection-nmstate ARCH=2-8-5-200 SITE=<site> INSPECTION_CANDIDATE=<node>"
 	@echo "  make init-ocp-settings ARCH=2-8-5-200 SITE=...  # Bootstrap ocp-settings.yml from inventory"
 	@echo "  make deploy-kvm ARCH=2-8-5-200 KVM_BASE_IMAGE=/path/to/rhel9.qcow2"
 	@echo ""
@@ -613,6 +614,20 @@ generate-ocp:  ## Generate OCP Ansible inventory + ABI manifests from ERA invent
 	@echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 	python3 scripts/generate-ocp-inventory.py --arch $(ARCH) --site $(SITE) --nic-mode $(NIC_MODE) \
 		$(if $(OCP_SETTINGS),--ocp-settings $(OCP_SETTINGS),)
+
+generate-inspection-nmstate:  ## Generate one IPA callback-only NMState artifact - requires ARCH, SITE, INSPECTION_CANDIDATE
+	$(call check_arch,$@)
+	@if [ -z "$(INSPECTION_CANDIDATE)" ]; then \
+		echo "ERROR: INSPECTION_CANDIDATE is required"; \
+		exit 1; \
+	fi
+	@if [ ! -d "output/$(ARCH)/$(SITE)/inventory" ]; then \
+		echo "ERROR: ERA inventory not found for arch=$(ARCH) site=$(SITE)"; \
+		echo "  Run 'make generate ARCH=$(ARCH) SITE=$(SITE)' first."; \
+		exit 1; \
+	fi
+	python3 scripts/generate-ocp-inventory.py --arch $(ARCH) --site $(SITE) --nic-mode $(NIC_MODE) \
+		--inspection-candidate "$(INSPECTION_CANDIDATE)"
 
 generate-ocp-iso:  ## Generate ABI ISO via openshift-install agent create image - requires ARCH, optional SITE OCP_EE_IMAGE= or OPENSHIFT_INSTALL=
 	$(call check_arch,$@)
