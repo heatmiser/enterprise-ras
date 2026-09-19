@@ -88,6 +88,33 @@ def test_kvm_nic_mode_bond_and_gpu():
     assert gpu_iface_names_kvm == ["eth3", "eth4"]
 
 
+def test_inspection_nmstate_is_cpu_bond_only():
+    dev = sample_device_data()
+    site = sample_site_vars()
+
+    cfg = gen_ocp.build_inspection_nmstate_network_config(dev, site, nic_mode="real-hw")
+
+    assert [iface["name"] for iface in cfg["interfaces"]] == ["bond0"]
+    assert cfg["interfaces"][0]["link-aggregation"]["port"] == [
+        "ens3f0np0", "ens3f1np0"
+    ]
+    assert cfg["routes"]["config"][0]["next-hop-interface"] == "bond0"
+
+
+def test_inspection_nmstate_requires_cpu_bond_data():
+    dev = sample_device_data()
+    dev["nic_map"]["cpu"] = []
+
+    try:
+        gen_ocp.build_inspection_nmstate_network_config(
+            dev, sample_site_vars(), nic_mode="real-hw"
+        )
+    except ValueError as exc:
+        assert str(exc) == "candidate has no CPU bond members"
+    else:
+        raise AssertionError("expected CPU-bond validation failure")
+
+
 def test_agent_config_nic_modes():
     site = sample_site_vars()
     role_map = {"su-1-node-1": "worker_gpu"}

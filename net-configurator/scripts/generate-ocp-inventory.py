@@ -34,6 +34,8 @@ Writes:
   │   └── group_vars/all/ocp.yml        OCP cluster vars for Ansible roles
   ├── agent-config.yaml                 ABI per-node config (if ocp-settings.yml present)
   ├── install-config.yaml               ABI cluster manifest (if pull_secret readable)
+  ├── inspection/
+  │   └── nmstate/<candidate>.yaml      IPA callback-only NMState for one inspection candidate
   └── day2/
       └── nncp-<node>-gpu-rails.yaml    Stage-2 NodeNetworkConfigurationPolicy CRs
                                         (GPU rail interfaces + PBR; apply after NMState Operator)
@@ -42,6 +44,8 @@ Usage:
     python3 scripts/generate-ocp-inventory.py --arch 2-8-5-200 [--site default]
     python3 scripts/generate-ocp-inventory.py --arch 2-8-5-200 --site kicktires \\
         --ocp-settings input/2-8-5-200/kicktires/ocp-settings.yml
+    python3 scripts/generate-ocp-inventory.py --arch 2-8-5-200 --site rhaifn01 \\
+        --inspection-candidate ipp5-285-rh-k8s-01
 """
 
 import argparse
@@ -246,6 +250,58 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="rea
         config["routes"] = {"config": routes}
     if rules:
         config["route-rules"] = {"config": rules}
+    return config
+
+
+def build_inspection_nmstate_network_config(device_data, site_vars, nic_mode="real-hw"):
+    """Return CPU-bond-only NMState for IPA callback connectivity.
+
+    This deliberately excludes OOB, GPU rails, ABI-specific settings, and
+    Day-2 network state. The static IPA callback uses the site CPU network
+    through ``bond0``.
+    """
+    common = site_vars.get("common", {})
+    ifaces_map = device_data.get("interfaces", {})
+    nic_map = device_data.get("nic_map", {})
+
+    if nic_map and nic_mode == "real-hw":
+        cpu_entries = nic_map.get("cpu", [])
+        members = [entry.get("kernel") for entry in cpu_entries if entry.get("kernel")]
+    else:
+        members = list(ifaces_map.get("cpu", []))
+
+    cidr = device_data.get("bond_ip")
+    gateway = common.get("cpu_gateway")
+    if not members:
+        raise ValueError("candidate has no CPU bond members")
+    if not cidr:
+        raise ValueError("candidate has no CPU bond address")
+
+    ip, prefix = _parse_cidr(cidr)
+    if not ip or prefix is None:
+        raise ValueError("candidate CPU bond address is not a valid CIDR")
+
+    config = {
+        "interfaces": [{
+            "name": "bond0",
+            "type": "bond",
+            "state": "up",
+            "ipv4": {
+                "enabled": True,
+                "dhcp": False,
+                "address": [{"ip": ip, "prefix-length": prefix}],
+            },
+            "link-aggregation": {"mode": "802.3ad", "port": members},
+        }],
+    }
+    if gateway:
+        config["routes"] = {
+            "config": [{
+                "destination": "0.0.0.0/0",
+                "next-hop-address": gateway,
+                "next-hop-interface": "bond0",
+            }],
+        }
     return config
 
 
@@ -624,6 +680,12 @@ def main():
         help="NIC naming mode: real-hw uses Wire Map K/L kernel names; "
              "kvm uses eth0/eth1/ethN (virtio) for KVM and Air simulations.",
     )
+    parser.add_argument(
+        "--inspection-candidate",
+        default=None,
+        help="Render only the candidate's minimal IPA callback NMState artifact; "
+             "does not generate ABI manifests or modify other OCP output.",
+    )
     args = parser.parse_args()
 
     base_dir   = Path("output") / args.arch / args.site
@@ -646,6 +708,35 @@ def main():
         for f in hv_dir.iterdir():
             if f.suffix in (".yml", ".yaml"):
                 era_host_vars[f.stem] = load_yaml(f)
+
+    if args.inspection_candidate:
+        candidate = args.inspection_candidate
+        device_data = devices.get(candidate)
+        if device_data is None:
+            sys.exit(
+                f"ERROR: inspection candidate {candidate!r} is not present in "
+                f"{inv_dir / 'group_vars/all/main.yml'}"
+            )
+        try:
+            inspection_nmstate = build_inspection_nmstate_network_config(
+                device_data, site_vars, nic_mode=args.nic_mode
+            )
+        except ValueError as exc:
+            sys.exit(f"ERROR: inspection candidate {candidate!r}: {exc}")
+
+        inspection_path = ocp_dir / "inspection" / "nmstate" / f"{candidate}.yaml"
+        write_yaml(
+            inspection_path,
+            inspection_nmstate,
+            header=(
+                "---\n"
+                "# Generated IPA callback-only inspection NMState — do not edit manually.\n"
+                "# CPU bond only; excludes OOB, GPU rails, ABI, and Day-2 network state."
+            ),
+        )
+        print(f"✓ {inspection_path}")
+        print("✅ Inspection NMState written; no ABI manifests were generated.")
+        return
 
     # Load ocp-settings.yml (optional)
     settings_path = args.ocp_settings or f"input/{args.arch}/{args.site}/ocp-settings.yml"
