@@ -1,0 +1,173 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Render the non-secret input artifact consumed by the collection's Gate-4
+# preflight. This driver only reads local files, decrypts the shared pull
+# secret, and queries the configured EE container through the included role.
+# It does not contact a BMC, deploy Ironic, or boot a node.
+
+- name: Prepare controlled inspection preflight inputs
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    inspection_preflight_candidate: ""
+    inspection_preflight_expected_ocp_version: ""
+    inspection_preflight_collection_cluster_vars_path: ""
+    inspection_preflight_nmstate_dir: ""
+    inspection_preflight_output_path: ""
+    inspection_preflight_architecture: x86_64
+    inspection_preflight_default_pull_secret_path: >-
+      {{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets/pull-secret.json
+
+  tasks:
+    - name: Validate operational driver arguments
+      ansible.builtin.assert:
+        that:
+          - inspection_preflight_candidate | length > 0
+          - inspection_preflight_expected_ocp_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')
+          - inspection_preflight_collection_cluster_vars_path | length > 0
+          - inspection_preflight_nmstate_dir | length > 0
+          - inspection_preflight_output_path | length > 0
+        fail_msg: >-
+          Supply one inspection candidate, its workbook-derived exact OCP
+          version, collection site variables, generated NMState directory, and
+          output path.
+
+    - name: Load shared Air vault
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../.era-secrets/air-secrets.yml"
+      no_log: true
+
+    - name: Read collection site variables
+      ansible.builtin.include_vars:
+        file: "{{ inspection_preflight_collection_cluster_vars_path }}"
+        name: __inspection_preflight_collection_vars
+
+    - name: Read generated candidate inspection NMState
+      ansible.builtin.include_vars:
+        file: >-
+          {{ inspection_preflight_nmstate_dir }}/{{ inspection_preflight_candidate }}.yaml
+        name: __inspection_preflight_nmstate
+
+    - name: Select generated candidate callback interface
+      ansible.builtin.set_fact:
+        __inspection_preflight_candidate_interfaces: >-
+          {{ __inspection_preflight_nmstate.interfaces
+             | selectattr('name', 'equalto', 'bond0')
+             | list }}
+
+    - name: Require one generated candidate callback interface
+      ansible.builtin.assert:
+        that:
+          - __inspection_preflight_candidate_interfaces | length == 1
+        fail_msg: >-
+          Generated inspection NMState must contain exactly one bond0 callback
+          interface.
+
+    - name: Select generated candidate callback interface
+      ansible.builtin.set_fact:
+        __inspection_preflight_candidate_interface: >-
+          {{ __inspection_preflight_candidate_interfaces | first }}
+
+    - name: Validate generated candidate callback address
+      ansible.builtin.assert:
+        that:
+          - __inspection_preflight_candidate_interface is mapping
+          - __inspection_preflight_candidate_interface.ipv4.enabled | default(false)
+          - __inspection_preflight_candidate_interface.ipv4.address | default([]) | length == 1
+        fail_msg: >-
+          Generated inspection NMState must contain exactly one enabled bond0
+          IPv4 address for callback-route selection.
+
+    - name: Derive generated candidate callback address
+      ansible.builtin.set_fact:
+        __inspection_preflight_callback_target_ip: >-
+          {{ (__inspection_preflight_candidate_interface.ipv4.address | first).ip }}
+
+    - name: Resolve bastion route to generated candidate callback address
+      ansible.builtin.command:
+        argv:
+          - ip
+          - -j
+          - route
+          - get
+          - "{{ __inspection_preflight_callback_target_ip }}"
+      register: __inspection_preflight_route_get
+      changed_when: false
+
+    - name: Parse bastion callback route selection
+      ansible.builtin.set_fact:
+        __inspection_preflight_callback_route: >-
+          {{ (__inspection_preflight_route_get.stdout | from_json) | first }}
+
+    - name: Validate bastion callback route selection
+      ansible.builtin.assert:
+        that:
+          - __inspection_preflight_callback_route.dev | default('') | length > 0
+          - >-
+            (__inspection_preflight_callback_route.prefsrc
+             | default(__inspection_preflight_callback_route.src | default(''))) | length > 0
+        fail_msg: >-
+          The bastion could not select a source address and interface for the
+          generated candidate inspection address.
+
+    - name: Derive operational inspection inputs
+      ansible.builtin.set_fact:
+        ocp_nodes: "{{ __inspection_preflight_collection_vars.ocp_nodes | default([]) }}"
+        ocp_ee_image: >-
+          {{ __inspection_preflight_collection_vars.ocp_ee_image | default('') }}
+        inspection_preflight_prepare_provisioning_ip: >-
+          {{ __inspection_preflight_callback_route.prefsrc
+             | default(__inspection_preflight_callback_route.src | default('')) }}
+        inspection_preflight_prepare_provisioning_interface: >-
+          {{ __inspection_preflight_callback_route.dev | default('') }}
+        pull_secret_path: >-
+          {{ inspection_preflight_default_pull_secret_path }}
+
+    - name: Validate derived inspection inputs
+      ansible.builtin.assert:
+        that:
+          - ocp_ee_image | length > 0
+          - inspection_preflight_prepare_provisioning_ip | length > 0
+          - inspection_preflight_prepare_provisioning_interface | length > 0
+        fail_msg: >-
+          Collection EE policy and the generated candidate callback route must
+          resolve before preparation can continue.
+
+    - name: Require shared-vault OCP pull secret
+      ansible.builtin.assert:
+        that:
+          - ocp_pull_secret | default('') | length > 0
+        fail_msg: >-
+          The shared Air vault must define ocp_pull_secret before inspection
+          preflight inputs can be prepared.
+      no_log: true
+
+    - name: Create local pull-secret parent directory
+      ansible.builtin.file:
+        path: "{{ pull_secret_path | dirname }}"
+        state: directory
+        mode: "0700"
+      no_log: true
+
+    - name: Materialize local pull secret for the collection role
+      ansible.builtin.copy:
+        content: "{{ ocp_pull_secret | trim }}\n"
+        dest: "{{ pull_secret_path }}"
+        mode: "0600"
+      no_log: true
+
+    - name: Render reviewable collection preflight inputs
+      ansible.builtin.include_role:
+        name: rhvp.baremetal_ocp.inspection_preflight_prepare
+      vars:
+        inspection_preflight_prepare_candidate_name: "{{ inspection_preflight_candidate }}"
+        inspection_preflight_prepare_nmstate_dir: "{{ inspection_preflight_nmstate_dir }}"
+        inspection_preflight_prepare_output_path: "{{ inspection_preflight_output_path }}"
+        inspection_preflight_prepare_architecture: "{{ inspection_preflight_architecture }}"
+        inspection_preflight_prepare_callback_target_ip: >-
+          {{ __inspection_preflight_callback_target_ip }}
+        inspection_preflight_prepare_expected_ocp_version: >-
+          {{ inspection_preflight_expected_ocp_version }}

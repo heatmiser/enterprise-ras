@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import ipaddress
+import re
 import sys
 from pathlib import Path
 
@@ -102,6 +103,21 @@ def read_ocp_settings(excel_path):
         return result
     except Exception:
         return {}
+
+
+def read_required_ocp_version(excel_path):
+    """Return the exact three-part OCP version declared in a workbook.
+
+    The workbook Settings tab is the declarative source for this value.  This
+    small adapter lets operational consumers read it without treating the
+    generated ocp-settings.yml projection as a second source of truth.
+    """
+    version = str(read_ocp_settings(excel_path).get("ocp_version", "")).strip()
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError(
+            f"Settings-tab ocp_version must be an exact three-part release, got {version!r}"
+        )
+    return version
 
 
 def suggest_vips(subnet_str):
@@ -244,7 +260,21 @@ def main():
     parser.add_argument("--site",  default="default", help="Site name (default: default)")
     parser.add_argument("--force", action="store_true",
                         help="Overwrite existing ocp-settings.yml")
+    parser.add_argument("--workbook", type=Path,
+                        help="Imported workbook path (defaults to input/<arch>/<site>/<arch>.xlsx)")
+    parser.add_argument("--print-ocp-version", action="store_true",
+                        help="Print the exact Settings-tab ocp_version and exit")
     args = parser.parse_args()
+
+    if args.print_ocp_version:
+        workbook = args.workbook or (Path("input") / args.arch / args.site / f"{args.arch}.xlsx")
+        if not workbook.is_file():
+            sys.exit(f"ERROR: imported workbook not found: {workbook}")
+        try:
+            print(read_required_ocp_version(workbook))
+        except ValueError as exc:
+            sys.exit(f"ERROR: {exc}")
+        return
 
     hosts_path = Path("output") / args.arch / args.site / "inventory" / "hosts"
     if not hosts_path.is_file():
