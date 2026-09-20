@@ -642,7 +642,7 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		exit 1; \
 	fi
 	@WORKBOOK="$(INPUT_XLSX)"; \
-	NMSTATE="output/$(ARCH)/$(SITE)/ocp/inspection/nmstate/$(INSPECTION_CANDIDATE).yaml"; \
+	NMSTATE="$(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/nmstate/$(INSPECTION_CANDIDATE).yaml"; \
 	CLUSTER_VARS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/cluster-vars.yaml"; \
 	OUTPUT="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/preflight-vars.yaml"; \
 	if [ ! -f "$$WORKBOOK" ]; then \
