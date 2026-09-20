@@ -15,7 +15,7 @@ SHELL := /bin/bash
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
-        rhcos-image-prep generate-ocp-iso generate-inspection-nmstate
+        rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -95,6 +95,11 @@ SERVER_OS ?= ubuntu
 
 INPUT_XLSX        = input/$(ARCH)/$(SITE)/$(ARCH).xlsx
 INVENTORY_DIR     = output/$(ARCH)/$(SITE)/inventory
+
+# Controlled physical-inspection integration. The collection remains separately
+# versioned; this standard installed location is overridable for development.
+RHV_BAREMETAL_OCP_COLLECTIONS_PATH ?= $(HOME)/.ansible/collections
+RHV_BAREMETAL_OCP_ROOT ?= $(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)/ansible_collections/rhvp/baremetal_ocp
 
 # Auto-detect LDAP: explicit LDAP=1 on command line takes priority,
 # otherwise detected at runtime inside targets (not at Makefile parse time).
@@ -274,6 +279,7 @@ help:  ## Show this help message
 	@echo "OCP / KVM Digital Twin:"
 	@echo "  make generate-ocp ARCH=2-8-5-200  # Generate OCP ABI manifests + NMState"
 	@echo "  make generate-inspection-nmstate ARCH=2-8-5-200 SITE=<site> INSPECTION_CANDIDATE=<node>"
+	@echo "  make prepare-inspection-preflight ARCH=2-8-5-200 SITE=<site> INSPECTION_CANDIDATE=<node>"
 	@echo "  make init-ocp-settings ARCH=2-8-5-200 SITE=...  # Bootstrap ocp-settings.yml from inventory"
 	@echo "  make deploy-kvm ARCH=2-8-5-200 KVM_BASE_IMAGE=/path/to/rhel9.qcow2"
 	@echo ""
@@ -628,6 +634,49 @@ generate-inspection-nmstate:  ## Generate one IPA callback-only NMState artifact
 	fi
 	python3 scripts/generate-ocp-inventory.py --arch $(ARCH) --site $(SITE) --nic-mode $(NIC_MODE) \
 		--inspection-candidate "$(INSPECTION_CANDIDATE)"
+
+prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - requires ARCH, SITE, INSPECTION_CANDIDATE
+	$(call check_arch,$@)
+	@if [ -z "$(INSPECTION_CANDIDATE)" ]; then \
+		echo "ERROR: INSPECTION_CANDIDATE is required"; \
+		exit 1; \
+	fi
+	@WORKBOOK="$(INPUT_XLSX)"; \
+	NMSTATE="output/$(ARCH)/$(SITE)/ocp/inspection/nmstate/$(INSPECTION_CANDIDATE).yaml"; \
+	CLUSTER_VARS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/cluster-vars.yaml"; \
+	OUTPUT="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/preflight-vars.yaml"; \
+	if [ ! -f "$$WORKBOOK" ]; then \
+		echo "ERROR: imported workbook not found: $$WORKBOOK"; \
+		exit 1; \
+	fi; \
+	if ! OCP_VERSION="$$(python3 scripts/init-ocp-settings.py --arch $(ARCH) --site $(SITE) --workbook "$$WORKBOOK" --print-ocp-version)"; then \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$NMSTATE" ]; then \
+		echo "ERROR: inspection NMState not found: $$NMSTATE"; \
+		echo "  Run 'make generate-inspection-nmstate ARCH=$(ARCH) SITE=$(SITE) INSPECTION_CANDIDATE=$(INSPECTION_CANDIDATE)' first."; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$CLUSTER_VARS" ]; then \
+		echo "ERROR: collection site variables not found: $$CLUSTER_VARS"; \
+		echo "  Install or point RHV_BAREMETAL_OCP_ROOT at the reviewed collection checkout."; \
+		exit 1; \
+	fi; \
+	if [ ! -f ".era-secrets/air-secrets.yml" ]; then \
+		echo "ERROR: shared Air vault not found: .era-secrets/air-secrets.yml"; \
+		echo "  Configure the shared vault with ocp_pull_secret before continuing."; \
+		exit 1; \
+	fi; \
+	VAULT_ARGS=(); \
+	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); fi; \
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
+		playbooks/prepare-inspection-preflight.yml \
+		-e "inspection_preflight_candidate=$(INSPECTION_CANDIDATE)" \
+		-e "inspection_preflight_expected_ocp_version=$$OCP_VERSION" \
+		-e "inspection_preflight_collection_cluster_vars_path=$$CLUSTER_VARS" \
+		-e "inspection_preflight_nmstate_dir=$$(dirname "$$NMSTATE")" \
+		-e "inspection_preflight_output_path=$$OUTPUT" \
+		"$${VAULT_ARGS[@]}"
 
 generate-ocp-iso:  ## Generate ABI ISO via openshift-install agent create image - requires ARCH, optional SITE OCP_EE_IMAGE= or OPENSHIFT_INSTALL=
 	$(call check_arch,$@)

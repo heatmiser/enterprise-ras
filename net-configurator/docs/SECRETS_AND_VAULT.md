@@ -10,7 +10,10 @@ This project uses two separate secret stores, each vault-encryptable:
 | **Shared Air vault** | `.era-secrets/air-secrets.yml` (repo-local, gitignored) | NGC API key, Air username, SSH key path | Per-checkout, shared across every arch/site in the repo |
 | **Per-deployment secrets** | `output/<arch>/<site>/inventory/group_vars/all/secrets.yml` | Switch, server, sudo, LDAP passwords | Per-deployment — can legitimately differ per customer |
 
-Only Ansible playbooks consume the per-deployment `secrets.yml`. Only the Air Python scripts consume the shared Air vault.
+Ansible playbooks consume the per-deployment `secrets.yml`. Air Python scripts
+and the controlled inspection-preflight driver consume the shared Air vault;
+the latter uses only `ocp_pull_secret` and materializes it as a local mode-0600
+JSON file for the collection role.
 
 ## Shared Air Vault
 
