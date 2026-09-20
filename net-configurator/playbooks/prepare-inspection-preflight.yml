@@ -28,12 +28,15 @@
           - inspection_preflight_candidate | length > 0
           - inspection_preflight_expected_ocp_version is match('^[0-9]+\\.[0-9]+\\.[0-9]+$')
           - inspection_preflight_collection_cluster_vars_path | length > 0
+          - inspection_preflight_collection_cluster_vars_path is match('^/')
           - inspection_preflight_nmstate_dir | length > 0
+          - inspection_preflight_nmstate_dir is match('^/')
           - inspection_preflight_output_path | length > 0
+          - inspection_preflight_output_path is match('^/')
         fail_msg: >-
           Supply one inspection candidate, its workbook-derived exact OCP
-          version, collection site variables, generated NMState directory, and
-          output path.
+          version, and absolute paths for collection site variables, generated
+          NMState directory, and output artifact.
 
     - name: Load shared Air vault
       ansible.builtin.include_vars:
