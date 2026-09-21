@@ -4648,6 +4648,30 @@ def generate_group_vars(settings, vlans, vrfs, output_dir, arch, nodes=None, por
             '2.cumulusnetworks.pool.ntp.org',
             '3.cumulusnetworks.pool.ntp.org',
         ]
+
+    # Preserve site-owned resolvers as an ordered list for consumers that need
+    # networking before their own configuration management is available (such
+    # as controlled Ironic inspection). Do not synthesize public resolvers.
+    dns_servers_str = str(settings.get('dns_servers', '') or '').strip()
+    dns_servers = []
+    if dns_servers_str:
+        for raw_server in dns_servers_str.split(','):
+            server = raw_server.strip()
+            try:
+                parsed_server = ipaddress.ip_address(server)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Settings.dns_servers contains invalid IP address {server!r}"
+                ) from exc
+            if parsed_server.version != 4 or str(parsed_server) != server:
+                raise ValueError(
+                    "Settings.dns_servers must contain canonical IPv4 addresses"
+                )
+            if server in dns_servers:
+                raise ValueError(
+                    f"Settings.dns_servers contains duplicate address {server!r}"
+                )
+            dns_servers.append(server)
     # `tiers` was split into ns_tiers (compute) + ew_tiers (GPU). A bare legacy
     # `tiers` seeds both for back-compat; warn so the operator migrates.
     if settings.get('tiers') is not None and \
@@ -4667,6 +4691,8 @@ def generate_group_vars(settings, vlans, vrfs, output_dir, arch, nodes=None, por
         'oob_uplink_mode': _normalize_oob_uplink_mode(settings),
         'ntp_servers': ntp_list,
     }
+    if dns_servers:
+        all_vars['dns_servers'] = dns_servers
 
     # Add VLAN/network info
     common = {}
