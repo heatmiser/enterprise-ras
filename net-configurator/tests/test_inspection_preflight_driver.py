@@ -62,6 +62,7 @@ def test_driver_uses_shared_vault_and_collection_role_without_bmc_credentials():
     assert "inspection_preflight_expected_ocp_version" in rendered
     assert "inspection_preflight_collection_cluster_vars_path is match('^/')" in rendered
     assert "inspection_preflight_nmstate_dir is match('^/')" in rendered
+    assert "inspection_preflight_early_network_path is match('^/')" in rendered
     assert "inspection_preflight_output_path is match('^/')" in rendered
     assert "inspection_preflight_ocp_settings_path" not in rendered
     assert "secrets.yaml" not in rendered
@@ -78,6 +79,8 @@ def test_make_target_wires_operational_driver_and_collection_location():
     assert "--print-ocp-version" in makefile
     assert "inspection_preflight_expected_ocp_version=$$OCP_VERSION" in makefile
     assert 'NMSTATE="$(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/nmstate/' in makefile
+    assert 'EARLY_NETWORK="$(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/early-network/' in makefile
+    assert "inspection_preflight_early_network_path=$$EARLY_NETWORK" in makefile
     assert "ocp-settings.yml\";" not in makefile
     assert "else VAULT_ARGS+=(--ask-vault-pass); fi;" in makefile
 

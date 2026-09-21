@@ -645,6 +645,7 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 	fi
 	@WORKBOOK="$(INPUT_XLSX)"; \
 	NMSTATE="$(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/nmstate/$(INSPECTION_CANDIDATE).yaml"; \
+	EARLY_NETWORK="$(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/early-network/$(INSPECTION_CANDIDATE).yaml"; \
 	CLUSTER_VARS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/cluster-vars.yaml"; \
 	OUTPUT="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/preflight-vars.yaml"; \
 	if [ ! -f "$$WORKBOOK" ]; then \
@@ -656,6 +657,11 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 	fi; \
 	if [ ! -f "$$NMSTATE" ]; then \
 		echo "ERROR: inspection NMState not found: $$NMSTATE"; \
+		echo "  Run 'make generate-inspection-nmstate ARCH=$(ARCH) SITE=$(SITE) INSPECTION_CANDIDATE=$(INSPECTION_CANDIDATE)' first."; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$EARLY_NETWORK" ]; then \
+		echo "ERROR: MAC-pinned inspection NIC input not found: $$EARLY_NETWORK"; \
 		echo "  Run 'make generate-inspection-nmstate ARCH=$(ARCH) SITE=$(SITE) INSPECTION_CANDIDATE=$(INSPECTION_CANDIDATE)' first."; \
 		exit 1; \
 	fi; \
@@ -677,6 +683,7 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		-e "inspection_preflight_expected_ocp_version=$$OCP_VERSION" \
 		-e "inspection_preflight_collection_cluster_vars_path=$$CLUSTER_VARS" \
 		-e "inspection_preflight_nmstate_dir=$$(dirname "$$NMSTATE")" \
+		-e "inspection_preflight_early_network_path=$$EARLY_NETWORK" \
 		-e "inspection_preflight_output_path=$$OUTPUT" \
 		"$${VAULT_ARGS[@]}"
 

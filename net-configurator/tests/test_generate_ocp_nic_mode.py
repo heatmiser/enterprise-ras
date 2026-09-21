@@ -101,6 +101,37 @@ def test_inspection_nmstate_is_cpu_bond_only():
     assert cfg["routes"]["config"][0]["next-hop-interface"] == "bond0"
 
 
+def test_inspection_early_network_identities_follow_bond_member_order():
+    dev = sample_device_data()
+    nmstate = gen_ocp.build_inspection_nmstate_network_config(
+        dev, sample_site_vars(), nic_mode="real-hw"
+    )
+
+    assert gen_ocp.build_inspection_early_network_interfaces(
+        dev, nmstate, nic_mode="real-hw"
+    ) == [
+        {"name": "ens3f0np0", "mac": "00:11:22:33:44:01"},
+        {"name": "ens3f1np0", "mac": "00:11:22:33:44:02"},
+    ]
+
+
+def test_inspection_early_network_requires_valid_cpu_mac():
+    dev = sample_device_data()
+    dev["nic_map"]["cpu"][1]["mac"] = ""
+    nmstate = gen_ocp.build_inspection_nmstate_network_config(
+        dev, sample_site_vars(), nic_mode="real-hw"
+    )
+
+    try:
+        gen_ocp.build_inspection_early_network_interfaces(
+            dev, nmstate, nic_mode="real-hw"
+        )
+    except ValueError as exc:
+        assert "lacks a valid workbook NIC MAC" in str(exc)
+    else:
+        raise AssertionError("expected MAC validation failure")
+
+
 def test_inspection_nmstate_requires_cpu_bond_data():
     dev = sample_device_data()
     dev["nic_map"]["cpu"] = []
