@@ -132,10 +132,14 @@ def main() -> int:
             return exc.exit_code
 
         console.print(f"  Found: {sim.title} ({sim.id}) [{sim.state}]")
+        if sim.owner:
+            console.print(f"  Owner: {sim.owner}")
 
         # Confirm
         if not args.force:
             console.print(f"\n  [bold]This will destroy simulation '{sim.title}'.[/]")
+            if sim.owner:
+                console.print(f"  [bold]Owner: {sim.owner}[/]")
             try:
                 response = input("  Continue? [y/N]: ").strip().lower()
             except EOFError:
