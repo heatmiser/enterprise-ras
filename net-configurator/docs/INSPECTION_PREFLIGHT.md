@@ -13,11 +13,18 @@ The normal site progression is:
 
 1. Import the physical-MAC workbook and generate the site output.
 2. Complete the Air fabric validation for the declared topology.
-3. Generate the selected node's inspection-only NMState document.
+3. Generate the selected node's inspection-only NMState document and its
+   sibling MAC-pinned CPU NIC identity artifact.
 4. Ensure the imported workbook's Settings-tab `ocp_version` is an exact
    three-part OCP release. The workbook at
    `input/<arch>/<site>/<arch>.xlsx` is the sole declared version source;
    `ocp-settings.yml` is a generated projection and is not read here.
+
+The generator writes the NIC identity artifact at
+`output/<arch>/<site>/ocp/inspection/early-network/<candidate>.yaml` from the
+workbook-derived CPU `nic_map`. Its ordered `{name, mac}` values must exactly
+match the inspection NMState bond members. The collection uses it to render
+dracut `ifname=<name>:<MAC>` arguments before the IPA live rootfs is fetched.
 
 The driver resolves the configured EE image to an immutable digest, then reads
 `openshift-install version` from that exact image. The EE-reported installer

@@ -36,6 +36,7 @@ Writes:
   ├── install-config.yaml               ABI cluster manifest (if pull_secret readable)
   ├── inspection/
   │   └── nmstate/<candidate>.yaml      IPA callback-only NMState for one inspection candidate
+  │   └── early-network/<candidate>.yaml CPU NIC identities for pre-rootfs dracut networking
   └── day2/
       └── nncp-<node>-gpu-rails.yaml    Stage-2 NodeNetworkConfigurationPolicy CRs
                                         (GPU rail interfaces + PBR; apply after NMState Operator)
@@ -303,6 +304,46 @@ def build_inspection_nmstate_network_config(device_data, site_vars, nic_mode="re
             }],
         }
     return config
+
+
+def build_inspection_early_network_interfaces(device_data, inspection_nmstate, nic_mode="real-hw"):
+    """Return ordered CPU NIC name/MAC identities for dracut ``ifname=``.
+
+    The inspection NMState document supplies the desired bond member names,
+    but it is applied only after the live rootfs is fetched.  Dracut must bind
+    those names to physical NICs first, so retain the matching CPU MACs from
+    the workbook-derived ``nic_map`` in a separate, reviewable artifact.
+    """
+    if nic_mode != "real-hw":
+        raise ValueError("MAC-pinned inspection networking requires nic_mode=real-hw")
+
+    interfaces = inspection_nmstate.get("interfaces", [])
+    bonds = [interface for interface in interfaces if interface.get("name") == "bond0"]
+    if len(bonds) != 1:
+        raise ValueError("inspection NMState must contain exactly one bond0 interface")
+
+    members = bonds[0].get("link-aggregation", {}).get("port", [])
+    cpu_entries = device_data.get("nic_map", {}).get("cpu", [])
+    mac_by_kernel = {
+        entry.get("kernel"): (entry.get("mac") or "").lower()
+        for entry in cpu_entries
+        if entry.get("kernel")
+    }
+    mac_pattern = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+    result = []
+    for member in members:
+        mac = mac_by_kernel.get(member, "")
+        if not mac_pattern.fullmatch(mac):
+            raise ValueError(
+                f"CPU bond member {member!r} lacks a valid workbook NIC MAC"
+            )
+        result.append({"name": member, "mac": mac})
+
+    if len(result) < 2 or len({entry["name"] for entry in result}) != len(result):
+        raise ValueError("inspection CPU bond members must be unique and contain at least two NICs")
+    if len({entry["mac"] for entry in result}) != len(result):
+        raise ValueError("inspection CPU bond member MAC addresses must be unique")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -721,6 +762,9 @@ def main():
             inspection_nmstate = build_inspection_nmstate_network_config(
                 device_data, site_vars, nic_mode=args.nic_mode
             )
+            inspection_early_network = build_inspection_early_network_interfaces(
+                device_data, inspection_nmstate, nic_mode=args.nic_mode
+            )
         except ValueError as exc:
             sys.exit(f"ERROR: inspection candidate {candidate!r}: {exc}")
 
@@ -734,8 +778,19 @@ def main():
                 "# CPU bond only; excludes OOB, GPU rails, ABI, and Day-2 network state."
             ),
         )
+        early_network_path = ocp_dir / "inspection" / "early-network" / f"{candidate}.yaml"
+        write_yaml(
+            early_network_path,
+            {"interfaces": inspection_early_network},
+            header=(
+                "---\n"
+                "# Generated MAC-pinned dracut interface identities — do not edit manually.\n"
+                "# Derived from the candidate CPU nic_map and inspection NMState bond members."
+            ),
+        )
         print(f"✓ {inspection_path}")
-        print("✅ Inspection NMState written; no ABI manifests were generated.")
+        print(f"✓ {early_network_path}")
+        print("✅ Inspection networking inputs written; no ABI manifests were generated.")
         return
 
     # Load ocp-settings.yml (optional)

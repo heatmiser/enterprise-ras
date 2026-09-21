@@ -16,6 +16,7 @@
     inspection_preflight_expected_ocp_version: ""
     inspection_preflight_collection_cluster_vars_path: ""
     inspection_preflight_nmstate_dir: ""
+    inspection_preflight_early_network_path: ""
     inspection_preflight_output_path: ""
     inspection_preflight_architecture: x86_64
     inspection_preflight_default_pull_secret_path: >-
@@ -31,12 +32,14 @@
           - inspection_preflight_collection_cluster_vars_path is match('^/')
           - inspection_preflight_nmstate_dir | length > 0
           - inspection_preflight_nmstate_dir is match('^/')
+          - inspection_preflight_early_network_path | length > 0
+          - inspection_preflight_early_network_path is match('^/')
           - inspection_preflight_output_path | length > 0
           - inspection_preflight_output_path is match('^/')
         fail_msg: >-
           Supply one inspection candidate, its workbook-derived exact OCP
           version, and absolute paths for collection site variables, generated
-          NMState directory, and output artifact.
+          NMState directory, MAC-pinned early-network input, and output artifact.
 
     - name: Load shared Air vault
       ansible.builtin.include_vars:
@@ -168,6 +171,8 @@
       vars:
         inspection_preflight_prepare_candidate_name: "{{ inspection_preflight_candidate }}"
         inspection_preflight_prepare_nmstate_dir: "{{ inspection_preflight_nmstate_dir }}"
+        inspection_preflight_prepare_early_network_path: >-
+          {{ inspection_preflight_early_network_path }}
         inspection_preflight_prepare_output_path: "{{ inspection_preflight_output_path }}"
         inspection_preflight_prepare_architecture: "{{ inspection_preflight_architecture }}"
         inspection_preflight_prepare_callback_target_ip: >-
