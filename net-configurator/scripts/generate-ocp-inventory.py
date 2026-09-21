@@ -50,6 +50,7 @@ Usage:
 """
 
 import argparse
+import ipaddress
 import os
 import re
 import sys
@@ -273,10 +274,31 @@ def build_inspection_nmstate_network_config(device_data, site_vars, nic_mode="re
 
     cidr = device_data.get("bond_ip")
     gateway = common.get("cpu_gateway")
+    dns_servers = site_vars.get("dns_servers", [])
     if not members:
         raise ValueError("candidate has no CPU bond members")
     if not cidr:
         raise ValueError("candidate has no CPU bond address")
+
+    if not isinstance(dns_servers, list) or not dns_servers:
+        raise ValueError("site dns_servers must provide at least one IPv4 resolver")
+    normalized_dns_servers = []
+    for dns_server in dns_servers:
+        if not isinstance(dns_server, str):
+            raise ValueError("site dns_servers must be an ordered list of IPv4 resolvers")
+        try:
+            parsed_dns_server = ipaddress.ip_address(dns_server)
+        except ValueError as exc:
+            raise ValueError(
+                f"site dns_servers contains invalid IP address {dns_server!r}"
+            ) from exc
+        if parsed_dns_server.version != 4 or str(parsed_dns_server) != dns_server:
+            raise ValueError("site dns_servers must contain canonical IPv4 resolvers")
+        if dns_server in normalized_dns_servers:
+            raise ValueError(
+                f"site dns_servers contains duplicate address {dns_server!r}"
+            )
+        normalized_dns_servers.append(dns_server)
 
     ip, prefix = _parse_cidr(cidr)
     if not ip or prefix is None:
@@ -303,6 +325,7 @@ def build_inspection_nmstate_network_config(device_data, site_vars, nic_mode="re
                 "next-hop-interface": "bond0",
             }],
         }
+    config["dns-resolver"] = {"config": {"server": normalized_dns_servers}}
     return config
 
 

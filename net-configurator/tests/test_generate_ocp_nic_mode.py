@@ -47,6 +47,7 @@ def sample_device_data():
 def sample_site_vars():
     return {
         "common": {"cpu_gateway": "10.78.221.1"},
+        "dns_servers": ["192.0.2.53", "192.0.2.54"],
         "devices": {"su-1-node-1": sample_device_data()},
     }
 
@@ -99,6 +100,33 @@ def test_inspection_nmstate_is_cpu_bond_only():
         "ens3f0np0", "ens3f1np0"
     ]
     assert cfg["routes"]["config"][0]["next-hop-interface"] == "bond0"
+    assert cfg["dns-resolver"]["config"]["server"] == ["192.0.2.53", "192.0.2.54"]
+
+
+def test_inspection_nmstate_requires_valid_site_dns_servers():
+    dev = sample_device_data()
+    site = sample_site_vars()
+    site["dns_servers"] = ["192.0.2.53", "192.0.2.53"]
+
+    try:
+        gen_ocp.build_inspection_nmstate_network_config(dev, site, nic_mode="real-hw")
+    except ValueError as exc:
+        assert "duplicate address" in str(exc)
+    else:
+        raise AssertionError("expected DNS validation failure")
+
+
+def test_inspection_nmstate_requires_site_dns_servers():
+    dev = sample_device_data()
+    site = sample_site_vars()
+    site.pop("dns_servers")
+
+    try:
+        gen_ocp.build_inspection_nmstate_network_config(dev, site, nic_mode="real-hw")
+    except ValueError as exc:
+        assert "at least one IPv4 resolver" in str(exc)
+    else:
+        raise AssertionError("expected missing DNS validation failure")
 
 
 def test_inspection_early_network_identities_follow_bond_member_order():
