@@ -79,3 +79,30 @@ def test_make_target_wires_operational_driver_and_collection_location():
     assert "inspection_preflight_expected_ocp_version=$$OCP_VERSION" in makefile
     assert 'NMSTATE="$(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/nmstate/' in makefile
     assert "ocp-settings.yml\";" not in makefile
+    assert "else VAULT_ARGS+=(--ask-vault-pass); fi;" in makefile
+
+
+def test_gate6_driver_requires_matching_authorization_and_new_durable_report():
+    driver_path = NET_CONFIGURATOR / "playbooks" / "inspect-controlled-candidate.yml"
+    driver = yaml.safe_load(driver_path.read_text())
+    rendered = driver_path.read_text()
+    task_names = [task["name"] for task in driver[0]["tasks"]]
+
+    assert "controlled_inspection_authorize_physical_boot == controlled_inspection_candidate" in rendered
+    assert "controlled_inspection_report_path is match('^/')" in rendered
+    assert "controlled_inspection_report_path is match('^/tmp(?:/|$)')" in rendered
+    assert "preflight_inspection_nodes | default([]) | length == 1" in rendered
+    assert "Refuse to overwrite an existing inspection report" in task_names
+    assert driver[1]["import_playbook"] == "{{ controlled_inspection_collection_playbook }}"
+    assert driver[1]["vars"]["inspect_cluster_nodes"] == "{{ preflight_inspection_nodes }}"
+
+
+def test_make_target_wires_gate6_driver_and_explicit_operator_contract():
+    makefile = (NET_CONFIGURATOR / "Makefile").read_text()
+
+    assert "inspect-controlled-candidate:" in makefile
+    assert "playbooks/inspect-controlled-candidate.yml" in makefile
+    assert "INSPECTION_AUTHORIZE_PHYSICAL_BOOT" in makefile
+    assert "INSPECTION_REPORT_PATH must be absolute" in makefile
+    assert "INSPECTION_REPORT_PATH must not be under /tmp" in makefile
+    assert "--ask-vault-pass" in makefile

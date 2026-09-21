@@ -15,7 +15,8 @@ SHELL := /bin/bash
         air-setup help-air-setup air-connect air-show air-auth-test air-ssh-check air-deploy air-destroy air-list air-budget air-full-deploy deploy-exclude-servers \
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
-        rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight
+        rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
+        inspect-controlled-candidate
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -280,6 +281,7 @@ help:  ## Show this help message
 	@echo "  make generate-ocp ARCH=2-8-5-200  # Generate OCP ABI manifests + NMState"
 	@echo "  make generate-inspection-nmstate ARCH=2-8-5-200 SITE=<site> INSPECTION_CANDIDATE=<node>"
 	@echo "  make prepare-inspection-preflight ARCH=2-8-5-200 SITE=<site> INSPECTION_CANDIDATE=<node>"
+	@echo "  make inspect-controlled-candidate INSPECTION_CANDIDATE=<node> INSPECTION_REPORT_PATH=/absolute/path INSPECTION_AUTHORIZE_PHYSICAL_BOOT=<node>"
 	@echo "  make init-ocp-settings ARCH=2-8-5-200 SITE=...  # Bootstrap ocp-settings.yml from inventory"
 	@echo "  make deploy-kvm ARCH=2-8-5-200 KVM_BASE_IMAGE=/path/to/rhel9.qcow2"
 	@echo ""
@@ -668,7 +670,7 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		exit 1; \
 	fi; \
 	VAULT_ARGS=(); \
-	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); fi; \
+	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
 		playbooks/prepare-inspection-preflight.yml \
 		-e "inspection_preflight_candidate=$(INSPECTION_CANDIDATE)" \
@@ -676,6 +678,41 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		-e "inspection_preflight_collection_cluster_vars_path=$$CLUSTER_VARS" \
 		-e "inspection_preflight_nmstate_dir=$$(dirname "$$NMSTATE")" \
 		-e "inspection_preflight_output_path=$$OUTPUT" \
+		"$${VAULT_ARGS[@]}"
+
+inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical inspection - requires candidate, report path, and matching authorization
+	$(call check_arch,$@)
+	@if [ -z "$(INSPECTION_CANDIDATE)" ] || [ -z "$(INSPECTION_REPORT_PATH)" ] || [ -z "$(INSPECTION_AUTHORIZE_PHYSICAL_BOOT)" ]; then \
+		echo "ERROR: INSPECTION_CANDIDATE, INSPECTION_REPORT_PATH, and INSPECTION_AUTHORIZE_PHYSICAL_BOOT are required"; \
+		exit 1; \
+	fi
+	@PREFLIGHT="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/preflight-vars.yaml"; \
+	SECRETS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/secrets.yaml"; \
+	HOSTS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/hosts.yml"; \
+	COLLECTION_PLAYBOOK="$(RHV_BAREMETAL_OCP_ROOT)/playbooks/inspect_cluster.yml"; \
+	REPORT="$(INSPECTION_REPORT_PATH)"; \
+	if [ ! -f "$$PREFLIGHT" ]; then \
+		echo "ERROR: prepared inspection inputs not found: $$PREFLIGHT"; \
+		echo "  Run 'make prepare-inspection-preflight ARCH=$(ARCH) SITE=$(SITE) INSPECTION_CANDIDATE=$(INSPECTION_CANDIDATE)' first."; \
+		exit 1; \
+	fi; \
+	if [ ! -f "$$SECRETS" ] || [ ! -f "$$HOSTS" ] || [ ! -f "$$COLLECTION_PLAYBOOK" ]; then \
+		echo "ERROR: reviewed collection inventory or inspection playbook is unavailable under $(RHV_BAREMETAL_OCP_ROOT)"; \
+		exit 1; \
+	fi; \
+	case "$$REPORT" in /*) ;; *) echo "ERROR: INSPECTION_REPORT_PATH must be absolute"; exit 1 ;; esac; \
+	case "$$REPORT" in /tmp|/tmp/*) echo "ERROR: INSPECTION_REPORT_PATH must not be under /tmp"; exit 1 ;; esac; \
+	VAULT_ARGS=(); \
+	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
+		-i "$$HOSTS" \
+		playbooks/inspect-controlled-candidate.yml \
+		-e "@$$PREFLIGHT" \
+		-e "@$$SECRETS" \
+		-e "controlled_inspection_candidate=$(INSPECTION_CANDIDATE)" \
+		-e "controlled_inspection_authorize_physical_boot=$(INSPECTION_AUTHORIZE_PHYSICAL_BOOT)" \
+		-e "controlled_inspection_report_path=$$REPORT" \
+		-e "controlled_inspection_collection_playbook=$$COLLECTION_PLAYBOOK" \
 		"$${VAULT_ARGS[@]}"
 
 generate-ocp-iso:  ## Generate ABI ISO via openshift-install agent create image - requires ARCH, optional SITE OCP_EE_IMAGE= or OPENSHIFT_INSTALL=

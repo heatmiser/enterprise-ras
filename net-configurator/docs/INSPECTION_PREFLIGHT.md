@@ -48,6 +48,30 @@ the reviewable, non-secret artifact to:
 
 `<collection-root>/inventories/<site>/preflight-vars.yaml`
 
+## Gate-6 Controlled Inspection
+
+After the report artifact and the collection's Gate-4 and Gate-5 checks have
+been reviewed, the separately authorized physical action is driven from this
+project:
+
+    make inspect-controlled-candidate ARCH=<arch> SITE=<site> \
+      INSPECTION_CANDIDATE=<candidate> \
+      INSPECTION_AUTHORIZE_PHYSICAL_BOOT=<candidate> \
+      INSPECTION_REPORT_PATH=/absolute/durable/path/<candidate>-inventory.yaml
+
+The authorization value must exactly equal the selected candidate. The report
+path must be absolute, must not be under `/tmp`, and must not already exist.
+The wrapper consumes the prepared `preflight-vars.yaml`, collection
+`secrets.yaml`, and collection bootstrap inventory at runtime. It maps the
+prepared one-node declaration to the collection's `inspect_cluster.yml`; it
+does not create a second release, media, NMState, callback, or BMC policy.
+
+The report is non-secret opaque evidence, mode `0640`, and must be retained
+for review before any ABI disk, NIC, or LLDP reconciliation work. The
+collection owns the physical lifecycle and its `always` teardown: report
+persistence, virtual-media detach, BMC postcondition verification, and
+ephemeral Ironic/customizer cleanup.
+
 ## Authorization Boundary
 
 The driver reads local configuration, materializes the local pull-secret file,

@@ -1,0 +1,64 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+#
+# Gate-6 operational adapter.  The collection remains the owner of the
+# Ironic lifecycle; this playbook only validates integrated handoff inputs and
+# binds the prepared single-candidate artifact to that collection playbook.
+
+- name: Authorize one controlled physical inspection
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    controlled_inspection_candidate: ""
+    controlled_inspection_authorize_physical_boot: ""
+    controlled_inspection_report_path: ""
+    controlled_inspection_collection_playbook: ""
+
+  tasks:
+    - name: Validate Gate-6 authorization and integrated inputs
+      ansible.builtin.assert:
+        that:
+          - controlled_inspection_candidate | length > 0
+          - controlled_inspection_authorize_physical_boot == controlled_inspection_candidate
+          - controlled_inspection_report_path is match('^/')
+          - not (controlled_inspection_report_path is match('^/tmp(?:/|$)'))
+          - controlled_inspection_collection_playbook is match('^/')
+          - preflight_inspection_nodes | default([]) | length == 1
+          - preflight_inspection_nodes[0].name | default('') == controlled_inspection_candidate
+          - ironic_image_resolve_ocp_release_image | default('') | length > 0
+          - ironic_image_resolve_pull_secret_path | default('') | length > 0
+          - ironic_preprovisioning_media_nmstate_dir | default('') | length > 0
+          - ironic_deploy_provisioning_ip | default('') | length > 0
+          - ironic_deploy_provisioning_interface | default('') | length > 0
+        fail_msg: >-
+          Gate 6 requires one prepared candidate, matching explicit physical-boot
+          authorization, an absolute non-temporary report path, and complete
+          release-matched preflight inputs.
+      no_log: true
+
+    - name: Require the collection inspection playbook
+      ansible.builtin.stat:
+        path: "{{ controlled_inspection_collection_playbook }}"
+      register: __controlled_inspection_collection_playbook
+
+    - name: Refuse to overwrite an existing inspection report
+      ansible.builtin.stat:
+        path: "{{ controlled_inspection_report_path }}"
+      register: __controlled_inspection_existing_report
+
+    - name: Validate report and collection destinations
+      ansible.builtin.assert:
+        that:
+          - __controlled_inspection_collection_playbook.stat.isreg | default(false)
+          - not (__controlled_inspection_existing_report.stat.exists | default(false))
+        fail_msg: >-
+          The collection inspection playbook must exist and the durable report
+          path must be new; preserve prior inspection evidence rather than
+          overwriting it.
+
+- import_playbook: "{{ controlled_inspection_collection_playbook }}"
+  vars:
+    inspect_cluster_nodes: "{{ preflight_inspection_nodes }}"
+    inspect_cluster_report_path: "{{ controlled_inspection_report_path }}"
