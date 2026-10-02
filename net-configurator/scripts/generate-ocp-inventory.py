@@ -17,7 +17,7 @@ Node role resolution (priority order):
                                      use ocp-settings.yml to assign the split explicitly)
 
 GPU node networking — Stage 1 / Stage 2 split:
-  Stage 1 (ABI): agent-config.yaml networkConfig contains bond0 (CPU/N-S) only.
+  Stage 1 (ABI): agent-config.yaml networkConfig contains ns-bond0 (CPU/N-S) only.
                  GPU rail interfaces are excluded — RHCOS during bootstrap may lack
                  drivers for the B3140 400G NICs, and E/W misconfiguration can
                  disrupt cluster formation.
@@ -30,7 +30,7 @@ Writes:
   output/<arch>/<site>/ocp/
   ├── inventory/
   │   ├── hosts.yml                     OCP-grouped YAML inventory (ansible_host per node)
-  │   ├── host_vars/<node>.yml          NMState networkConfig (Stage 1 / bond0 only for GPU nodes)
+  │   ├── host_vars/<node>.yml          NMState networkConfig (Stage 1 / ns-bond0 only for GPU nodes)
   │   └── group_vars/all/ocp.yml        OCP cluster vars for Ansible roles
   ├── agent-config.yaml                 ABI per-node config (if ocp-settings.yml present)
   ├── install-config.yaml               ABI cluster manifest (if pull_secret readable)
@@ -64,21 +64,8 @@ except ImportError:
     def _load_shared_air_vault(*_args, **_kwargs):
         return {}
 
-# ---------------------------------------------------------------------------
-# Architecture-level GPU boot disk defaults.
-# OEM-specific control_plane/infra/storage disks come from ocp-settings.yml.
-# See: era-ocp-configurator/vars/arch-oem-disk-defaults.yml for the full table.
-# ---------------------------------------------------------------------------
-GPU_DISK_DEFAULTS = {
-    "2-4-3-200":    "/dev/nvme0n1",
-    "2-4-5-800":    "/dev/nvme2n1",  # GB200 NVL72: E1.S cache drives enumerate first
-    "2-8-5-200":    "/dev/nvme0n1",
-    "2-8-9-400":    "/dev/nvme0n1",  # UNVERIFIED — OEM-dependent
-    "2-8-9-400-SP": "/dev/nvme0n1",  # UNVERIFIED
-    "2-8-9-800":    "/dev/nvme2n1",  # GB200 NVL72: same as 2-4-5-800
-}
-
 FALLBACK_DISK = "/dev/sda"
+DISK_DEFAULTS_PATH = Path(__file__).resolve().parent.parent / "vars" / "arch-oem-disk-defaults.yml"
 
 # Routing table IDs assigned per GPU rail for PBR (matches VLAN IDs 901-904).
 GPU_RAIL_TABLE_BASE = 900
@@ -88,13 +75,13 @@ OCP_ROLES = ("control_plane", "infra", "worker_gpu", "worker_storage")
 _KVM_PROFILE_ORDER = ("oob", "cpu", "gpu", "support", "storage")
 
 
-def _kvm_offset_for_profile(nic_map, profile_key):
+def _kvm_offset_for_profile(nic_alias_map, profile_key):
     """Return starting ethN index for profile_key based on canonical profile order."""
     offset = 0
     for key in _KVM_PROFILE_ORDER:
         if key == profile_key:
             break
-        offset += len(nic_map.get(key, []))
+        offset += len(nic_alias_map.get(key, []))
     return offset
 
 
@@ -113,6 +100,14 @@ INSTALLER_ROLE = {
 def load_yaml(path):
     with open(path) as f:
         return yaml.safe_load(f) or {}
+
+
+def load_disk_defaults(path=DISK_DEFAULTS_PATH):
+    """Load verified architecture/OEM/role boot-device defaults."""
+    defaults = load_yaml(path).get("disk_defaults", {})
+    if not isinstance(defaults, dict):
+        raise ValueError(f"disk_defaults must be a mapping: {path}")
+    return defaults
 
 
 def write_yaml(path, data, header=None):
@@ -146,19 +141,66 @@ def infer_ocp_role(hostname):
     return None
 
 
-def resolve_disk(hostname, ocp_role, arch, overrides):
-    """Four-step disk resolution: override → gpu-default → arch-fallback → /dev/sda.
+def resolve_disk(hostname, ocp_role, arch, oem, disk_defaults, overrides):
+    """Resolve boot disk: per-host override → arch/OEM/role default → fallback.
 
     Returns (device_path, used_fallback).  Callers should aggregate used_fallback
     and emit a single summary warning rather than one warning per node.
     """
     if hostname in overrides:
         return overrides[hostname], False
-    if ocp_role == "worker_gpu":
-        dev = GPU_DISK_DEFAULTS.get(arch)
-        if dev:
-            return dev, False
+    dev = disk_defaults.get(arch, {}).get(str(oem).lower(), {}).get(ocp_role)
+    if dev:
+        return dev, False
     return FALLBACK_DISK, True
+
+
+_MAC_ADDRESS_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$", re.IGNORECASE)
+
+
+def validate_nic_alias_map(hostname, nic_alias_map):
+    """Reject incomplete or ambiguous workbook alias/MAC identities."""
+    aliases = set()
+    macs = set()
+    for profile, entries in nic_alias_map.items():
+        for entry in entries:
+            alias = (entry.get("alias") or "").strip()
+            mac = (entry.get("mac") or "").strip().lower()
+            if not alias or not _MAC_ADDRESS_RE.fullmatch(mac):
+                raise ValueError(
+                    f"{hostname}: {profile} NIC alias entries require a non-empty alias "
+                    "and a valid MAC address"
+                )
+            if alias in aliases:
+                raise ValueError(f"{hostname}: duplicate NIC alias {alias!r}")
+            if mac in macs:
+                raise ValueError(f"{hostname}: duplicate NIC MAC address {mac!r}")
+            aliases.add(alias)
+            macs.add(mac)
+
+
+def _normalize_dns_servers(dns_servers):
+    """Validate and return ordered list of canonical IPv4 DNS resolvers."""
+    if not isinstance(dns_servers, list) or not dns_servers:
+        raise ValueError("site dns_servers must provide at least one IPv4 resolver")
+    normalized = []
+    for dns_server in dns_servers:
+        if not isinstance(dns_server, str):
+            raise ValueError("site dns_servers must be an ordered list of IPv4 resolvers")
+        try:
+            parsed = ipaddress.ip_address(dns_server)
+        except ValueError as exc:
+            raise ValueError(
+                f"site dns_servers contains invalid IP address {dns_server!r}"
+            ) from exc
+        if parsed.version != 4 or str(parsed) != dns_server:
+            raise ValueError("site dns_servers must contain canonical IPv4 resolvers")
+        if dns_server in normalized:
+            raise ValueError(
+                f"site dns_servers contains duplicate address {dns_server!r}"
+            )
+        normalized.append(dns_server)
+    return normalized
 
 
 # ---------------------------------------------------------------------------
@@ -167,30 +209,40 @@ def resolve_disk(hostname, ocp_role, arch, overrides):
 
 def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="real-hw"):
     """Return nmstate networkConfig dict for a node."""
-    common     = site_vars.get("common", {})
+    common = site_vars.get("common", {})
     ifaces_map = device_data.get("interfaces", {})
-    nic_map    = device_data.get("nic_map", {})
+    nic_alias_map = device_data.get("nic_alias_map", {})
+    dns_servers = site_vars.get("dns_servers", [])
     interfaces = []
     routes     = []
     rules      = []
 
     def _bond_members(profile_key):
-        """Return bond member NIC names, handling real-hw vs kvm mode."""
-        if nic_map and nic_mode == "real-hw":
-            entries = nic_map.get(profile_key, [])
+        """Return (bond-member names, MAC-identified entries) for a profile."""
+        if nic_alias_map and nic_mode == "real-hw":
+            entries = nic_alias_map.get(profile_key, [])
             if entries:
-                return [e["kernel"] for e in entries]
+                return [entry["alias"] for entry in entries], entries
         # KVM/Air: use topology-derived interface names (ifaces_map) directly.
-        # _kvm_offset_for_profile uses real-hw nic_map counts which can differ
+        # _kvm_offset_for_profile uses real-hw alias-map counts which can differ
         # from the number of ports the topology actually wires up per profile.
-        return ifaces_map.get(profile_key, [])
+        return ifaces_map.get(profile_key, []), []
 
-    def _bond(members, cidr, gateway):
+    def _bond(profile_key, cidr, gateway, bond_name="bond0"):
+        members, member_entries = _bond_members(profile_key)
         if not (cidr and members):
             return
+        for entry in member_entries:
+            interfaces.append({
+                "name": entry["alias"],
+                "type": "ethernet",
+                "identifier": "mac-address",
+                "mac-address": entry["mac"],
+                "state": "up",
+            })
         ip, prefix = _parse_cidr(cidr)
         interfaces.append({
-            "name": "bond0",
+            "name": bond_name,
             "type": "bond",
             "state": "up",
             "ipv4": {
@@ -204,46 +256,26 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="rea
             routes.append({
                 "destination": "0.0.0.0/0",
                 "next-hop-address": gateway,
-                "next-hop-interface": "bond0",
+                "next-hop-interface": bond_name,
             })
 
-    # Add eth0 OOB management interface if eth0_ip is defined
-    eth0_ip = device_data.get("eth0_ip")
-    if eth0_ip:
-        ip, prefix = _parse_cidr(eth0_ip)
-        if not prefix:
-            oob_net = common.get("oob_network", "")
-            _, prefix = _parse_cidr(oob_net) if oob_net else ("", 24)
-            prefix = prefix or 24
-        interfaces.append({
-            "name": "eth0",
-            "type": "ethernet",
-            "state": "up",
-            "ipv4": {
-                "enabled": True,
-                "dhcp": False,
-                "address": [{"ip": ip, "prefix-length": prefix}],
-            },
-        })
-
     if ocp_role in ("control_plane", "infra"):
-        members = _bond_members("cpu") or _bond_members("support")
-        cidr    = device_data.get("bond_ip") or device_data.get("bond_ip1")
-        gw      = common.get("cpu_gateway") or common.get("support_gateway")
-        _bond(members, cidr, gw)
+        profile_key = "cpu" if _bond_members("cpu")[0] else "support"
+        cidr = device_data.get("bond_ip") or device_data.get("bond_ip1")
+        gw = common.get("cpu_gateway") or common.get("support_gateway")
+        bond_name = "ns-bond0" if profile_key == "cpu" and nic_mode == "real-hw" else "bond0"
+        _bond(profile_key, cidr, gw, bond_name)
 
     elif ocp_role == "worker_gpu":
-        _bond(_bond_members("cpu"),
-              device_data.get("bond_ip"),
-              common.get("cpu_gateway"))
+        bond_name = "ns-bond0" if nic_mode == "real-hw" else "bond0"
+        _bond("cpu", device_data.get("bond_ip"), common.get("cpu_gateway"), bond_name)
         # GPU rail interfaces are intentionally excluded from ABI networkConfig;
         # applied post-install via NNCP CRs in ocp/day2/.
 
     elif ocp_role == "worker_storage":
-        members = _bond_members("storage")
-        cidr    = device_data.get("bond_ip1") or device_data.get("bond_ip")
-        gw      = common.get("storage_gateway") or common.get("cpu_gateway")
-        _bond(members, cidr, gw)
+        cidr = device_data.get("bond_ip1") or device_data.get("bond_ip")
+        gw = common.get("storage_gateway") or common.get("cpu_gateway")
+        _bond("storage", cidr, gw)
 
     config = {}
     if interfaces:
@@ -252,6 +284,8 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="rea
         config["routes"] = {"config": routes}
     if rules:
         config["route-rules"] = {"config": rules}
+    if dns_servers:
+        config["dns-resolver"] = {"config": {"server": _normalize_dns_servers(dns_servers)}}
     return config
 
 
@@ -264,11 +298,11 @@ def build_inspection_nmstate_network_config(device_data, site_vars, nic_mode="re
     """
     common = site_vars.get("common", {})
     ifaces_map = device_data.get("interfaces", {})
-    nic_map = device_data.get("nic_map", {})
+    nic_alias_map = device_data.get("nic_alias_map", {})
 
-    if nic_map and nic_mode == "real-hw":
-        cpu_entries = nic_map.get("cpu", [])
-        members = [entry.get("kernel") for entry in cpu_entries if entry.get("kernel")]
+    if nic_alias_map and nic_mode == "real-hw":
+        cpu_entries = nic_alias_map.get("cpu", [])
+        members = [entry.get("alias") for entry in cpu_entries if entry.get("alias")]
     else:
         members = list(ifaces_map.get("cpu", []))
 
@@ -280,25 +314,7 @@ def build_inspection_nmstate_network_config(device_data, site_vars, nic_mode="re
     if not cidr:
         raise ValueError("candidate has no CPU bond address")
 
-    if not isinstance(dns_servers, list) or not dns_servers:
-        raise ValueError("site dns_servers must provide at least one IPv4 resolver")
-    normalized_dns_servers = []
-    for dns_server in dns_servers:
-        if not isinstance(dns_server, str):
-            raise ValueError("site dns_servers must be an ordered list of IPv4 resolvers")
-        try:
-            parsed_dns_server = ipaddress.ip_address(dns_server)
-        except ValueError as exc:
-            raise ValueError(
-                f"site dns_servers contains invalid IP address {dns_server!r}"
-            ) from exc
-        if parsed_dns_server.version != 4 or str(parsed_dns_server) != dns_server:
-            raise ValueError("site dns_servers must contain canonical IPv4 resolvers")
-        if dns_server in normalized_dns_servers:
-            raise ValueError(
-                f"site dns_servers contains duplicate address {dns_server!r}"
-            )
-        normalized_dns_servers.append(dns_server)
+    normalized_dns_servers = _normalize_dns_servers(dns_servers)
 
     ip, prefix = _parse_cidr(cidr)
     if not ip or prefix is None:
@@ -335,7 +351,7 @@ def build_inspection_early_network_interfaces(device_data, inspection_nmstate, n
     The inspection NMState document supplies the desired bond member names,
     but it is applied only after the live rootfs is fetched.  Dracut must bind
     those names to physical NICs first, so retain the matching CPU MACs from
-    the workbook-derived ``nic_map`` in a separate, reviewable artifact.
+    the workbook-derived ``nic_alias_map`` in a separate, reviewable artifact.
     """
     if nic_mode != "real-hw":
         raise ValueError("MAC-pinned inspection networking requires nic_mode=real-hw")
@@ -346,16 +362,16 @@ def build_inspection_early_network_interfaces(device_data, inspection_nmstate, n
         raise ValueError("inspection NMState must contain exactly one bond0 interface")
 
     members = bonds[0].get("link-aggregation", {}).get("port", [])
-    cpu_entries = device_data.get("nic_map", {}).get("cpu", [])
-    mac_by_kernel = {
-        entry.get("kernel"): (entry.get("mac") or "").lower()
+    cpu_entries = device_data.get("nic_alias_map", {}).get("cpu", [])
+    mac_by_alias = {
+        entry.get("alias"): (entry.get("mac") or "").lower()
         for entry in cpu_entries
-        if entry.get("kernel")
+        if entry.get("alias")
     }
     mac_pattern = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
     result = []
     for member in members:
-        mac = mac_by_kernel.get(member, "")
+        mac = mac_by_alias.get(member, "")
         if not mac_pattern.fullmatch(mac):
             raise ValueError(
                 f"CPU bond member {member!r} lacks a valid workbook NIC MAC"
@@ -382,37 +398,50 @@ def _build_gpu_rail_desiredstate(device_data, site_vars, nic_mode="real-hw"):
     """
     common          = site_vars.get("common", {})
     ifaces_map      = device_data.get("interfaces", {})
-    nic_map         = device_data.get("nic_map", {})
+    nic_alias_map   = device_data.get("nic_alias_map", {})
     gpu_ifaces_list = device_data.get("gpu_interfaces")
     gpu_ips_list    = device_data.get("gpu_ips")
     gpu_nic_names   = ifaces_map.get("gpu", [])
+    gpu_alias_entries = nic_alias_map.get("gpu", [])
 
-    # Kernel NIC names for GPU rails (from Wire Map col K), ordered by Wire Map row.
-    if nic_mode == "kvm" and nic_map:
-        gpu_offset = _kvm_offset_for_profile(nic_map, "gpu")
-        gpu_count = len(gpu_ifaces_list) if gpu_ifaces_list else len(nic_map.get("gpu", []))
-        gpu_kernel_names = [f"eth{gpu_offset + i}" for i in range(gpu_count)]
+    # NIC aliases for GPU rails (from Wire Map col K), ordered by Wire Map row.
+    if nic_mode == "kvm" and nic_alias_map:
+        gpu_offset = _kvm_offset_for_profile(nic_alias_map, "gpu")
+        gpu_count = len(gpu_ifaces_list) if gpu_ifaces_list else len(nic_alias_map.get("gpu", []))
+        gpu_aliases = [f"eth{gpu_offset + i}" for i in range(gpu_count)]
     else:
-        gpu_kernel_names = [e["kernel"] for e in nic_map.get("gpu", []) if e.get("kernel")]
+        gpu_aliases = [entry["alias"] for entry in gpu_alias_entries if entry.get("alias")]
+    gpu_mac_by_alias = {
+        entry["alias"]: entry["mac"]
+        for entry in gpu_alias_entries
+        if entry.get("alias") and entry.get("mac")
+    }
+
+    def _gpu_ethernet_interface(name, ip, prefix):
+        interface = {
+            "name": name,
+            "type": "ethernet",
+            "state": "up",
+            "ipv4": {
+                "enabled": True,
+                "dhcp": False,
+                "address": [{"ip": ip, "prefix-length": prefix}],
+            },
+        }
+        if nic_mode == "real-hw" and name in gpu_mac_by_alias:
+            interface["identifier"] = "mac-address"
+            interface["mac-address"] = gpu_mac_by_alias[name]
+        return interface
 
     interfaces, routes, rules = [], [], []
 
     if gpu_ifaces_list:
         for i, gi in enumerate(gpu_ifaces_list):
             gi = dict(gi)
-            if i < len(gpu_kernel_names):
-                gi["iface"] = gpu_kernel_names[i]
+            if i < len(gpu_aliases):
+                gi["iface"] = gpu_aliases[i]
             nic_ip, nic_prefix = _parse_cidr(gi["ip"])
-            interfaces.append({
-                "name": gi["iface"],
-                "type": "ethernet",
-                "state": "up",
-                "ipv4": {
-                    "enabled": True,
-                    "dhcp": False,
-                    "address": [{"ip": nic_ip, "prefix-length": nic_prefix}],
-                },
-            })
+            interfaces.append(_gpu_ethernet_interface(gi["iface"], nic_ip, nic_prefix))
             routes.append({
                 "destination": "0.0.0.0/0",
                 "next-hop-address": gi["gateway"],
@@ -425,21 +454,13 @@ def _build_gpu_rail_desiredstate(device_data, site_vars, nic_mode="real-hw"):
                 "priority": 100,
             })
 
-    elif gpu_ips_list and gpu_nic_names:
+    elif gpu_ips_list and (gpu_aliases or gpu_nic_names):
         gw = common.get("gpu_gateway") or common.get("cpu_gateway")
-        for i, (nic_name, nic_cidr) in enumerate(zip(gpu_nic_names, gpu_ips_list)):
+        names = gpu_aliases if nic_mode == "real-hw" and gpu_aliases else gpu_nic_names
+        for i, (nic_name, nic_cidr) in enumerate(zip(names, gpu_ips_list)):
             table_id = GPU_RAIL_TABLE_BASE + i + 1  # 901, 902, 903, 904
             nic_ip, nic_prefix = _parse_cidr(nic_cidr)
-            interfaces.append({
-                "name": nic_name,
-                "type": "ethernet",
-                "state": "up",
-                "ipv4": {
-                    "enabled": True,
-                    "dhcp": False,
-                    "address": [{"ip": nic_ip, "prefix-length": nic_prefix}],
-                },
-            })
+            interfaces.append(_gpu_ethernet_interface(nic_name, nic_ip, nic_prefix))
             if gw:
                 routes.append({
                     "destination": "0.0.0.0/0",
@@ -583,7 +604,8 @@ def build_ocp_group_vars(ocp_settings, site_vars, ocp_out_dir, vault=None):
     }
 
 
-def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch, nic_mode="real-hw"):
+def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch,
+                       nic_mode="real-hw", disk_defaults=None):
     """Render agent-config.yaml dict."""
     devices  = site_vars.get("devices", {})
     overrides = {}
@@ -594,6 +616,8 @@ def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch, n
         cluster_name = ocp_settings.get("cluster", {}).get("name", cluster_name)
         oem          = ocp_settings.get("oem", oem)
         overrides    = ocp_settings.get("install_disk", {}).get("overrides") or {}
+
+    disk_defaults = disk_defaults if disk_defaults is not None else load_disk_defaults()
 
     # rendezvous IP: first control_plane node's bond IP
     rendezvous_ip = None
@@ -613,17 +637,18 @@ def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch, n
             print(f"  WARNING: {hostname} not in devices block — skipping", file=sys.stderr)
             continue
 
-        disk, _        = resolve_disk(hostname, ocp_role, arch, overrides)
+        nic_alias_map = device_data.get("nic_alias_map", {})
+        if nic_mode == "real-hw" and nic_alias_map:
+            validate_nic_alias_map(hostname, nic_alias_map)
+        disk, _        = resolve_disk(hostname, ocp_role, arch, oem, disk_defaults, overrides)
         mac            = device_data.get("mac")
         network_config = build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode=nic_mode)
-
-        nic_map = device_data.get("nic_map", {})
         if nic_mode == "kvm":
-            if nic_map:
+            if nic_alias_map:
                 all_entries = [
                     entry for key in _KVM_PROFILE_ORDER
-                    for entry in nic_map.get(key, [])
-                    if entry.get("kernel")
+                    for entry in nic_alias_map.get(key, [])
+                    if entry.get("alias")
                 ]
                 hw_interfaces = [
                     {"name": f"eth{i}", "macAddress": entry.get("mac", "")}
@@ -631,12 +656,12 @@ def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch, n
                 ]
             else:
                 hw_interfaces = [{"name": "eth0", "macAddress": mac}] if mac else []
-        elif nic_map:
+        elif nic_alias_map:
             hw_interfaces = [
-                {"name": entry["kernel"], "macAddress": entry["mac"]}
-                for entries in nic_map.values()
+                {"name": entry["alias"], "macAddress": entry["mac"]}
+                for entries in nic_alias_map.values()
                 for entry in entries
-                if entry.get("kernel") and entry.get("mac")
+                if entry.get("alias") and entry.get("mac")
             ]
         else:
             hw_interfaces = [{"name": "eth0", "macAddress": mac}] if mac else []
@@ -741,7 +766,7 @@ def main():
         "--nic-mode",
         choices=("real-hw", "kvm"),
         default="real-hw",
-        help="NIC naming mode: real-hw uses Wire Map K/L kernel names; "
+        help="NIC naming mode: real-hw uses Wire Map K/L NIC aliases; "
              "kvm uses eth0/eth1/ethN (virtio) for KVM and Air simulations.",
     )
     parser.add_argument(
@@ -808,7 +833,7 @@ def main():
             header=(
                 "---\n"
                 "# Generated MAC-pinned dracut interface identities — do not edit manually.\n"
-                "# Derived from the candidate CPU nic_map and inspection NMState bond members."
+                "# Derived from the candidate CPU NIC alias map and inspection NMState bond members."
             ),
         )
         print(f"✓ {inspection_path}")
@@ -824,6 +849,8 @@ def main():
         print(f"  Using ocp-settings.yml: {settings_path}")
     else:
         print(f"  No ocp-settings.yml found at {settings_path} — using auto-inference")
+
+    disk_defaults = load_disk_defaults()
 
     # Load shared vault for credentials (ocp_pull_secret takes precedence over pull_secret_path)
     vault = _load_shared_air_vault()
@@ -863,7 +890,9 @@ def main():
 
         ansible_host = era_host_vars.get(hostname, {}).get("ansible_host", "")
         network_config = build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode=args.nic_mode)
-        disk, used_fallback = resolve_disk(hostname, ocp_role, args.arch, overrides)
+        disk, used_fallback = resolve_disk(
+            hostname, ocp_role, args.arch, oem, disk_defaults, overrides
+        )
         if used_fallback:
             fallback_disk_roles.add(ocp_role)
 
@@ -896,7 +925,10 @@ def main():
 
     # ── ABI manifests (require ocp-settings.yml) ──────────────────────────
     if ocp_settings:
-        agent_cfg  = build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, args.arch, nic_mode=args.nic_mode)
+        agent_cfg  = build_agent_config(
+            ocp_settings, role_map, era_host_vars, site_vars, args.arch,
+            nic_mode=args.nic_mode, disk_defaults=disk_defaults,
+        )
         ac_path    = ocp_dir / "agent-config.yaml"
         write_yaml(ac_path, agent_cfg)
         print(f"  ✓ {ac_path}")

@@ -1,0 +1,16 @@
+---
+# Boot-device defaults for Agent-based Installer nodes.
+#
+# Resolution order:
+#   1. input/<arch>/<site>/ocp-settings.yml install_disk.overrides[hostname]
+#   2. disk_defaults[arch][oem][ocp_role]
+#   3. /dev/sda with a generation warning
+#
+# Keep this file limited to verified hardware/BOM values.  An absent role or
+# OEM intentionally reaches the warning-producing fallback rather than
+# inheriting a guess from another platform.
+disk_defaults:
+  "2-8-5-200":
+    dell:
+      control_plane: /dev/disk/by-path/pci-0000:01:00.0-nvme-1
+      worker_gpu: /dev/disk/by-path/pci-0000:81:00.0-nvme-1

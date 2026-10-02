@@ -34,7 +34,7 @@ from utils import (
     classify_node as _classify_node,
     is_switch,
     build_interface_map,
-    build_nic_map,
+    build_nic_alias_map,
     build_nic_destinations,
     plane_for_switch,
 )
@@ -432,7 +432,8 @@ _WM_HEADER_ALIASES = {
                         'switch name', 'switch hostname', 'peer'),
     'switch_port':     ('port (b)', 'port(b)', 'b-side port', 'b side port',
                         'switch port', 'peer port', 'switch interface'),
-    'kernel_nic_name': ('kernel nic name', 'kernel nic', 'kernel name', 'kernel'),
+    'nic_alias':       ('kernel nic alias', 'kernel nic name', 'kernel nic',
+                        'kernel name', 'kernel'),
     'nic_mac_address': ('mac address', 'mac addr', 'mac'),
 }
 
@@ -649,8 +650,8 @@ def _build_wiremap_row_list(ws_wiremap, ws_air_only=None, nodes_function_map=Non
                 'switch_role_raw': switch_role_raw,
                 'switch_name': switch_name,
                 'switch_port': switch_port,
-                'kernel_nic': _wm_cell(row, col_map, 'kernel_nic_name'),
-                'nic_mac':    _wm_cell(row, col_map, 'nic_mac_address'),
+                'nic_alias': _wm_cell(row, col_map, 'nic_alias'),
+                'nic_mac':   _wm_cell(row, col_map, 'nic_mac_address'),
             })
         return rows
 
@@ -834,9 +835,9 @@ def build_devices(nodes, vlans, mgmt_subnets, node_oob_mapping=None, wiremap_row
             iface_map = build_interface_map(wiremap_rows, name)
             if iface_map:
                 entry['interfaces'] = iface_map
-            nic_map = build_nic_map(wiremap_rows, name)
-            if nic_map:
-                entry['nic_map'] = nic_map
+            nic_alias_map = build_nic_alias_map(wiremap_rows, name)
+            if nic_alias_map:
+                entry['nic_alias_map'] = nic_alias_map
 
         # Compute data-plane IPs based on role
         if role == 'compute' and cpu_base and gpu_base:

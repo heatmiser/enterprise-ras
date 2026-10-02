@@ -358,12 +358,12 @@ def build_interface_map(rows, node_name: str) -> dict:
     return dict(result)
 
 
-def build_nic_map(rows, node_name: str) -> dict:
-    """Build {profile_category: [{kernel, mac}]} from Wire Map rows with K/L data.
+def build_nic_alias_map(rows, node_name: str) -> dict:
+    """Build {profile_category: [{alias, mac}]} from Wire Map rows with K/L data.
 
-    Uses the 'kernel_nic' and 'nic_mac' keys added by _build_wiremap_row_list()
-    when columns K (Kernel NIC Name) and L (MAC Address) are present in the
-    Wire Map sheet.  Rows without a kernel_nic value (BMC, iDRAC) are skipped.
+    Uses the 'nic_alias' and 'nic_mac' keys added by _build_wiremap_row_list()
+    when columns K (Kernel NIC Alias) and L (MAC Address) are present in the
+    Wire Map sheet. Rows without a NIC alias value (BMC, iDRAC) are skipped.
 
     Returns an empty dict when no K/L data is present (e.g. KVM-only Excels).
 
@@ -372,7 +372,7 @@ def build_nic_map(rows, node_name: str) -> dict:
         node_name: hostname to filter on (A-side system_name).
 
     Returns:
-        {'cpu': [{'kernel': 'ens3f0np0', 'mac': '04:3F:72:01:02:00'}, ...],
+        {'cpu': [{'alias': 'ns-nic0', 'mac': '04:3F:72:01:02:00'}, ...],
          'oob': [...], 'gpu': [...], ...}
     """
     result = defaultdict(list)
@@ -382,13 +382,13 @@ def build_nic_map(rows, node_name: str) -> dict:
             continue
         if is_switch(r.get('system_role', '')):
             continue
-        kernel = (r.get('kernel_nic') or '').strip()
-        if not kernel or kernel in seen:
+        alias = (r.get('nic_alias') or '').strip()
+        if not alias or alias in seen:
             continue
-        seen.add(kernel)
+        seen.add(alias)
         mac     = (r.get('nic_mac') or '').strip()
         profile = classify_net_profile(r.get('net_profile', ''))
-        result[profile].append({'kernel': kernel, 'mac': mac})
+        result[profile].append({'alias': alias, 'mac': mac})
     return dict(result)
 
 

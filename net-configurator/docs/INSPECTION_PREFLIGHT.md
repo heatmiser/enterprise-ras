@@ -22,7 +22,7 @@ The normal site progression is:
 
 The generator writes the NIC identity artifact at
 `output/<arch>/<site>/ocp/inspection/early-network/<candidate>.yaml` from the
-workbook-derived CPU `nic_map`. Its ordered `{name, mac}` values must exactly
+workbook-derived CPU `nic_alias_map`. Its ordered `{name, mac}` values must exactly
 match the inspection NMState bond members. The collection uses it to render
 dracut `ifname=<name>:<MAC>` arguments before the IPA live rootfs is fetched.
 

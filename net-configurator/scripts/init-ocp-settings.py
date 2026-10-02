@@ -38,8 +38,24 @@ def find_excel(arch, site):
     return candidates[0] if candidates else None
 
 
-def read_support_vlan(excel_path):
-    """Read VLANs & Profiles sheet and return (subnet, gateway) for the Support VLAN, or (None, None)."""
+def find_cpu_inband_vlan(vlans):
+    """Return the CPU/in-band ``(subnet, gateway)`` from parsed VLAN rows.
+
+    OCP API and Ingress VIPs must be reachable on the machine network, which
+    is the CPU/in-band VLAN.  A Support VLAN can share the INBAND VRF but is
+    not the machine network and must never be selected for these VIPs.
+    """
+    for vlan in vlans:
+        name = str(vlan.get("name") or "").strip().lower()
+        if not vlan.get("subnet"):
+            continue
+        if "cpu" in name or "in-band" in name or "inband" in name:
+            return str(vlan["subnet"]), str(vlan.get("gateway") or "") or None
+    return None, None
+
+
+def read_cpu_inband_vlan(excel_path):
+    """Read the CPU/in-band VLAN subnet and gateway from the workbook."""
     try:
         import openpyxl  # noqa: F401
         from excel_parser import load_workbook_safe
@@ -48,15 +64,17 @@ def read_support_vlan(excel_path):
     try:
         wb = load_workbook_safe(excel_path, data_only=True)
         ws = wb["VLANs & Profiles"]
+        vlans = []
         for row in ws.iter_rows(values_only=True):
             # Row layout: VLAN ID, Name, Purpose, Subnet, Gateway, VRF, ...
             if len(row) < 5:
                 continue
-            name = str(row[1]).strip() if row[1] is not None else ""
-            subnet = row[3]
-            gateway = row[4]
-            if name.lower() == "support" and subnet:
-                return str(subnet), str(gateway) if gateway else None
+            vlans.append({
+                "name": row[1],
+                "subnet": row[3],
+                "gateway": row[4],
+            })
+        return find_cpu_inband_vlan(vlans)
     except Exception:
         pass
     return None, None
@@ -188,7 +206,7 @@ def write_settings(out_path, arch, site, node_roles_yaml,
 
     Priority for each field:
       1. Spreadsheet OPENSHIFT section value (ocp dict)
-      2. Derived heuristic (VIPs from support subnet, passed as api_vip/ingress_vip)
+      2. Derived heuristic (VIPs from CPU/in-band subnet, passed as api_vip/ingress_vip)
       3. TODO placeholder
     """
     ocp = ocp or {}
@@ -214,12 +232,12 @@ def write_settings(out_path, arch, site, node_roles_yaml,
         api_line     = f'  api_vip: "{xl_api_vip}"\n'
         ingress_line = f'  ingress_vip: "{xl_ingress_vip}"\n'
     elif api_vip and ingress_vip:
-        comment      = "# suggested from support subnet — confirm with IPAM before deploy"
+        comment      = "# suggested from CPU/in-band subnet — confirm with IPAM before deploy"
         api_line     = f'  api_vip: "{api_vip}"  {comment}\n'
         ingress_line = f'  ingress_vip: "{ingress_vip}"  {comment}\n'
     else:
-        api_line     = '  api_vip: ""  # TODO: set API VIP (reserved IP in the support subnet)\n'
-        ingress_line = '  ingress_vip: ""  # TODO: set Ingress VIP (reserved IP in the support subnet)\n'
+        api_line     = '  api_vip: ""  # TODO: set API VIP (reserved IP in the CPU/in-band subnet)\n'
+        ingress_line = '  ingress_vip: ""  # TODO: set Ingress VIP (reserved IP in the CPU/in-band subnet)\n'
 
     # OEM
     oem_val  = ocp.get("ocp_oem", "")
@@ -302,8 +320,8 @@ def main():
     node_roles_yaml = format_node_roles_yaml(node_roles)
 
     excel_path = find_excel(args.arch, args.site)
-    support_subnet, support_gateway = read_support_vlan(excel_path) if excel_path else (None, None)
-    api_vip, ingress_vip = suggest_vips(support_subnet) if support_subnet else ("", "")
+    cpu_inband_subnet, cpu_inband_gateway = read_cpu_inband_vlan(excel_path) if excel_path else (None, None)
+    api_vip, ingress_vip = suggest_vips(cpu_inband_subnet) if cpu_inband_subnet else ("", "")
     ocp = read_ocp_settings(excel_path) if excel_path else {}
 
     vault = _load_shared_air_vault()
@@ -326,7 +344,7 @@ def main():
     if not ocp.get("ocp_version"):
         todos.append("cluster.version     OCP version (e.g. 4.22.0)")
     if not (ocp.get("ocp_api_vip") or api_vip):
-        reason = "Excel not found" if not excel_path else "support VLAN not in spreadsheet"
+        reason = "Excel not found" if not excel_path else "CPU/in-band VLAN not in spreadsheet"
         todos.append(f"cluster.api_vip     (set manually — {reason})")
     if not (ocp.get("ocp_ingress_vip") or ingress_vip):
         todos.append(f"cluster.ingress_vip (set manually — same reason as api_vip)")
@@ -343,7 +361,7 @@ def main():
         for t in todos:
             print(f"    {t}")
     elif not (ocp.get("ocp_api_vip") and ocp.get("ocp_ingress_vip")) and api_vip and ingress_vip:
-        print(f"\n  VIPs suggested from support subnet {support_subnet} — confirm with IPAM:")
+        print(f"\n  VIPs suggested from CPU/in-band subnet {cpu_inband_subnet} — confirm with IPAM:")
         print(f"    cluster.api_vip:     {api_vip}")
         print(f"    cluster.ingress_vip: {ingress_vip}")
 
