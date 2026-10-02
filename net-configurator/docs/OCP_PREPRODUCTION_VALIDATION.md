@@ -88,10 +88,11 @@ simulator — `topology_generator.py`'s `_build_connected_links()` skips them en
 so they receive no `ethN` assignment and generate no virtual link in the Air JSON.
 
 However, **`Display in Air = No` rows are not ignored by the real-hardware pipeline.**
-`build_nic_map()` in `scripts/utils.py` processes all Wire Map rows that carry a kernel
-NIC name (column K), regardless of the `Display in Air` value. In `--nic-mode real-hw`,
-those kernel names and MACs appear in the `agent-config.yaml interfaces:` block used for
-Agent-Based Installer (ABI) host identification.
+`build_nic_alias_map()` in `scripts/utils.py` processes all Wire Map rows that carry a
+NIC alias (column K), regardless of the `Display in Air` value. In `--nic-mode real-hw`,
+those alias/MAC pairs appear in the `agent-config.yaml interfaces:` block used for
+Agent-Based Installer (ABI) host identification. The aliases are matched by MAC and do
+not depend on PCI-derived kernel netdev names.
 
 `Display in Air = No` rows exist for one purpose: **physical cabling documentation**. They
 record real hardware connections that NVIDIA Air cannot simulate, so that the Wire Map
@@ -245,7 +246,7 @@ parser.add_argument(
     "--nic-mode",
     choices=("real-hw", "kvm"),
     default="real-hw",
-    help="NIC naming mode: real-hw uses Wire Map K/L kernel names; "
+    help="NIC naming mode: real-hw uses Wire Map K/L NIC aliases; "
          "kvm uses eth0/eth1/ethN (virtio) for KVM and Air simulations.",
 )
 ```
@@ -256,19 +257,19 @@ logic applies to three places:
 **1a. `build_agent_config()` — `interfaces:` list**
 
 ```python
-# existing (real-hw mode):
+# real-hw mode:
 hw_interfaces = [
-    {"name": entry["kernel"], "macAddress": entry["mac"]}
-    for entries in nic_map.values()
+    {"name": entry["alias"], "macAddress": entry["mac"]}
+    for entries in nic_alias_map.values()
     for entry in entries
-    if entry.get("kernel") and entry.get("mac")
+    if entry.get("alias") and entry.get("mac")
 ]
 
 # kvm mode: enumerate all NICs across profiles, assign eth0, eth1, ethN...
 if nic_mode == "kvm":
     all_entries = [
-        entry for entries in nic_map.values() for entry in entries
-        if entry.get("kernel")
+        entry for entries in nic_alias_map.values() for entry in entries
+        if entry.get("alias")
     ]
     hw_interfaces = [
         {"name": f"eth{i}", "macAddress": entry.get("mac", "")}
@@ -281,24 +282,20 @@ they can be left empty or retained from Wire Map column L.
 
 **1b. `build_nmstate_network_config()` — bond member names**
 
-The `_bond_members()` helper currently returns kernel names from `nic_map`. In kvm
-mode, substitute `ethN` indices:
+The `_bond_members()` helper returns workbook aliases and their MACs in real-hardware
+mode. The ABI networkConfig emits MAC-identified Ethernet profiles and references their
+aliases as `ns-bond0` ports. KVM mode uses topology-derived simulated `ethN` names:
 
 ```python
-def _bond_members(profile_key, nic_mode="real-hw"):
-    if nic_map and nic_mode == "real-hw":
-        entries = nic_map.get(profile_key, [])
+def _bond_members(profile_key):
+    if nic_alias_map and nic_mode == "real-hw":
+        entries = nic_alias_map.get(profile_key, [])
         if entries:
-            return [e["kernel"] for e in entries]
-    elif nic_map and nic_mode == "kvm":
-        # Assign ethN based on position across all profiles in insertion order
-        offset = _kvm_offset_for_profile(nic_map, profile_key)
-        count = len(nic_map.get(profile_key, []))
-        return [f"eth{offset + i}" for i in range(count)]
-    return ifaces_map.get(profile_key, [])
+            return [e["alias"] for e in entries], entries
+    return ifaces_map.get(profile_key, []), []
 ```
 
-`_kvm_offset_for_profile()` walks the `nic_map` dict in key order and sums entry
+`_kvm_offset_for_profile()` walks the `nic_alias_map` dict in key order and sums entry
 counts for profiles that precede the requested one, yielding the correct `ethN` start
 index. Profile key order should be consistent — define a canonical order constant:
 
@@ -310,10 +307,10 @@ _KVM_PROFILE_ORDER = ("oob", "cpu", "gpu", "support", "storage")
 
 ```python
 if nic_mode == "kvm":
-    gpu_offset = _kvm_offset_for_profile(nic_map, "gpu")
-    gpu_kernel_names = [f"eth{gpu_offset + i}" for i in range(len(gpu_ifaces_list))]
+    gpu_offset = _kvm_offset_for_profile(nic_alias_map, "gpu")
+    gpu_aliases = [f"eth{gpu_offset + i}" for i in range(len(gpu_ifaces_list))]
 else:
-    gpu_kernel_names = [e["kernel"] for e in nic_map.get("gpu", []) if e.get("kernel")]
+    gpu_aliases = [e["alias"] for e in nic_alias_map.get("gpu", []) if e.get("alias")]
 ```
 
 **Makefile integration:** Pass `--nic-mode $(NIC_MODE)` to `generate-ocp-inventory.py`

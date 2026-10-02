@@ -46,6 +46,31 @@ def test_workbook_ocp_version_adapter_requires_exact_three_part_version(monkeypa
         raise AssertionError("an incomplete workbook version must be rejected")
 
 
+def test_cpu_inband_vip_source_excludes_support_vlan():
+    module = _load_init_settings_module()
+
+    subnet, gateway = module.find_cpu_inband_vlan([
+        {"name": "Support", "subnet": "10.78.220.0/24", "gateway": "10.78.220.1"},
+        {"name": "CPU/In-Band", "subnet": "10.78.221.0/24", "gateway": "10.78.221.1"},
+    ])
+
+    assert (subnet, gateway) == ("10.78.221.0/24", "10.78.221.1")
+    assert module.suggest_vips(subnet) == ("10.78.221.254", "10.78.221.253")
+
+
+def test_generated_vip_comment_names_cpu_inband_subnet(tmp_path):
+    output = tmp_path / "ocp-settings.yml"
+    _load_init_settings_module().write_settings(
+        output, "2-8-5-200", "example", "  control_plane:\n    - node-01",
+        api_vip="10.78.221.254", ingress_vip="10.78.221.253",
+    )
+
+    rendered = output.read_text()
+
+    assert "suggested from CPU/in-band subnet" in rendered
+    assert "suggested from support subnet" not in rendered
+
+
 def test_driver_uses_shared_vault_and_collection_role_without_bmc_credentials():
     playbook = yaml.safe_load(
         (NET_CONFIGURATOR / "playbooks" / "prepare-inspection-preflight.yml").read_text()

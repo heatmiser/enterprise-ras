@@ -94,6 +94,12 @@ SITE ?= default
 NIC_MODE ?= real-hw
 SERVER_OS ?= ubuntu
 
+# Keep standalone generation consistent with the RHCOS validation workflow.
+# An explicit SERVER_IMAGE remains authoritative for alternate RHCOS builds.
+ifeq ($(SERVER_OS),rhcos)
+SERVER_IMAGE ?= rhcos-422-openstack-gd
+endif
+
 INPUT_XLSX        = input/$(ARCH)/$(SITE)/$(ARCH).xlsx
 INVENTORY_DIR     = output/$(ARCH)/$(SITE)/inventory
 
