@@ -828,6 +828,8 @@ def build_devices(nodes, vlans, mgmt_subnets, node_oob_mapping=None, wiremap_row
             'eth0_ip': eth0_ip,
             'mac': mac,
         }
+        if 'include_in_initial_abi' in node:
+            entry['include_in_initial_abi'] = node['include_in_initial_abi']
 
         # Build interface mapping from Wire Map (if available)
         iface_map = {}
@@ -2579,6 +2581,7 @@ def parse_nodes(ws):
     gateway_col = _col('gateway', 6)
     ztp_col     = _col('ztp', None)
     enabled_col = _col('enabled', None)
+    abi_col = _col('include in initial abi', None)
 
     for row in range(2, ws.max_row + 1):
         role = ws.cell(row=row, column=func_col).value
@@ -2622,6 +2625,8 @@ def parse_nodes(ws):
         }
         if ztp_col:
             node['ztp'] = ws.cell(row=row, column=ztp_col).value or ''
+        if abi_col:
+            node['include_in_initial_abi'] = ws.cell(row=row, column=abi_col).value
         nodes.append(node)
 
     # Second pass: assign index by order-among-same-category for nodes

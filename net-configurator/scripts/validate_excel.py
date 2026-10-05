@@ -22,6 +22,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 
 import openpyxl
+import yaml
 
 # Re-use the parser's canonical-role helpers so the validator and parser
 # share one source of truth for category resolution.
@@ -965,7 +966,7 @@ def validate_settings(ws, result):
     return settings
 
 
-def validate_nodes(ws, result, settings=None):
+def validate_nodes(ws, result, settings=None, ocp_hostnames=None):
     """Validate Nodes sheet: required columns, IP formats, duplicates.
 
     Returns a list of dicts with parsed node data for cross-validation:
@@ -998,6 +999,10 @@ def validate_nodes(ws, result, settings=None):
     gateway_col = col_map.get('Gateway', NODE_COL_GATEWAY)
     enabled_col = col_map.get('Enabled')  # optional, not all sheets have it
     type_col = col_map.get('Type')        # optional, new in 2026-05-28
+    abi_col = col_map.get('Include in Initial ABI')
+    ocp_hostnames = ocp_hostnames or {}
+    if ocp_hostnames and abi_col is None:
+        result.error("Nodes", "Missing required column header: 'Include in Initial ABI'")
     # Notes column ('Notes') is purely informational, no validator rules.
 
     functions_seen = []
@@ -1141,6 +1146,15 @@ def validate_nodes(ws, result, settings=None):
         enabled_str = str(enabled_val or 'Yes').strip().lower()
         is_air_documentary = (enabled_str == 'air')
         is_enabled = enabled_str in ('yes', 'true', '1', '')
+
+        if name_str in ocp_hostnames and abi_col is not None:
+            abi_value = ws.cell(row=row, column=abi_col).value
+            if abi_value not in ('Yes', 'No'):
+                result.error("Nodes", f"Row {row} ({name_str}): Include in Initial ABI "
+                             f"must be exactly Yes or No; got {abi_value!r}")
+            elif ocp_hostnames[name_str] == 'control_plane' and abi_value != 'Yes':
+                result.error("Nodes", f"Row {row} ({name_str}): control-plane node "
+                             "must have Include in Initial ABI=Yes")
 
         # Type column rules (only when present in the sheet)
         type_val = ''
@@ -3708,9 +3722,20 @@ def validate_excel(xlsx_path):
 
     # 3. Nodes
     parsed_nodes = []
+    ocp_hostnames = {}
+    ocp_settings_path = path.parent / 'ocp-settings.yml'
+    if ocp_settings_path.is_file():
+        try:
+            ocp_settings = yaml.safe_load(ocp_settings_path.read_text()) or {}
+            for role, hostnames in (ocp_settings.get('node_roles') or {}).items():
+                for hostname in hostnames:
+                    ocp_hostnames[hostname] = role
+        except (OSError, yaml.YAMLError, AttributeError, TypeError) as exc:
+            result.error('OCP settings', f'Cannot read node roles: {exc}')
     if 'Nodes' in wb.sheetnames:
         print("  Checking Nodes...")
-        parsed_nodes = validate_nodes(wb['Nodes'], result, settings=settings)
+        parsed_nodes = validate_nodes(wb['Nodes'], result, settings=settings,
+                                      ocp_hostnames=ocp_hostnames)
         print(f"    {len(parsed_nodes)} nodes found")
 
     # Build the {name → canonical_function} lookup so downstream Wire
