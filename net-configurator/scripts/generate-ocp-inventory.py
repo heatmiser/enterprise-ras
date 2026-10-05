@@ -38,8 +38,13 @@ Writes:
   │   └── nmstate/<candidate>.yaml      IPA callback-only NMState for one inspection candidate
   │   └── early-network/<candidate>.yaml CPU NIC identities for pre-rootfs dracut networking
   └── day2/
+      ├── workers/nodes-config.yaml     Excluded workers for oc adm node-image create
       └── nncp-<node>-gpu-rails.yaml    Stage-2 NodeNetworkConfigurationPolicy CRs
                                         (GPU rail interfaces + PBR; apply after NMState Operator)
+
+The Nodes-sheet "Include in Initial ABI" value must be Yes or No for every
+OCP-managed host. All hosts remain in inventory. Only Yes hosts enter ABI
+manifests; No hosts are rendered for later Day-2 worker image creation.
 
 Usage:
     python3 scripts/generate-ocp-inventory.py --arch 2-8-5-200 [--site default]
@@ -545,6 +550,25 @@ def build_role_map(ocp_settings, devices, arch, site):
     return role_map
 
 
+def split_abi_membership(role_map, devices):
+    """Separate initial ABI hosts from Day-2 workers using workbook intent."""
+    initial, day2 = {}, {}
+    for hostname, role in role_map.items():
+        device = devices.get(hostname)
+        if device is None:
+            raise ValueError(f"{hostname}: OCP node is absent from the imported Nodes sheet")
+        value = device.get("include_in_initial_abi")
+        if value not in ("Yes", "No"):
+            raise ValueError(
+                f"{hostname}: Nodes 'Include in Initial ABI' must be exactly Yes or No; "
+                f"got {value!r}"
+            )
+        if role == "control_plane" and value != "Yes":
+            raise ValueError(f"{hostname}: control-plane node must have Include in Initial ABI=Yes")
+        (initial if value == "Yes" else day2)[hostname] = role
+    return initial, day2
+
+
 def build_hosts_yaml(role_map, era_host_vars):
     """Build OCP-grouped YAML inventory dict with ansible_host per node."""
     groups = {role: {} for role in OCP_ROLES}
@@ -681,6 +705,19 @@ def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch,
         "rendezvousIP": rendezvous_ip,
         "hosts":      agent_hosts,
     }
+
+
+def build_day2_workers_config(ocp_settings, day2_roles, era_host_vars, site_vars, arch,
+                              nic_mode="real-hw", disk_defaults=None):
+    """Render the node-image input using the same host identity as ABI."""
+    agent = build_agent_config(
+        ocp_settings, day2_roles, era_host_vars, site_vars, arch,
+        nic_mode=nic_mode, disk_defaults=disk_defaults,
+    )
+    return {"hosts": [
+        {key: value for key, value in host.items() if key != "role"}
+        for host in agent["hosts"]
+    ]}
 
 
 def read_pull_secret(ocp_settings, vault=None):
@@ -860,6 +897,12 @@ def main():
     role_map = build_role_map(ocp_settings, devices, args.arch, args.site)
     if not role_map:
         sys.exit("ERROR: no OCP nodes found in ERA inventory (devices block is empty or unrecognized)")
+    initial_roles, day2_roles = role_map, {}
+    if ocp_settings:
+        try:
+            initial_roles, day2_roles = split_abi_membership(role_map, devices)
+        except ValueError as exc:
+            sys.exit(f"ERROR: {exc}")
 
     # Summarize role assignment
     for role in OCP_ROLES:
@@ -926,18 +969,32 @@ def main():
     # ── ABI manifests (require ocp-settings.yml) ──────────────────────────
     if ocp_settings:
         agent_cfg  = build_agent_config(
-            ocp_settings, role_map, era_host_vars, site_vars, args.arch,
+            ocp_settings, initial_roles, era_host_vars, site_vars, args.arch,
             nic_mode=args.nic_mode, disk_defaults=disk_defaults,
         )
         ac_path    = ocp_dir / "agent-config.yaml"
         write_yaml(ac_path, agent_cfg)
         print(f"  ✓ {ac_path}")
 
-        install_cfg = build_install_config(ocp_settings, site_vars, role_map, vault=vault)
+        install_cfg = build_install_config(ocp_settings, site_vars, initial_roles, vault=vault)
+        ic_path = ocp_dir / "install-config.yaml"
         if install_cfg:
-            ic_path = ocp_dir / "install-config.yaml"
             write_yaml(ic_path, install_cfg)
             print(f"  ✓ {ic_path}")
+        elif ic_path.exists():
+            print(f"  Preserved existing {ic_path} (credentials unavailable; not regenerated)")
+
+        workers_path = ocp_dir / "day2" / "workers" / "nodes-config.yaml"
+        if day2_roles:
+            workers_cfg = build_day2_workers_config(
+                ocp_settings, day2_roles, era_host_vars, site_vars, args.arch,
+                nic_mode=args.nic_mode, disk_defaults=disk_defaults,
+            )
+            write_yaml(workers_path, workers_cfg,
+                       header="---\n# Rendered Day-2 worker input for oc adm node-image create; no ISO is created.")
+            print(f"  ✓ {workers_path}")
+        elif workers_path.exists():
+            workers_path.unlink()
     else:
         print(
             "\n  ABI manifests (agent-config.yaml, install-config.yaml) require ocp-settings.yml.\n"
@@ -957,14 +1014,13 @@ def main():
             nncp_path = ocp_dir / "day2" / f"nncp-{hostname}-gpu-rails.yaml"
             write_yaml(nncp_path, nncp,
                        header=f"---\n# Stage-2 GPU rail NNCP for {hostname}\n"
-                              "# Apply after NVIDIA Network Operator is installed and healthy:\n"
-                              "#   oc apply -f ocp/day2/")
+                              "# Apply after this worker joins and NVIDIA Network Operator is healthy.")
             print(f"  ✓ {nncp_path}")
             nncp_count += 1
 
     if nncp_count:
         print(f"\n  Day-2 GPU rail policies ({nncp_count} nodes): {ocp_dir}/day2/")
-        print("  Apply post-install: oc apply -f ocp/day2/")
+        print("  Apply each joined worker's nncp-<hostname>-gpu-rails.yaml post-install.")
     elif gpu_nodes:
         print(f"\n  NOTE: {len(gpu_nodes)} worker_gpu node(s) found but no GPU rail data in ERA inventory.",
               file=sys.stderr)

@@ -176,6 +176,13 @@ deployment — omitting `SERVER_IMAGE` leaves the topology defaulting to
 
 ### Step 7: Generate OCP inventory
 
+To also render initial ABI manifests and configuration for workers to add later,
+initialize a missing `input/<ARCH>/<SITE>/ocp-settings.yml` after Step 6 with
+`make init-ocp-settings ARCH=<ARCH> SITE=<SITE>`. Review the cluster settings,
+VIPs, credential paths, and node roles before generating OCP artifacts. Preserve
+an existing settings file. Without it, this step generates inventory and rail
+policies but skips ABI manifests and Day-2 worker configuration.
+
 ```bash
 make generate-ocp NIC_MODE=kvm
 ```
@@ -451,14 +458,38 @@ they exist only on the utility VM at `/opt/era/ignition/`.
 
 ### Day-2 NNCP YAMLs vs. ignition NMState payload
 
+Initial ABI membership is selected by the `Nodes` sheet's `Include in Initial ABI`
+column. Each OCP-managed node must have exactly `Yes` or `No`, with `Yes` required
+for every control-plane node. Keep excluded workers in `ocp-settings.yml.node_roles`;
+they remain in inventory but are rendered to `ocp/day2/workers/nodes-config.yaml`
+instead of the initial `agent-config.yaml`. Only included workers count toward
+`install-config.yaml` worker replicas. This selection does not remove nodes from
+the Air simulation or suppress their generated ignition instructions.
+
+The complete ABI rendering order is import, generate ERA inventory, initialize
+missing OCP settings, review those settings, then generate OCP artifacts. See
+[Initial ABI membership and Day-2 worker rendering](OCP_PREPRODUCTION_VALIDATION.md#initial-abi-membership-and-day-2-worker-rendering)
+for the command sequence and the verified physical `test01` example: seven nodes
+in inventory, six initial hosts, three worker replicas, three control-plane
+replicas, and GPU-03 alone in Day-2 worker configuration. That test used
+`NIC_MODE=real-hw`; it verified rendering, not cluster installation or worker joining.
+
 `make generate-ocp` also produces
 `output/<ARCH>/<SITE>/ocp/day2/nncp-<node>-gpu-rails.yaml` —
-`NodeNetworkConfigurationPolicy` CRs for the OpenShift NMState operator. These are
-applied post-install to a running OCP cluster:
+`NodeNetworkConfigurationPolicy` CRs for the OpenShift NMState operator. Policies
+are rendered for all configured GPU workers, including excluded workers. Apply
+each policy after its worker has joined the installed cluster and the OpenShift
+NMState and NVIDIA Network Operators are ready. For `test01`, GPU-03's policy must
+wait until that worker has been repaired and joined.
 
-```bash
-oc apply -f output/<ARCH>/<SITE>/ocp/day2/
-```
+For example, apply the joined GPU-01 worker's policy for `test01`:
+
+oc apply -f output/2-8-5-200/test01/ocp/day2/nncp-ipp5-285-rh-gpu-01-gpu-rails.yaml
+
+Select individual NNCP files. The generated `day2/workers/nodes-config.yaml` is
+input for a later explicit `oc adm node-image create` operation against a running
+cluster; it is not a Kubernetes resource to apply with `oc apply`. Generation
+creates neither an installation ISO nor a physical boot operation.
 
 The NNCP YAMLs and the ignition NMState payload express **equivalent GPU rail
 configuration** but are generated independently from the same source data
