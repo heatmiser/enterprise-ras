@@ -16,7 +16,7 @@ SHELL := /bin/bash
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
-        inspect-controlled-candidate
+        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -111,6 +111,10 @@ RHV_BAREMETAL_OCP_ROOT ?= $(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)/ansible_collecti
 INSPECTION_REPORT_PATH ?= $(CURDIR)/output/$(ARCH)/$(SITE)/reports/inspection/test/$(INSPECTION_CANDIDATE)-inventory.yaml
 INSPECTION_FAILURE_REPORT_PATH ?= $(patsubst %-inventory,%,$(basename $(INSPECTION_REPORT_PATH)))-failure.yaml
 INSPECTION_CLEANUP_REPORT_PATH ?= $(patsubst %-inventory,%,$(basename $(INSPECTION_REPORT_PATH)))-cleanup.yaml
+
+# Explicit run/node selection. Preparation does not authorize physical execution.
+FLEET_CONCURRENCY ?= 2
+FLEET_PREP_DIR = $(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/fleet/$(FLEET_RUN_ID)
 
 # Auto-detect LDAP: explicit LDAP=1 on command line takes priority,
 # otherwise detected at runtime inside targets (not at Makefile parse time).
@@ -696,6 +700,39 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		-e "inspection_preflight_early_network_path=$$EARLY_NETWORK" \
 		-e "inspection_preflight_output_path=$$OUTPUT" \
 		"$${VAULT_ARGS[@]}"
+
+prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared release preflight; no physical boot
+	$(call check_arch,$@)
+	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
+		echo "ERROR: FLEET_RUN_ID and explicit comma-separated FLEET_NODES are required"; exit 1; \
+	fi
+	python3 scripts/prepare-fleet-inspection.py prepare \
+		--arch "$(ARCH)" --site "$(SITE)" --run-id "$(FLEET_RUN_ID)" \
+		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_CONCURRENCY)" \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+	@VAULT_ARGS=(); \
+	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
+		playbooks/prepare-fleet-inspection.yml \
+		-i "$(FLEET_PREP_DIR)/hosts.yml" -e "@$(FLEET_PREP_DIR)/plan.yml" \
+		"$${VAULT_ARGS[@]}"
+
+inspect-fleet:  ## Run separately authorized physical fleet inspection; exact run and node list required
+	$(call check_arch,$@)
+	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_AUTHORIZE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_NODES)" ]; then \
+		echo "ERROR: FLEET_RUN_ID, FLEET_AUTHORIZE_RUN and FLEET_AUTHORIZE_NODES are required"; exit 1; \
+	fi
+	@SECRETS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/secrets.yaml"; \
+	if [ ! -f "$$SECRETS" ]; then echo "ERROR: collection site secrets are missing"; exit 1; fi; \
+	AUTH="$$(python3 scripts/prepare-fleet-inspection.py authorize \
+		--bundle "$(FLEET_PREP_DIR)" --run-id "$(FLEET_AUTHORIZE_RUN)" \
+		--nodes "$(FLEET_AUTHORIZE_NODES)")" || exit 1; \
+	VAULT_ARGS=(); \
+	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
+		playbooks/inspect-fleet.yml -i "$(FLEET_PREP_DIR)/hosts.yml" \
+		-e "@$(FLEET_PREP_DIR)/plan.yml" -e "@$(FLEET_PREP_DIR)/preflight-vars.yaml" \
+		-e "@$$SECRETS" -e "$$AUTH" "$${VAULT_ARGS[@]}"
 
 inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical inspection - requires candidate and matching authorization
 	$(call check_arch,$@)

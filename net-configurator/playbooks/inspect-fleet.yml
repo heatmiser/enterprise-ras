@@ -1,0 +1,77 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+- name: Authorize the exact prepared physical fleet and adapt vaulted credentials
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars:
+    fleet_adapter_authorized_run: ""
+    fleet_adapter_authorized_nodes: []
+  tasks:
+    - name: Require exact physical authorization and one local bootstrap
+      ansible.builtin.assert:
+        that:
+          - groups['bootstrap'] | default([]) == ['localhost']
+          - fleet_adapter_authorized_run == inspect_fleet_plan.run_id
+          - fleet_adapter_authorized_nodes | type_debug == 'list'
+          - fleet_adapter_authorized_nodes | length == inspect_fleet_plan.expected_node_count
+          - fleet_adapter_authorized_nodes | sort == inspect_fleet_plan.authorized_nodes | map(attribute='name') | sort
+          - not (inspect_fleet_synthetic_lifecycle | default(false) | bool)
+          - not (fleet_inspection_driver_synthetic_lifecycle | default(false) | bool)
+          - fleet_inspection_driver_nmstate_dir == fleet_adapter_bundle ~ '/nmstate'
+          - fleet_inspection_driver_early_network_dir == fleet_adapter_bundle ~ '/early-network'
+        fail_msg: Review and authorize this exact prepared run and node list before physical inspection.
+
+    - name: Verify prepared input hashes and unused evidence destination
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/../scripts/prepare-fleet-inspection.py"
+          - authorize
+          - --bundle
+          - "{{ fleet_adapter_bundle }}"
+          - --run-id
+          - "{{ fleet_adapter_authorized_run }}"
+          - --nodes
+          - "{{ fleet_adapter_authorized_nodes | join(',') }}"
+      register: __fleet_adapter_authority
+      changed_when: false
+
+    - name: Require the effective plan and preflight to match the sealed inputs
+      ansible.builtin.assert:
+        that:
+          - inspect_fleet_plan == __sealed_plan.inspect_fleet_plan
+          - ironic_image_resolve_ocp_release_image == __sealed_runtime.ironic_image_resolve_ocp_release_image
+          - ironic_image_resolve_oc_container_image == __sealed_runtime.ironic_image_resolve_oc_container_image
+          - ironic_deploy_provisioning_ip == __sealed_runtime.ironic_deploy_provisioning_ip
+          - ironic_deploy_provisioning_interface == __sealed_runtime.ironic_deploy_provisioning_interface
+          - ironic_preprovisioning_media_artifacts == __sealed_runtime.ironic_preprovisioning_media_artifacts
+      vars:
+        __sealed_plan: "{{ lookup('ansible.builtin.file', fleet_adapter_bundle ~ '/plan.yml') | from_yaml }}"
+        __sealed_runtime: "{{ lookup('ansible.builtin.file', fleet_adapter_bundle ~ '/preflight-vars.yaml') | from_yaml }}"
+
+    - name: Require separate vaulted credentials for every selected node
+      ansible.builtin.assert:
+        that:
+          - bmc_credentials[item.name].username | default('') | length > 0
+          - bmc_credentials[item.name].password | default('') | length > 0
+      loop: "{{ inspect_fleet_plan.authorized_nodes }}"
+      no_log: true
+
+    - name: Initialize the selected credential adapter
+      ansible.builtin.set_fact:
+        fleet_inspection_driver_bmc_credentials: {}
+        fleet_inspection_driver_physical_authorization: >-
+          {{ (__fleet_adapter_authority.stdout | from_json).fleet_inspection_driver_physical_authorization }}
+      no_log: true
+
+    - name: Adapt only selected node credentials for the collection
+      ansible.builtin.set_fact:
+        fleet_inspection_driver_bmc_credentials: >-
+          {{ fleet_inspection_driver_bmc_credentials | combine({item.name: bmc_credentials[item.name]}) }}
+      loop: "{{ inspect_fleet_plan.authorized_nodes }}"
+      no_log: true
+
+- name: Run the authorized collection fleet lifecycle
+  ansible.builtin.import_playbook: rhvp.baremetal_ocp.inspect_fleet

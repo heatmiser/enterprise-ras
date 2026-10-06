@@ -1,0 +1,74 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: MIT
+- name: Check every selected callback route before shared preflight preparation
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require explicit selected nodes and absolute preparation inputs
+      ansible.builtin.assert:
+        that:
+          - inspect_fleet_plan.authorized_nodes | length > 0
+          - inspect_fleet_plan.expected_node_count == inspect_fleet_plan.authorized_nodes | length
+          - fleet_adapter_bundle is match('^/')
+          - fleet_adapter_collection_vars is match('^/')
+          - fleet_adapter_expected_version is match('^[0-9]+[.][0-9]+[.][0-9]+$')
+
+    - name: Resolve bastion route to each selected callback address
+      ansible.builtin.command:
+        argv: [ip, -j, route, get, "{{ item.devices.bond_ip }}"]
+      loop: "{{ inspect_fleet_plan.authorized_nodes }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: __fleet_adapter_routes
+      changed_when: false
+
+    - name: Require one shared bastion source address and interface for the fleet
+      ansible.builtin.assert:
+        that:
+          - __route.dev | default('') | length > 0
+          - __route.prefsrc | default(__route.src | default('')) | length > 0
+          - __route.dev == __first_route.dev
+          - >-
+            __route.prefsrc | default(__route.src | default(''))
+            == __first_route.prefsrc | default(__first_route.src | default(''))
+        fail_msg: Every selected callback must use the same bastion source IP and interface for the shared runtime.
+      vars:
+        __route: "{{ (item.stdout | from_json) | first }}"
+        __first_route: "{{ (__fleet_adapter_routes.results[0].stdout | from_json) | first }}"
+      loop: "{{ __fleet_adapter_routes.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+
+- name: Prepare shared release metadata using the existing single-candidate driver
+  ansible.builtin.import_playbook: prepare-inspection-preflight.yml
+  vars:
+    inspection_preflight_candidate: "{{ inspect_fleet_plan.authorized_nodes[0].name }}"
+    inspection_preflight_expected_ocp_version: "{{ fleet_adapter_expected_version }}"
+    inspection_preflight_collection_cluster_vars_path: "{{ fleet_adapter_collection_vars }}"
+    inspection_preflight_nmstate_dir: "{{ fleet_inspection_driver_nmstate_dir }}"
+    inspection_preflight_early_network_path: >-
+      {{ fleet_inspection_driver_early_network_dir }}/{{ inspect_fleet_plan.authorized_nodes[0].name }}.yaml
+    inspection_preflight_output_path: "{{ fleet_adapter_bundle }}/preflight-vars.yaml"
+
+- name: Seal the complete reviewed fleet preparation handoff
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Preserve callback route evidence for every selected node
+      ansible.builtin.copy:
+        dest: "{{ fleet_adapter_bundle }}/callback-routes.yaml"
+        mode: "0640"
+        content: "{{ hostvars['localhost']['__fleet_adapter_routes'].results | to_nice_yaml(indent=2) }}"
+
+    - name: Seal plan networking and release inputs without touching hardware
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/../scripts/prepare-fleet-inspection.py"
+          - seal
+          - --bundle
+          - "{{ fleet_adapter_bundle }}"
+      changed_when: true
