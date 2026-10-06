@@ -14,6 +14,8 @@
     controlled_inspection_candidate: ""
     controlled_inspection_authorize_physical_boot: ""
     controlled_inspection_report_path: ""
+    controlled_inspection_failure_report_path: ""
+    controlled_inspection_cleanup_report_path: ""
     controlled_inspection_collection_playbook: ""
 
   tasks:
@@ -43,22 +45,62 @@
         path: "{{ controlled_inspection_collection_playbook }}"
       register: __controlled_inspection_collection_playbook
 
-    - name: Refuse to overwrite an existing inspection report
-      ansible.builtin.stat:
-        path: "{{ controlled_inspection_report_path }}"
-      register: __controlled_inspection_existing_report
+    - name: Resolve all controlled inspection artifact destinations
+      ansible.builtin.set_fact:
+        __controlled_inspection_failure_path: >-
+          {{ controlled_inspection_failure_report_path
+             | default(controlled_inspection_report_path
+                       | regex_replace('(-inventory)?[.]ya?ml$', '') ~ '-failure.yaml', true) }}
+        __controlled_inspection_cleanup_path: >-
+          {{ controlled_inspection_cleanup_report_path
+             | default(controlled_inspection_report_path
+                       | regex_replace('(-inventory)?[.]ya?ml$', '') ~ '-cleanup.yaml', true) }}
 
-    - name: Validate report and collection destinations
+    - name: Validate distinct durable YAML artifact destinations
       ansible.builtin.assert:
         that:
           - __controlled_inspection_collection_playbook.stat.isreg | default(false)
-          - not (__controlled_inspection_existing_report.stat.exists | default(false))
+          - item is match('^/')
+          - not (item is match('^/tmp(?:/|$)'))
+          - item is search('[.]yaml$')
+          - item is not search('[()]')
+          - >-
+            [controlled_inspection_report_path, __controlled_inspection_failure_path,
+             __controlled_inspection_cleanup_path] | unique | length == 3
         fail_msg: >-
-          The collection inspection playbook must exist and the durable report
-          path must be new; preserve prior inspection evidence rather than
-          overwriting it.
+          Inventory, failure, and cleanup paths must be distinct absolute
+          non-temporary .yaml destinations without parentheses. The collection
+          inspection playbook must exist.
+      loop:
+        - "{{ controlled_inspection_report_path }}"
+        - "{{ __controlled_inspection_failure_path }}"
+        - "{{ __controlled_inspection_cleanup_path }}"
 
-- import_playbook: "{{ controlled_inspection_collection_playbook }}"
+    - name: Inspect all controlled inspection artifact destinations
+      ansible.builtin.stat:
+        path: "{{ item }}"
+        follow: false
+      loop:
+        - "{{ controlled_inspection_report_path }}"
+        - "{{ __controlled_inspection_failure_path }}"
+        - "{{ __controlled_inspection_cleanup_path }}"
+      register: __controlled_inspection_existing_artifacts
+
+    - name: Refuse to overwrite prior inspection evidence
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists
+        fail_msg: >-
+          Inspection destination already exists: {{ item.item }}.
+          Preserve prior evidence before reusing the single-node test directory.
+      loop: "{{ __controlled_inspection_existing_artifacts.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+- name: Run the authorized collection inspection lifecycle
+  import_playbook: "{{ controlled_inspection_collection_playbook }}"
   vars:
     inspect_cluster_nodes: "{{ preflight_inspection_nodes }}"
     inspect_cluster_report_path: "{{ controlled_inspection_report_path }}"
+    inspect_cluster_failure_report_path: "{{ hostvars['localhost']['__controlled_inspection_failure_path'] }}"
+    inspect_cluster_cleanup_report_path: "{{ hostvars['localhost']['__controlled_inspection_cleanup_path'] }}"
