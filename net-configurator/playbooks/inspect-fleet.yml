@@ -38,6 +38,11 @@
       register: __fleet_adapter_authority
       changed_when: false
 
+    # Host-scoped inputs persist into the collection play without overriding per-node role parameters.
+    - name: Load sealed shared preflight inputs below per-node role parameter precedence
+      ansible.builtin.include_vars:
+        file: "{{ fleet_adapter_bundle }}/preflight-vars.yaml"
+
     - name: Require the effective plan and preflight to match the sealed inputs
       ansible.builtin.assert:
         that:
