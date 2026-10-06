@@ -95,15 +95,121 @@ collection owns the physical lifecycle and its `always` teardown: report
 persistence, virtual-media detach, BMC postcondition verification, and
 ephemeral Ironic/customizer cleanup.
 
-## Future whole-cluster artifact conventions
+## Fleet inspection through net-configurator
 
-Complete-cluster inspection will use
-`reports/inspection/<UTC-run-timestamp>/<node>/{inventory,failure,cleanup}.yaml`.
+`make prepare-fleet-inspection` and `make inspect-fleet` adapt an explicit node
+list to the collection's `inspect_fleet.yml`. The collection owns the shared
+Ironic runtime, bounded node concurrency, inventory collection, reconciliation,
+power-off verification, media detach and cleanup. These targets require the
+collection's fleet inspection, physical attachment, RAID and disk-matching updates.
+They do not generate ABI manifests, stage an install or boot an ABI ISO.
+
+### Inputs and preparation
+
+Run from `enterprise-ras/net-configurator` on the bastion with the project's
+Python/Ansible venv active. Import the reviewed site workbook and run `make generate`
+first. The adapter reads the canonical `input/<arch>/<site>/<arch>.xlsx`, generated
+ERA inventory, explicit OCP roles/disk policy in `ocp-settings.yml`, and the
+collection's `inventories/<site>/cluster-vars.yaml`. Workbook and OCP settings
+versions must agree; the existing preflight role checks the EE installer against
+the exact workbook version. All OpenShift utilities come from that EE container.
+
+Choose and retain a fresh UTC `FLEET_RUN_ID` in `YYYYMMDDTHHMMSSZ` format. Supply
+an explicit comma-separated `FLEET_NODES` list; there is no automatic whole-cluster
+selection. The first reviewed test selection is K8S-01 and GPU-01, concurrency 2.
+This selection and the commands below do not grant physical execution authority.
+
+    FLEET_RUN_ID=$(date -u +%Y%m%dT%H%M%SZ)
+
+    make prepare-fleet-inspection \
+      ARCH=2-8-5-200 \
+      SITE=rhaifn02 \
+      FLEET_RUN_ID="$FLEET_RUN_ID" \
+      FLEET_NODES=ipp5-285-rh-k8s-01,ipp5-285-rh-gpu-01 \
+      FLEET_CONCURRENCY=2
+
+Preparation creates a new directory at
+`output/<arch>/<site>/ocp/inspection/fleet/<run-id>/` containing:
+
+- `plan.yml`: exact nodes, BMC endpoints, CPU interface MACs, desired Wire Map,
+  by-path disk hints, concurrency and timeouts, plus source fingerprints.
+- `nmstate/<node>.yaml` and `early-network/<node>.yaml`: callback-only `bond0`
+  networking and MAC-pinned CPU NIC names. OOB and GPU rails are excluded.
+- `hosts.yml`: one local bootstrap, separate from the inspected nodes.
+- `callback-routes.yaml`: route observations for every selected callback address.
+- `preflight-vars.yaml`: pinned release/EE and shared runtime inputs, prepared
+  once using the first selected node. Its one-node candidate list is not the
+  fleet selection or execution authorization.
+- `prepared.yaml`: hashes binding the plan, network files, routes, runtime inputs
+  and bootstrap inventory. Changes to source inputs also invalidate the handoff.
+
+Preparation queries local routes and EE metadata and materializes the existing
+shared-vault pull secret; it does not contact BMCs, start Ironic or boot nodes.
+Every selected callback must route through the same bastion source IP/interface.
+Existing preparation directories are refused. Preserve a failed preparation and
+choose a fresh run ID after addressing its failure; existing artifacts are not removed.
+
+### Review and separate physical authorization
+
+Review `plan.yml`, networking, callback routes and pinned provenance before
+authorizing the exact run ID and node list. Default timeouts are manageable 300s,
+inspection 1200s, API fetch 30s and total run 3600s. Review their suitability for
+the selected node count and concurrency before execution.
+
+After fresh operator approval for this exact physical run:
+
+    make inspect-fleet \
+      ARCH=2-8-5-200 \
+      SITE=rhaifn02 \
+      FLEET_RUN_ID="$FLEET_RUN_ID" \
+      FLEET_AUTHORIZE_RUN="$FLEET_RUN_ID" \
+      FLEET_AUTHORIZE_NODES=ipp5-285-rh-k8s-01,ipp5-285-rh-gpu-01
+
+The adapter rejects missing or mismatched run/node authority, changed prepared
+inputs and existing evidence roots before entering the collection lifecycle.
+It reads the collection site's vaulted `secrets.yaml` and maps only the selected
+`bmc_credentials` entries to `fleet_inspection_driver_bmc_credentials` under
+`no_log`. The collection independently validates physical authorization,
+prepared networking and exclusive ownership before shared service startup.
+No node boot retries or expanded selection are implied by an earlier approval.
+
+The resulting evidence root is
+`output/<arch>/<site>/reports/inspection/<run-id>/`. Per-node evidence lives at
+`<node>/inventory.yaml`, raw inventory/port JSON, optional `storage.yaml`, and
+terminal/cleanup evidence. Run-level `index.yaml`, `summary.yaml` and `runtime.yaml`
+record collection, reconciliation and teardown results. A completed lifecycle
+does not imply that reconciliation passed; review these files before proceeding.
+Fresh Wire Map mismatches fail validation while preserving observed evidence and
+terminal cleanup. The adapter retains spreadsheet expectations and never replaces
+them with historical LLDP observations.
+
+Full inventories include GPU rail and OOB observations, but this first adapter
+reconciles only the selected CPU bond attachments. Successful CPU reconciliation
+does not certify GPU rails or OOB cabling. RAID checks run only when a selected
+collection `ocp_nodes` entry contains a separately reviewed `storagePolicy` with
+`controller_id`, `volume_id`, `raid_type` and `member_count`. Never reuse another
+node's controller/volume identifiers. GPU-01 identifiers remain unconfirmed;
+omitting its policy does not establish RAID health. Unknown controller health and
+strong Redfish-to-OS disk correlation remain explicit limitations of the accepted
+best-effort BOSS approach. ABI eligibility remains blocked until later staging integration.
+
+### Expansion to the initial cluster
+
+After reviewing the two-node results, a later separately approved run can use the
+same preparation target with this explicit initial-cluster selection:
+
+FLEET_NODES=ipp5-285-rh-k8s-01,ipp5-285-rh-k8s-02,ipp5-285-rh-k8s-03,ipp5-285-rh-gpu-01,ipp5-285-rh-gpu-02,ipp5-285-rh-gpu-04
+
+Use a fresh run ID, review the new plan and timeouts, then obtain exact run/node
+authority. GPU-03 remains excluded. Selection does not change spreadsheet ABI
+membership. The existing single-node test targets and stable paths remain available.
+
+## Future installation artifact conventions
+
 Complete-cluster installation will use
 `reports/installation/<UTC-run-timestamp>/<node>/` with run-level
 `installation-status.yaml`. The timestamp format is `YYYYMMDDTHHMMSSZ`.
-These are agreed conventions for subsequent orchestration work; this target
-implements only the stable single-node test layout.
+Installation orchestration remains subsequent work.
 
 ## Authorization Boundary
 
