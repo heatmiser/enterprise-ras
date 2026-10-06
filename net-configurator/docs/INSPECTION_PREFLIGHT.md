@@ -57,17 +57,33 @@ the reviewable, non-secret artifact to:
 
 ## Gate-6 Controlled Inspection
 
-After the report artifact and the collection's Gate-4 and Gate-5 checks have
+After the preflight artifact and the collection's Gate-4 and Gate-5 checks have
 been reviewed, the separately authorized physical action is driven from this
 project:
 
     make inspect-controlled-candidate ARCH=<arch> SITE=<site> \
       INSPECTION_CANDIDATE=<candidate> \
-      INSPECTION_AUTHORIZE_PHYSICAL_BOOT=<candidate> \
-      INSPECTION_REPORT_PATH=/absolute/durable/path/<candidate>-inventory.yaml
+      INSPECTION_AUTHORIZE_PHYSICAL_BOOT=<candidate>
 
-The authorization value must exactly equal the selected candidate. The report
-path must be absolute, must not be under `/tmp`, and must not already exist.
+The authorization value must exactly equal the selected candidate. Make derives
+three stable single-node R&D destinations under
+`output/<arch>/<site>/reports/inspection/test/`:
+
+- `<candidate>-inventory.yaml`
+- `<candidate>-failure.yaml`
+- `<candidate>-cleanup.yaml`
+
+Any existing destination blocks execution before the physical lifecycle starts,
+including a prior failure or cleanup artifact without an inventory report.
+Preserve prior evidence explicitly before reusing these test names; the target
+does not rename, archive, or delete historical reports.
+
+Optional `INSPECTION_REPORT_PATH`, `INSPECTION_FAILURE_REPORT_PATH`, and
+`INSPECTION_CLEANUP_REPORT_PATH` overrides must be distinct absolute `.yaml`
+paths outside `/tmp`, without parentheses. If only the inventory path is
+supplied, sibling names replace its trailing `-inventory.yaml` with
+`-failure.yaml` and `-cleanup.yaml`; a different stem gets these suffixes appended
+after removing its extension. No timestamp shell expression is needed.
 The wrapper consumes the prepared `preflight-vars.yaml`, collection
 `secrets.yaml`, and collection bootstrap inventory at runtime. It maps the
 prepared one-node declaration to the collection's `inspect_cluster.yml`; it
@@ -78,6 +94,16 @@ for review before any ABI disk, NIC, or LLDP reconciliation work. The
 collection owns the physical lifecycle and its `always` teardown: report
 persistence, virtual-media detach, BMC postcondition verification, and
 ephemeral Ironic/customizer cleanup.
+
+## Future whole-cluster artifact conventions
+
+Complete-cluster inspection will use
+`reports/inspection/<UTC-run-timestamp>/<node>/{inventory,failure,cleanup}.yaml`.
+Complete-cluster installation will use
+`reports/installation/<UTC-run-timestamp>/<node>/` with run-level
+`installation-status.yaml`. The timestamp format is `YYYYMMDDTHHMMSSZ`.
+These are agreed conventions for subsequent orchestration work; this target
+implements only the stable single-node test layout.
 
 ## Authorization Boundary
 

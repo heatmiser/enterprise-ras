@@ -1,10 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Static contract tests for the controlled inspection-preflight driver."""
+"""Contract and local execution tests for the controlled inspection driver."""
 
 import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import tempfile
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -120,7 +126,7 @@ def test_gate6_driver_requires_matching_authorization_and_new_durable_report():
     assert "controlled_inspection_report_path is match('^/')" in rendered
     assert "controlled_inspection_report_path is match('^/tmp(?:/|$)')" in rendered
     assert "preflight_inspection_nodes | default([]) | length == 1" in rendered
-    assert "Refuse to overwrite an existing inspection report" in task_names
+    assert "Refuse to overwrite prior inspection evidence" in task_names
     assert driver[1]["import_playbook"] == "{{ controlled_inspection_collection_playbook }}"
     assert driver[1]["vars"]["inspect_cluster_nodes"] == "{{ preflight_inspection_nodes }}"
 
@@ -134,3 +140,140 @@ def test_make_target_wires_gate6_driver_and_explicit_operator_contract():
     assert "INSPECTION_REPORT_PATH must be absolute" in makefile
     assert "INSPECTION_REPORT_PATH must not be under /tmp" in makefile
     assert "--ask-vault-pass" in makefile
+
+
+@pytest.fixture
+def durable_workspace():
+    with tempfile.TemporaryDirectory(prefix="inspection-make-", dir="/var/tmp") as directory:
+        yield Path(directory)
+
+
+@pytest.mark.parametrize("mode", ["default", "inventory_only", "explicit"])
+def test_make_resolves_all_artifact_paths_without_running_ansible(durable_workspace, mode):
+    """Execute the real recipe with a capture executable, never a physical play."""
+    tmp_path = durable_workspace
+    shutil.copyfile(NET_CONFIGURATOR / "Makefile", tmp_path / "Makefile")
+    (tmp_path / "input" / "2-8-5-200").mkdir(parents=True)
+    collection = tmp_path / "collection"
+    inventory = collection / "inventories" / "test-site"
+    inventory.mkdir(parents=True)
+    for name in ("hosts.yml", "secrets.yaml", "preflight-vars.yaml"):
+        (inventory / name).touch()
+    (collection / "playbooks").mkdir()
+    (collection / "playbooks" / "inspect_cluster.yml").touch()
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    capture = tmp_path / "arguments.json"
+    executable = bin_dir / "ansible-playbook"
+    executable.write_text(
+        "#!/usr/bin/env python3\nimport json, os, sys\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['INSPECTION_TEST_CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n"
+    )
+    executable.chmod(0o700)
+    command = [
+        "make", "inspect-controlled-candidate", "ARCH=2-8-5-200", "SITE=test-site",
+        "INSPECTION_CANDIDATE=node-01", "INSPECTION_AUTHORIZE_PHYSICAL_BOOT=node-01",
+        f"RHV_BAREMETAL_OCP_ROOT={collection}",
+    ]
+    report = tmp_path / "output/2-8-5-200/test-site/reports/inspection/test/node-01-inventory.yaml"
+    failure = report.with_name("node-01-failure.yaml")
+    cleanup = report.with_name("node-01-cleanup.yaml")
+    if mode != "default":
+        report = tmp_path / "custom/node-01-inventory.yaml"
+        failure = report.with_name("node-01-failure.yaml")
+        cleanup = report.with_name("node-01-cleanup.yaml")
+        command.append(f"INSPECTION_REPORT_PATH={report}")
+    if mode == "explicit":
+        failure = tmp_path / "other/failure.yaml"
+        cleanup = tmp_path / "other/cleanup.yaml"
+        command += [f"INSPECTION_FAILURE_REPORT_PATH={failure}",
+                    f"INSPECTION_CLEANUP_REPORT_PATH={cleanup}"]
+    result = subprocess.run(command, cwd=tmp_path, text=True, capture_output=True,
+                            env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                                 "INSPECTION_TEST_CAPTURE": str(capture)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    arguments = json.loads(capture.read_text())
+    assert f"controlled_inspection_report_path={report}" in arguments
+    assert f"controlled_inspection_failure_report_path={failure}" in arguments
+    assert f"controlled_inspection_cleanup_report_path={cleanup}" in arguments
+
+
+@pytest.mark.parametrize("case", [
+    "default", "generic_stem", "explicit", "inventory_exists", "failure_exists", "cleanup_exists",
+    "same_path", "parentheses", "wrong_extension", "temporary_path",
+])
+def test_adapter_artifact_guard_before_collection_entry(case):
+    """Run the actual adapter against a harmless imported collection fixture."""
+    with tempfile.TemporaryDirectory(prefix="inspection-adapter-", dir="/var/tmp") as directory:
+        workspace = Path(directory)
+        marker = workspace / "collection-entered.json"
+        collection = workspace / "inspect_cluster.yml"
+        collection.write_text(yaml.safe_dump([{
+            "name": "Capture adapter handoff without hardware",
+            "hosts": "bootstrap", "gather_facts": False,
+            "tasks": [{"name": "Record collection entry and resolved paths",
+                       "ansible.builtin.copy": {
+                           "dest": str(marker), "mode": "0600",
+                           "content": "{{ [inspect_cluster_report_path, "
+                                      "inspect_cluster_failure_report_path, "
+                                      "inspect_cluster_cleanup_report_path] | to_json }}"}}],
+        }], sort_keys=False))
+        report = workspace / "node-01-inventory.yaml"
+        failure = workspace / "node-01-failure.yaml"
+        cleanup = workspace / "node-01-cleanup.yaml"
+        inputs = {
+            "controlled_inspection_candidate": "node-01",
+            "controlled_inspection_authorize_physical_boot": "node-01",
+            "controlled_inspection_collection_playbook": str(collection),
+            "preflight_inspection_nodes": [{"name": "node-01"}],
+            "ironic_image_resolve_ocp_release_image": "fixture-release",
+            "ironic_image_resolve_pull_secret_path": "fixture-auth-path",
+            "ironic_preprovisioning_media_nmstate_dir": "fixture-nmstate",
+            "ironic_deploy_provisioning_ip": "192.0.2.1",
+            "ironic_deploy_provisioning_interface": "fixture-interface",
+        }
+        if case == "generic_stem":
+            report = workspace / "custom-report.yaml"
+            failure = workspace / "custom-report-failure.yaml"
+            cleanup = workspace / "custom-report-cleanup.yaml"
+        elif case == "explicit":
+            report = workspace / "custom-inventory.yaml"
+            failure = workspace / "explicit-failure.yaml"
+            cleanup = workspace / "explicit-cleanup.yaml"
+            inputs.update(controlled_inspection_failure_report_path=str(failure),
+                          controlled_inspection_cleanup_report_path=str(cleanup))
+        elif case.endswith("_exists"):
+            {"inventory_exists": report, "failure_exists": failure,
+             "cleanup_exists": cleanup}[case].write_text("retained evidence")
+        elif case == "same_path":
+            inputs["controlled_inspection_cleanup_report_path"] = str(report)
+        elif case == "parentheses":
+            report = workspace / "node-(date-inventory.yaml"
+        elif case == "wrong_extension":
+            report = workspace / "node-inventory.yml"
+        elif case == "temporary_path":
+            report = Path("/tmp/node-01-inventory.yaml")
+        inputs["controlled_inspection_report_path"] = str(report)
+        extra_vars = workspace / "inputs.json"
+        extra_vars.write_text(json.dumps(inputs))
+        inventory = workspace / "hosts.yaml"
+        inventory.write_text(yaml.safe_dump({"all": {"children": {"bootstrap": {
+            "hosts": {"fixture-bootstrap": {"ansible_connection": "local"}},
+        }}}}))
+        result = subprocess.run([
+            "ansible-playbook", "-i", str(inventory), "-c", "local",
+            str(NET_CONFIGURATOR / "playbooks/inspect-controlled-candidate.yml"),
+            "-e", f"@{extra_vars}",
+        ], text=True, capture_output=True, timeout=60)
+        if case in ("default", "generic_stem", "explicit"):
+            assert result.returncode == 0, result.stdout + result.stderr
+            assert json.loads(marker.read_text()) == [str(report), str(failure), str(cleanup)]
+        else:
+            assert result.returncode != 0
+            assert not marker.exists(), "collection entered despite invalid/existing artifacts"
+            if case.endswith("_exists"):
+                existing = {"inventory_exists": report, "failure_exists": failure,
+                            "cleanup_exists": cleanup}[case]
+                assert existing.read_text() == "retained evidence"
+                assert "Inspection destination already exists" in result.stdout

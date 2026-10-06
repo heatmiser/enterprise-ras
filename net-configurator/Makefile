@@ -107,6 +107,10 @@ INVENTORY_DIR     = output/$(ARCH)/$(SITE)/inventory
 # versioned; this standard installed location is overridable for development.
 RHV_BAREMETAL_OCP_COLLECTIONS_PATH ?= $(HOME)/.ansible/collections
 RHV_BAREMETAL_OCP_ROOT ?= $(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)/ansible_collections/rhvp/baremetal_ocp
+# Stable single-node R&D evidence; explicit absolute .yaml paths may override.
+INSPECTION_REPORT_PATH ?= $(CURDIR)/output/$(ARCH)/$(SITE)/reports/inspection/test/$(INSPECTION_CANDIDATE)-inventory.yaml
+INSPECTION_FAILURE_REPORT_PATH ?= $(patsubst %-inventory,%,$(basename $(INSPECTION_REPORT_PATH)))-failure.yaml
+INSPECTION_CLEANUP_REPORT_PATH ?= $(patsubst %-inventory,%,$(basename $(INSPECTION_REPORT_PATH)))-cleanup.yaml
 
 # Auto-detect LDAP: explicit LDAP=1 on command line takes priority,
 # otherwise detected at runtime inside targets (not at Makefile parse time).
@@ -287,7 +291,7 @@ help:  ## Show this help message
 	@echo "  make generate-ocp ARCH=2-8-5-200  # Generate OCP ABI manifests + NMState"
 	@echo "  make generate-inspection-nmstate ARCH=2-8-5-200 SITE=<site> INSPECTION_CANDIDATE=<node>"
 	@echo "  make prepare-inspection-preflight ARCH=2-8-5-200 SITE=<site> INSPECTION_CANDIDATE=<node>"
-	@echo "  make inspect-controlled-candidate INSPECTION_CANDIDATE=<node> INSPECTION_REPORT_PATH=/absolute/path INSPECTION_AUTHORIZE_PHYSICAL_BOOT=<node>"
+	@echo "  make inspect-controlled-candidate INSPECTION_CANDIDATE=<node> INSPECTION_AUTHORIZE_PHYSICAL_BOOT=<node>"
 	@echo "  make init-ocp-settings ARCH=2-8-5-200 SITE=...  # Bootstrap ocp-settings.yml from inventory"
 	@echo "  make deploy-kvm ARCH=2-8-5-200 KVM_BASE_IMAGE=/path/to/rhel9.qcow2"
 	@echo ""
@@ -693,10 +697,10 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		-e "inspection_preflight_output_path=$$OUTPUT" \
 		"$${VAULT_ARGS[@]}"
 
-inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical inspection - requires candidate, report path, and matching authorization
+inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical inspection - requires candidate and matching authorization
 	$(call check_arch,$@)
-	@if [ -z "$(INSPECTION_CANDIDATE)" ] || [ -z "$(INSPECTION_REPORT_PATH)" ] || [ -z "$(INSPECTION_AUTHORIZE_PHYSICAL_BOOT)" ]; then \
-		echo "ERROR: INSPECTION_CANDIDATE, INSPECTION_REPORT_PATH, and INSPECTION_AUTHORIZE_PHYSICAL_BOOT are required"; \
+	@if [ -z "$(INSPECTION_CANDIDATE)" ] || [ -z "$(INSPECTION_AUTHORIZE_PHYSICAL_BOOT)" ]; then \
+		echo "ERROR: INSPECTION_CANDIDATE and INSPECTION_AUTHORIZE_PHYSICAL_BOOT are required"; \
 		exit 1; \
 	fi
 	@PREFLIGHT="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/preflight-vars.yaml"; \
@@ -704,6 +708,8 @@ inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical 
 	HOSTS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/hosts.yml"; \
 	COLLECTION_PLAYBOOK="$(RHV_BAREMETAL_OCP_ROOT)/playbooks/inspect_cluster.yml"; \
 	REPORT="$(INSPECTION_REPORT_PATH)"; \
+	FAILURE_REPORT="$(INSPECTION_FAILURE_REPORT_PATH)"; \
+	CLEANUP_REPORT="$(INSPECTION_CLEANUP_REPORT_PATH)"; \
 	if [ ! -f "$$PREFLIGHT" ]; then \
 		echo "ERROR: prepared inspection inputs not found: $$PREFLIGHT"; \
 		echo "  Run 'make prepare-inspection-preflight ARCH=$(ARCH) SITE=$(SITE) INSPECTION_CANDIDATE=$(INSPECTION_CANDIDATE)' first."; \
@@ -725,6 +731,8 @@ inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical 
 		-e "controlled_inspection_candidate=$(INSPECTION_CANDIDATE)" \
 		-e "controlled_inspection_authorize_physical_boot=$(INSPECTION_AUTHORIZE_PHYSICAL_BOOT)" \
 		-e "controlled_inspection_report_path=$$REPORT" \
+		-e "controlled_inspection_failure_report_path=$$FAILURE_REPORT" \
+		-e "controlled_inspection_cleanup_report_path=$$CLEANUP_REPORT" \
 		-e "controlled_inspection_collection_playbook=$$COLLECTION_PLAYBOOK" \
 		"$${VAULT_ARGS[@]}"
 
