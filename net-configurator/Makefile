@@ -731,7 +731,7 @@ inspect-fleet:  ## Run separately authorized physical fleet inspection; exact ru
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
 		playbooks/inspect-fleet.yml -i "$(FLEET_PREP_DIR)/hosts.yml" \
-		-e "@$(FLEET_PREP_DIR)/plan.yml" -e "@$(FLEET_PREP_DIR)/preflight-vars.yaml" \
+		-e "@$(FLEET_PREP_DIR)/plan.yml" \
 		-e "@$$SECRETS" -e "$$AUTH" "$${VAULT_ARGS[@]}"
 
 inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical inspection - requires candidate and matching authorization

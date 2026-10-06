@@ -52,6 +52,10 @@ def seal(bundle):
         "ironic_image_resolve_oc_container_image": "fixture-ee",
         "ironic_deploy_provisioning_ip": "192.0.2.10",
         "ironic_deploy_provisioning_interface": "fixture0",
+        "ironic_preprovisioning_media_nmstate_dir": str(bundle / "nmstate"),
+        "ironic_preprovisioning_media_probe_node": node["name"],
+        "ironic_preprovisioning_media_early_network_path": str(
+            bundle / "early-network" / f"{node['name']}.yaml"),
         "ironic_preprovisioning_media_artifacts": {"fixture": "no services"}})
     adapter.write_yaml(bundle / "callback-routes.yaml", {"fixture": "No real route queries executed"})
     adapter.seal(bundle)
@@ -150,13 +154,14 @@ def test_make_handoff_and_authorization_guard_without_ansible_services(workspace
     assert "playbooks/inspect-fleet.yml" in arguments
     assert f"@{bundle}/hosts.yml" not in arguments
     assert str(bundle / "hosts.yml") in arguments
+    assert f"@{bundle}/preflight-vars.yaml" not in arguments
     authority = next(json.loads(arg) for arg in arguments if arg.startswith('{"fleet_inspection_driver_physical_authorization"'))
     assert authority["fleet_inspection_driver_physical_authorization"]["node_names"] == NAMES
 
 
 @pytest.mark.parametrize("authorized", [True, False])
 def test_actual_adapter_guard_with_harmless_collection_entry(workspace, authorized):
-    """Execute the adapter tasks; replace only the collection entry with a local marker."""
+    """Run production per-node network preparation; stop before runtime or BMC operations."""
     root, _ = workspace
     bundle = prepare(workspace)
     seal(bundle)
@@ -166,11 +171,16 @@ def test_actual_adapter_guard_with_harmless_collection_entry(workspace, authoriz
     marker = root / "entered.yaml"
     stub = playbooks / "collection-fixture.yml"
     stub.write_text(yaml.safe_dump([{
-        "name": "Capture selected credentials without any service or hardware",
+        "name": "Prepare selected networks without any service or hardware",
         "hosts": "bootstrap", "gather_facts": False,
-        "tasks": [{"name": "Record exact selected handoff", "ansible.builtin.copy": {
+        "tasks": [{"name": "Validate and prepare real per-node collection networking",
+                   "ansible.builtin.include_role": {
+                       "name": "rhvp.baremetal_ocp.fleet_inspection_driver", "tasks_from": "validate_plan"},
+                   "vars": {"fleet_inspection_driver_prepare_network": True}},
+                  {"name": "Record exact selected handoff", "ansible.builtin.copy": {
             "dest": str(marker), "mode": "0600",
             "content": "{{ {'names': fleet_inspection_driver_bmc_credentials.keys() | list, "
+                       "'networks': __fleet_inspection_driver_prepared_nodes, "
                        "'authority': fleet_inspection_driver_physical_authorization} | to_nice_yaml }}"}}]}]))
     play = playbooks / "inspect-fleet.yml"
     play.write_text((ROOT / "playbooks/inspect-fleet.yml").read_text().replace(
@@ -183,13 +193,28 @@ def test_actual_adapter_guard_with_harmless_collection_entry(workspace, authoriz
     inputs_path = root / "inputs.json"
     inputs_path.write_text(json.dumps(inputs))
     result = subprocess.run(["ansible-playbook", "-i", str(bundle / "hosts.yml"), str(play),
-                             "-e", f"@{bundle}/plan.yml", "-e", f"@{bundle}/preflight-vars.yaml",
+                             "-e", f"@{bundle}/plan.yml",
                              "-e", f"@{inputs_path}"], text=True, capture_output=True, timeout=60)
     if authorized:
         assert result.returncode == 0, result.stdout + result.stderr
         handoff = yaml.safe_load(marker.read_text())
         assert handoff["names"] == NAMES
         assert handoff["authority"]["node_names"] == NAMES
+        nodes = adapter.read_yaml(bundle / "plan.yml")["inspect_fleet_plan"]["authorized_nodes"]
+        networks = handoff["networks"]
+        assert set(networks) == set(NAMES)
+        assert [networks[name]["callback_ip"] for name in NAMES] == ["10.78.221.101", "10.78.221.201"]
+        for node in nodes:
+            network = networks[node["name"]]
+            assert network["nmstate_path"] == str(bundle / "nmstate" / f"{node['name']}.yaml")
+            assert network["early_network_path"] == str(bundle / "early-network" / f"{node['name']}.yaml")
+            assert f"ip={node['devices']['bond_ip']}::" in network["kernel_append_params"]
+            for interface in node["interfaces"]:
+                assert f"ifname={interface['name']}:{interface['macAddress']}" in network["kernel_append_params"]
+            other = next(candidate for candidate in nodes if candidate["name"] != node["name"])
+            assert all(interface["macAddress"] not in network["kernel_append_params"]
+                       for interface in other["interfaces"])
+        assert not Path(adapter.read_yaml(bundle / "plan.yml")["inspect_fleet_plan"]["artifact_root"]).exists()
     else:
         assert result.returncode != 0
         assert not marker.exists()
