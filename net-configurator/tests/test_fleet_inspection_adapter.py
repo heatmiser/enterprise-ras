@@ -118,6 +118,7 @@ def test_example_cpu_identities_and_desired_ports_survive_preparation(workspace)
     assert {purpose: sum(link["purpose"] == purpose for link in plan["wiremap"])
             for purpose in ("cpu", "gpu", "host_oob")} == {"cpu": 4, "gpu": 4, "host_oob": 4}
     k8s, gpu = plan["authorized_nodes"]
+    assert [node["devices"]["bmc_ip"] for node in (k8s, gpu)] == ["192.0.2.101", "192.0.2.201"]
     assert k8s["rootDeviceHints"]["deviceName"] == "/dev/disk/by-path/pci-0000:01:00.0-nvme-1"
     assert gpu["rootDeviceHints"]["deviceName"] == "/dev/disk/by-path/pci-0000:81:00.0-nvme-1"
     assert [(link["interface"], link["expected_switch"], link["expected_port"])
@@ -233,11 +234,13 @@ def test_named_bmc_endpoints_keep_physical_authority_and_verify_resolution(works
     plan = adapter.read_yaml(bundle / "plan.yml")["inspect_fleet_plan"]
     assert [node["name"] for node in plan["authorized_nodes"]] == NAMES
     assert [node["bmc"]["host"] for node in plan["authorized_nodes"]] == list(expected)
+    assert [node["devices"]["bmc_ip"] for node in plan["authorized_nodes"]] == list(expected.values())
     assert looked_up == list(expected)
     assert [node["devices"]["bond_ip"] for node in plan["authorized_nodes"]] == ["198.51.100.101", "198.51.100.201"]
 
 
-@pytest.mark.parametrize("case", ["matching", "wrong_run", "wrong_nodes", "changed_network", "existing_evidence"])
+@pytest.mark.parametrize("case", ["matching", "wrong_run", "wrong_nodes", "changed_network", "changed_bmc_ip",
+                                 "existing_evidence"])
 def test_exact_authority_and_sealed_inputs(workspace, case):
     bundle = prepare(workspace)
     seal(bundle)
@@ -248,6 +251,10 @@ def test_exact_authority_and_sealed_inputs(workspace, case):
         names = NAMES[:1]
     elif case == "changed_network":
         (bundle / "nmstate" / f"{NAMES[0]}.yaml").write_text("changed input")
+    elif case == "changed_bmc_ip":
+        document = adapter.read_yaml(bundle / "plan.yml")
+        document["inspect_fleet_plan"]["authorized_nodes"][0]["devices"]["bmc_ip"] = "192.0.2.99"
+        (bundle / "plan.yml").write_text(yaml.safe_dump(document))
     elif case == "existing_evidence":
         Path(adapter.read_yaml(bundle / "plan.yml")["inspect_fleet_plan"]["artifact_root"]).mkdir(parents=True)
     if case == "matching":

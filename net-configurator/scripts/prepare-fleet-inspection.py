@@ -179,7 +179,7 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
         callback = nmstate["interfaces"][0]["ipv4"]["address"][0]["ip"]
         ipaddress.ip_address(callback)
         node = {"name": name, "role": OCP.INSTALLER_ROLE[role], "bmc": effective_bmc,
-                "devices": {"bond_ip": callback},
+                "devices": {"bond_ip": callback, "bmc_ip": expected_bmc_ip},
                 "interfaces": [{"name": item["name"], "macAddress": item["mac"]} for item in early],
                 "rootDeviceHints": {"deviceName": disk}}
         if "storagePolicy" in configured:
