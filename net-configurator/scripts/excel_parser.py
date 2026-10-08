@@ -830,6 +830,8 @@ def build_devices(nodes, vlans, mgmt_subnets, node_oob_mapping=None, wiremap_row
         }
         if 'include_in_initial_abi' in node:
             entry['include_in_initial_abi'] = node['include_in_initial_abi']
+        if node.get('ocp_role'):
+            entry['ocp_role'] = node['ocp_role']
 
         # Build interface mapping from Wire Map (if available)
         iface_map = {}
@@ -2582,6 +2584,7 @@ def parse_nodes(ws):
     ztp_col     = _col('ztp', None)
     enabled_col = _col('enabled', None)
     abi_col = _col('include in initial abi', None)
+    ocp_role_col = _col('role', None)
 
     for row in range(2, ws.max_row + 1):
         role = ws.cell(row=row, column=func_col).value
@@ -2627,6 +2630,8 @@ def parse_nodes(ws):
             node['ztp'] = ws.cell(row=row, column=ztp_col).value or ''
         if abi_col:
             node['include_in_initial_abi'] = ws.cell(row=row, column=abi_col).value
+        if ocp_role_col:
+            node['ocp_role'] = str(ws.cell(row=row, column=ocp_role_col).value or '').strip()
         nodes.append(node)
 
     # Second pass: assign index by order-among-same-category for nodes

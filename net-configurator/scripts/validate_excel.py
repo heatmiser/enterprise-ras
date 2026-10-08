@@ -23,6 +23,7 @@ from pathlib import Path
 
 import openpyxl
 import yaml
+from endpoint_naming import WORKBOOK_ROLE_TO_OCP, build_role_endpoints, dns_name
 
 # Re-use the parser's canonical-role helpers so the validator and parser
 # share one source of truth for category resolution.
@@ -135,6 +136,9 @@ OPTIONAL_SETTINGS_KEYS = [
     "ocp_api_vip",
     "ocp_ingress_vip",
     "ocp_cluster_domain",
+    "ocp_cluster_name",
+    "dns_servers",
+    "bmc_dns_subdomain",
     "ocp_version",
     "ocp_oem",
 ]
@@ -597,6 +601,13 @@ def validate_settings(ws, result):
         seen_keys[key_lower] = row
         settings[key_lower] = val
 
+    bmc_subdomain = settings.get('bmc_dns_subdomain')
+    if bmc_subdomain is not None and str(bmc_subdomain).strip():
+        try:
+            dns_name(str(bmc_subdomain).strip() + '.example.com')
+        except ValueError as exc:
+            result.error('Settings', f'Invalid bmc_dns_subdomain: {exc}')
+
     # Required keys
     for k in REQUIRED_SETTINGS_KEYS:
         if k not in settings or settings[k] is None or str(settings[k]).strip() == '':
@@ -1000,6 +1011,9 @@ def validate_nodes(ws, result, settings=None, ocp_hostnames=None):
     enabled_col = col_map.get('Enabled')  # optional, not all sheets have it
     type_col = col_map.get('Type')        # optional, new in 2026-05-28
     abi_col = col_map.get('Include in Initial ABI')
+    role_col = col_map.get('Role')
+    explicit_roles = {}
+    eligible_roles = set()
     ocp_hostnames = ocp_hostnames or {}
     if ocp_hostnames and abi_col is None:
         result.error("Nodes", "Missing required column header: 'Include in Initial ABI'")
@@ -1146,6 +1160,15 @@ def validate_nodes(ws, result, settings=None, ocp_hostnames=None):
         enabled_str = str(enabled_val or 'Yes').strip().lower()
         is_air_documentary = (enabled_str == 'air')
         is_enabled = enabled_str in ('yes', 'true', '1', '')
+
+        if is_enabled and category in ('gpu', 'support', 'storage', 'k8s'):
+            eligible_roles.add(name_str)
+        workbook_role = str(_cell(ws, row, role_col) or '').strip() if role_col else ''
+        if workbook_role:
+            if workbook_role not in WORKBOOK_ROLE_TO_OCP:
+                result.error('Nodes', f'Row {row}: invalid Role {workbook_role!r}')
+            if is_enabled:
+                explicit_roles[name_str] = workbook_role
 
         if name_str in ocp_hostnames and abi_col is not None:
             abi_value = ws.cell(row=row, column=abi_col).value
@@ -1376,6 +1399,18 @@ def validate_nodes(ws, result, settings=None, ocp_hostnames=None):
         if count > 1:
             entries = [(r, f) for ip, r, f in ips_seen if ip == ip_addr]
             result.error("Nodes", f"Duplicate management IP '{ip_addr}' used by: {entries}")
+
+    if explicit_roles:
+        if set(explicit_roles) != eligible_roles:
+            result.error('Nodes', 'Explicit Role must cover exactly every enabled OCP server')
+        try:
+            build_role_endpoints(
+                explicit_roles, (settings or {}).get('ocp_cluster_name'),
+                (settings or {}).get('ocp_cluster_domain'),
+                str((settings or {}).get('bmc_dns_subdomain') or '').strip() or None,
+            )
+        except (ValueError, TypeError) as exc:
+            result.error('Nodes', f'Role-based endpoint naming: {exc}')
 
     return parsed_nodes
 

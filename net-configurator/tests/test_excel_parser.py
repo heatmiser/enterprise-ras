@@ -1325,3 +1325,19 @@ def test_split_roles_bucket_into_new_groups():
     assert any(n["name"] == "cs-01" for n in c["cs"])
     assert any(n["name"] == "gl-plane1-01" for n in c["gl_plane1"])
     assert any(n["name"] == "gs-plane1-01" for n in c["gs_plane1"])
+
+
+def test_ocp_role_survives_parser_and_devices_without_changing_function():
+    wb = openpyxl.Workbook()
+    ws = _make_nodes_sheet(wb, headers=['Function', 'Name', 'Mgmt IP Address',
+                                     'Enabled', 'Include in Initial ABI', 'Role'],
+                           rows=[['gpu', 'server-01', '192.0.2.11', 'Yes', 'No', 'worker'],
+                                 ['support', 'server-02', '192.0.2.12', 'No', 'No', 'control']])
+    nodes = parse_nodes(ws)
+    assert nodes[0]['role'] == 'gpu' and nodes[0]['category'] == 'gpu'
+    assert nodes[0]['ocp_role'] == 'worker'
+    devices = build_devices(nodes, {}, [])
+    assert devices['server-01']['ocp_role'] == 'worker'
+    assert devices['server-01']['include_in_initial_abi'] == 'No'
+    assert 'server-02' not in devices
+    wb.close()
