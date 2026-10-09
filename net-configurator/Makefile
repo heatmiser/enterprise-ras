@@ -773,34 +773,29 @@ inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical 
 		-e "controlled_inspection_collection_playbook=$$COLLECTION_PLAYBOOK" \
 		"$${VAULT_ARGS[@]}"
 
-generate-ocp-iso:  ## Generate ABI ISO via openshift-install agent create image - requires ARCH, optional SITE OCP_EE_IMAGE= or OPENSHIFT_INSTALL=
+generate-ocp-iso:  ## Generate ABI ISO from an eligible physical inspection - requires ARCH, SITE, FLEET_RUN_ID
 	$(call check_arch,$@)
-	@OCP_DIR="output/$(ARCH)/$(SITE)/ocp"; \
-	if [ ! -f "$$OCP_DIR/agent-config.yaml" ] || [ ! -f "$$OCP_DIR/install-config.yaml" ]; then \
-		echo "❌ ERROR: ABI manifests not found for arch=$(ARCH) site=$(SITE)"; \
-		echo "   Both agent-config.yaml and install-config.yaml are required."; \
-		echo "   Run 'make generate-ocp ARCH=$(ARCH) SITE=$(SITE)' first."; \
-		echo "   Note: ocp-settings.yml must exist in input/$(ARCH)/$(SITE)/ to generate ABI manifests."; \
+	@if [ -z "$(FLEET_RUN_ID)" ]; then \
+		echo "ERROR: FLEET_RUN_ID of a successful eligible physical inspection is required"; \
 		exit 1; \
 	fi; \
-	ISO_STAGE="output/$(ARCH)/$(SITE)/ocp-iso"; \
-	mkdir -p "$$ISO_STAGE"; \
-	cp "$$OCP_DIR/agent-config.yaml" "$$ISO_STAGE/"; \
-	cp "$$OCP_DIR/install-config.yaml" "$$ISO_STAGE/"; \
-	ABS_STAGE="$$(realpath $$ISO_STAGE)"; \
-	if [ -n "$(OCP_EE_IMAGE)" ]; then \
+	ABS_STAGE="$(CURDIR)/output/$(ARCH)/$(SITE)/ocp-iso/$(FLEET_RUN_ID)"; \
+	EE_IMAGE="$$(python3 scripts/validate-abi-handoff.py \
+		--arch "$(ARCH)" --site "$(SITE)" --run-id "$(FLEET_RUN_ID)" \
+		--stage-dir "$$ABS_STAGE" --ee-image "$(OCP_EE_IMAGE)" --installer "$(OPENSHIFT_INSTALL)")" || exit 1; \
+	if [ -z "$(OPENSHIFT_INSTALL)" ]; then \
 		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 		echo "  Generating OCP ABI ISO  arch=$(ARCH)  site=$(SITE)"; \
 		echo "  Staging dir: $$ABS_STAGE"; \
-		echo "  openshift-install: $(OCP_EE_IMAGE) (container)"; \
+		echo "  openshift-install: $$EE_IMAGE (prepared immutable container)"; \
 		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
 		podman run --rm \
 			--userns=keep-id \
 			-v "$$ABS_STAGE:$$ABS_STAGE:Z" \
-			"$(OCP_EE_IMAGE)" \
+			"$$EE_IMAGE" \
 			openshift-install --dir "$$ABS_STAGE" agent create image || exit 1; \
 	else \
-		OCP_BIN="$(or $(OPENSHIFT_INSTALL),openshift-install)"; \
+		OCP_BIN="$(OPENSHIFT_INSTALL)"; \
 		if ! command -v "$$OCP_BIN" >/dev/null 2>&1; then \
 			echo "❌ ERROR: openshift-install not found. Provide one of:"; \
 			echo "   make generate-ocp-iso ARCH=$(ARCH) SITE=$(SITE) OCP_EE_IMAGE=quay.io/s4v0/dcm-ocp-ee-4.22"; \

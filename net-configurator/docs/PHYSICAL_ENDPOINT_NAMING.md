@@ -202,3 +202,54 @@ staging/report and disk-policy lookups must consume the physical/FQDN mapping
 before these outputs are used for the physical install workflow. Generation
 does not establish inspection eligibility, boot nodes, or build an ISO.
 DSX Air DNS functionality and deployment validation are deferred.
+
+## Physical inspection to ABI ISO eligibility handoff
+
+Generate the reviewed real-hardware OCP inventory and both candidate manifests
+before preparing the next fleet inspection. Preparation checks agent hostnames,
+roles, MACs, network configuration and root-device hints against the workbook and
+settings, and checks install-config cluster identity, replica counts, VIPs and
+machine network. It seals the candidate file hashes and endpoint map with the
+source inputs. Pull secrets stay in the private candidate file; only its hash is
+included in the non-secret handoff.
+
+Inspection-only preparation without candidate manifests remains supported.
+Such a run cannot grant ISO eligibility. A subset inspection likewise cannot
+grant eligibility for a larger initial-install host list.
+
+After every selected physical node validates and terminal/shared-runtime cleanup
+succeeds, the collection finalizes `summary.yaml` and writes `eligibility.yaml`.
+Eligibility requires exact initial-install membership and candidate binding.
+The receipt binds the candidate hashes to the durable aggregate and node evidence.
+Synthetic evidence never grants physical eligibility. No RAID verification is
+added unless the reviewed plan explicitly requests a storage policy.
+
+`make generate-ocp-iso ARCH=<architecture> SITE=<site> FLEET_RUN_ID=<reviewed-run>`
+requires this receipt. It verifies the sealed inputs, evidence hashes, physical
+validation, exact node membership, disk identities and cleanup before staging any
+installer inputs. Changed workbook, settings, candidates or evidence require a
+new preparation and physical inspection. Archived evidence whose files have been
+sanitized cannot be used as an executable handoff.
+
+The default installer is the immutable EE image resolved during inspection
+preflight. An explicit `OCP_EE_IMAGE` must match that digest or the sealed site's
+configured image; the build still uses the prepared digest. An explicitly selected
+`OPENSHIFT_INSTALL` must report the same version and release image as preflight.
+The target does not implicitly select a local installer from PATH.
+
+Validated candidate bytes are copied into a new private directory:
+`output/<architecture>/<site>/ocp-iso/<run-id>/`. Existing installer directories
+are not reused. The resulting ISO is `agent.x86_64.iso` in that directory.
+ISO generation does not authorize installation boot or change BMC power state.
+
+The direct Make handoff uses the current fleet evidence layout. Integrating the
+collection's separate `stage_fleet_abi.yml` role with that layout remains a follow-up.
+
+### To-Do / WIP: end-to-end orchestration
+
+A future single Make target will coordinate DSX Air deployment, complete fabric
+verification, physical inspection, eligibility, ABI ISO build, installation boot,
+installation monitoring and final cluster verification. This orchestration is not
+implemented by the eligibility handoff. Full four-rail logical fabric validation,
+stage-specific physical authorization and installation verification remain required
+implementation work.

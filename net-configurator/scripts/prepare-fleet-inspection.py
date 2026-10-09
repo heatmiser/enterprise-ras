@@ -106,6 +106,38 @@ def auxiliary_links(name, wires, device):
     return links
 
 
+def candidate_binding(base, settings, roles, site_vars, arch, endpoints, disks):
+    """Bind generated initial-install candidates when present; inspection alone stays usable."""
+    paths = [base / "ocp" / filename for filename in ("agent-config.yaml", "install-config.yaml")]
+    if not any(path.exists() for path in paths):
+        return {}, []
+    initial, _ = OCP.split_abi_membership(roles, site_vars["devices"])
+    agent = read_yaml(paths[0])
+    expected = OCP.build_agent_config(settings, initial, {}, site_vars, arch,
+                                      nic_mode="real-hw", disk_defaults=disks)
+    require(agent == expected, "ABI agent candidate differs from reviewed workbook/settings; regenerate OCP inventory")
+    install = read_yaml(paths[1])
+    cluster = settings["cluster"]
+    require(install.get("metadata", {}).get("name") == cluster["name"]
+            and install.get("baseDomain") == cluster["domain"], "ABI cluster identity mismatch")
+    require(install.get("controlPlane", {}).get("replicas") == sum(r == "control_plane" for r in initial.values())
+            and install.get("compute", [{}])[0].get("replicas") == sum(r != "control_plane" for r in initial.values()),
+            "ABI replica counts differ from initial membership")
+    require(install.get("platform", {}).get("baremetal", {}).get("apiVIPs") == [cluster["api_vip"]]
+            and install.get("platform", {}).get("baremetal", {}).get("ingressVIPs") == [cluster["ingress_vip"]]
+            and install.get("networking", {}).get("machineNetwork") == [{"cidr": site_vars["common"]["cpu_network"]}],
+            "ABI VIPs or machine network differ from reviewed settings")
+    mapping = {endpoints[name]["rhcos"]["hostname"] if endpoints else name: name for name in initial}
+    if endpoints:
+        path = base / "ocp/endpoint-map.yaml"
+        require(read_yaml(path) == build_endpoint_manifest(settings, site_vars["devices"], roles),
+                "Endpoint map differs from reviewed settings")
+        paths.append(path)
+    return {"schema_version": 1, "initial_node_names": sorted(initial),
+            "hostname_to_physical": mapping,
+            "manifest_sha256": {path.name: fingerprint(path) for path in paths}}, paths
+
+
 def prepare(root, arch, site, names, run_id, collection_root, concurrency):
     """Validate every selected node before creating a new run-specific preparation directory."""
     validate_run(run_id)
@@ -205,6 +237,8 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
     require(len({(link["expected_switch"], link["expected_port"]) for link in links}) == len(links),
             "Duplicate desired host NIC switch attachment")
     base = root / "output" / arch / site
+    abi_handoff, candidate_paths = candidate_binding(base, settings, roles, site_vars, arch, endpoints, disks)
+    source_files.extend(candidate_paths)
     evidence = base / "reports/inspection" / run_id
     require(not evidence.exists() and not evidence.is_symlink(), "Evidence run already exists")
     bundle = base / "ocp/inspection/fleet" / run_id
@@ -221,6 +255,8 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
             "expected_node_count": len(nodes), "concurrency_limit": concurrency,
             "timeouts": {"manageable": 300, "inspection": 1200, "api_fetch": 30, "total_run": 3600},
             "wiremap": links, "switch_aliases": cluster.get("fleet_inspection_switch_aliases", {})}
+    if abi_handoff:
+        plan["abi_handoff"] = abi_handoff
     write_yaml(bundle / "plan.yml", {"inspect_fleet_plan": plan,
                "fleet_adapter_bundle": str(bundle), "fleet_adapter_expected_version": version,
                "fleet_adapter_collection_vars": str(cluster_path),
