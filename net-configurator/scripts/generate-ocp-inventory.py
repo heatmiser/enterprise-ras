@@ -62,6 +62,7 @@ import sys
 from pathlib import Path
 
 import yaml
+from endpoint_naming import build_endpoint_manifest, endpoint_names, render_dnsmasq_records
 
 try:
     from airlib.env import _load_shared_air_vault
@@ -75,7 +76,7 @@ DISK_DEFAULTS_PATH = Path(__file__).resolve().parent.parent / "vars" / "arch-oem
 # Routing table IDs assigned per GPU rail for PBR (matches VLAN IDs 901-904).
 GPU_RAIL_TABLE_BASE = 900
 
-OCP_ROLES = ("control_plane", "infra", "worker_gpu", "worker_storage")
+OCP_ROLES = ("control_plane", "infra", "worker", "worker_gpu", "worker_storage")
 
 _KVM_PROFILE_ORDER = ("oob", "cpu", "gpu", "support", "storage")
 
@@ -93,6 +94,7 @@ def _kvm_offset_for_profile(nic_alias_map, profile_key):
 INSTALLER_ROLE = {
     "control_plane": "master",
     "infra":         "worker",
+    "worker":        "worker",
     "worker_gpu":    "worker",
     "worker_storage": "worker",
 }
@@ -264,7 +266,7 @@ def build_nmstate_network_config(device_data, site_vars, ocp_role, nic_mode="rea
                 "next-hop-interface": bond_name,
             })
 
-    if ocp_role in ("control_plane", "infra"):
+    if ocp_role in ("control_plane", "infra", "worker"):
         profile_key = "cpu" if _bond_members("cpu")[0] else "support"
         cidr = device_data.get("bond_ip") or device_data.get("bond_ip1")
         gw = common.get("cpu_gateway") or common.get("support_gateway")
@@ -492,7 +494,7 @@ def _build_gpu_rail_desiredstate(device_data, site_vars, nic_mode="real-hw"):
     return state or None
 
 
-def build_gpu_nncp(hostname, device_data, site_vars, nic_mode="real-hw"):
+def build_gpu_nncp(hostname, device_data, site_vars, nic_mode="real-hw", node_hostname=None):
     """Return a NodeNetworkConfigurationPolicy CR dict for GPU rail interfaces.
 
     Returns None when the node has no GPU rail data (not a GPU node or data absent).
@@ -505,7 +507,7 @@ def build_gpu_nncp(hostname, device_data, site_vars, nic_mode="real-hw"):
         "kind":       "NodeNetworkConfigurationPolicy",
         "metadata":   {"name": f"{hostname}-gpu-rails"},
         "spec": {
-            "nodeSelector": {"kubernetes.io/hostname": hostname},
+            "nodeSelector": {"kubernetes.io/hostname": node_hostname or hostname},
             "desiredState": desired_state,
         },
     }
@@ -569,7 +571,7 @@ def split_abi_membership(role_map, devices):
     return initial, day2
 
 
-def build_hosts_yaml(role_map, era_host_vars):
+def build_hosts_yaml(role_map, era_host_vars, endpoints=None):
     """Build OCP-grouped YAML inventory dict with ansible_host per node."""
     groups = {role: {} for role in OCP_ROLES}
     for hostname, ocp_role in sorted(role_map.items()):
@@ -577,6 +579,8 @@ def build_hosts_yaml(role_map, era_host_vars):
             continue
         ansible_host = era_host_vars.get(hostname, {}).get("ansible_host", "")
         groups[ocp_role][hostname] = {"ansible_host": ansible_host} if ansible_host else {}
+        if endpoints:
+            groups[ocp_role][hostname].update(endpoint_host_vars(hostname, endpoints[hostname]))
 
     return {
         "all": {
@@ -589,7 +593,19 @@ def build_hosts_yaml(role_map, era_host_vars):
     }
 
 
-def build_ocp_group_vars(ocp_settings, site_vars, ocp_out_dir, vault=None):
+def endpoint_host_vars(physical_name, endpoint):
+    """Connection metadata for OS automation; inventory keys remain physical."""
+    return {
+        "physical_server_name": physical_name,
+        "ansible_host": endpoint["rhcos"]["hostname"],
+        "rhcos_hostname": endpoint["rhcos"]["hostname"],
+        "rhcos_ip": endpoint["rhcos"]["ip"],
+        "bmc_host": endpoint["bmc"]["hostname"],
+        "bmc_ip": endpoint["bmc"]["ip"],
+    }
+
+
+def build_ocp_group_vars(ocp_settings, site_vars, ocp_out_dir, vault=None, endpoints=None):
     """Build group_vars/all/ocp.yml content dict."""
     common = site_vars.get("common", {})
     vault = vault or {}
@@ -610,7 +626,8 @@ def build_ocp_group_vars(ocp_settings, site_vars, ocp_out_dir, vault=None):
             "ocp_machine_network":    common.get("cpu_network", ""),
             "ocp_pull_secret_path":   ocp_settings.get("pull_secret_path", "~/.era-secrets/pull-secret.json"),
             "ocp_ssh_key_path":       ocp_settings.get("ssh_key_path", vault_ssh_key_pub),
-            "ocp_node_hostnames":     all_nodes,
+            "ocp_node_hostnames":     [endpoints[node]["rhcos"]["hostname"] for node in all_nodes]
+                                      if endpoints else all_nodes,
             "ocp_install_output_dir": str(ocp_out_dir),
         }
 
@@ -690,8 +707,9 @@ def build_agent_config(ocp_settings, role_map, era_host_vars, site_vars, arch,
         else:
             hw_interfaces = [{"name": "eth0", "macAddress": mac}] if mac else []
 
+        names = endpoint_names(ocp_settings, hostname) if nic_mode == "real-hw" else None
         agent_hosts.append({
-            "hostname":        hostname,
+            "hostname":        names["rhcos_fqdn"] if names else hostname,
             "role":            INSTALLER_ROLE[ocp_role],
             "rootDeviceHints": {"deviceName": disk},
             "interfaces":      hw_interfaces,
@@ -904,6 +922,15 @@ def main():
         except ValueError as exc:
             sys.exit(f"ERROR: {exc}")
 
+    try:
+        endpoint_manifest = (
+            build_endpoint_manifest(ocp_settings, devices, role_map)
+            if args.nic_mode == "real-hw" else None
+        )
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
+    endpoints = endpoint_manifest["nodes"] if endpoint_manifest else None
+
     # Summarize role assignment
     for role in OCP_ROLES:
         nodes = [h for h, r in sorted(role_map.items()) if r == role]
@@ -911,7 +938,7 @@ def main():
             print(f"  {role:16s}: {', '.join(nodes)}")
 
     # ── OCP Ansible inventory ─────────────────────────────────────────────
-    hosts_yaml = build_hosts_yaml(role_map, era_host_vars)
+    hosts_yaml = build_hosts_yaml(role_map, era_host_vars, endpoints=endpoints)
     hosts_path = ocp_dir / "inventory" / "hosts.yml"
     write_yaml(hosts_path, hosts_yaml,
                header="---\n# Generated by net-configurator generate-ocp-inventory.py — do not edit manually.")
@@ -946,6 +973,8 @@ def main():
             "install_disk": disk,
             "networkConfig": network_config,
         }
+        if endpoints:
+            hv_content.update(endpoint_host_vars(hostname, endpoints[hostname]))
         hv_path = ocp_dir / "inventory" / "host_vars" / f"{hostname}.yml"
         write_yaml(hv_path, hv_content,
                    header=f"---\n# Generated by net-configurator — {hostname} OCP node vars")
@@ -960,11 +989,20 @@ def main():
         )
 
     # ── group_vars ────────────────────────────────────────────────────────
-    gv_content = build_ocp_group_vars(ocp_settings, site_vars, str(ocp_dir), vault=vault)
+    gv_content = build_ocp_group_vars(ocp_settings, site_vars, str(ocp_dir), vault=vault, endpoints=endpoints)
     gv_path = ocp_dir / "inventory" / "group_vars" / "all" / "ocp.yml"
     write_yaml(gv_path, gv_content,
                header="---\n# Generated by net-configurator generate-ocp-inventory.py — do not edit manually.")
     print(f"  ✓ {gv_path}")
+
+    if endpoint_manifest:
+        endpoint_path = ocp_dir / "endpoint-map.yaml"
+        write_yaml(endpoint_path, endpoint_manifest)
+        records_path = ocp_dir / "dns" / "dnsmasq-records.conf"
+        records_path.parent.mkdir(parents=True, exist_ok=True)
+        records_path.write_text(render_dnsmasq_records(endpoint_manifest))
+        print(f"  ✓ {endpoint_path}")
+        print(f"  ✓ {records_path}")
 
     # ── ABI manifests (require ocp-settings.yml) ──────────────────────────
     if ocp_settings:
@@ -1009,7 +1047,10 @@ def main():
         device_data = devices.get(hostname)
         if device_data is None:
             continue
-        nncp = build_gpu_nncp(hostname, device_data, site_vars, nic_mode=args.nic_mode)
+        nncp = build_gpu_nncp(
+            hostname, device_data, site_vars, nic_mode=args.nic_mode,
+            node_hostname=endpoints[hostname]["rhcos"]["hostname"] if endpoints else None,
+        )
         if nncp:
             nncp_path = ocp_dir / "day2" / f"nncp-{hostname}-gpu-rails.yaml"
             write_yaml(nncp_path, nncp,

@@ -4,8 +4,9 @@
 """
 Bootstrap input/<arch>/<site>/ocp-settings.yml from the ERA inventory.
 
-Reads the ERA inventory hosts file produced by `make generate` and writes a
-pre-populated ocp-settings.yml with node_roles derived from the inventory groups:
+Reads the ERA inventory hosts file produced by `make generate`. Explicit
+workbook Nodes.Role values generate node_roles and node_endpoints; absent or
+all-blank Roles retain legacy role inference from the inventory groups:
 
   [nodes]   → worker_gpu
   [support] → control_plane
@@ -26,6 +27,10 @@ import re
 import sys
 from pathlib import Path
 
+import yaml
+from endpoint_naming import (dns_name, endpoint_names, WORKBOOK_ROLE_TO_OCP,
+                             build_role_endpoints)
+
 try:
     from airlib.env import _load_shared_air_vault
 except ImportError:
@@ -33,9 +38,9 @@ except ImportError:
         return {}
 
 def find_excel(arch, site):
-    """Return the first *.xlsx found in input/<arch>/<site>/, or None."""
-    candidates = list((Path("input") / arch / site).glob("*.xlsx"))
-    return candidates[0] if candidates else None
+    """Use only the imported canonical workbook, never an arbitrary alternate."""
+    path = Path("input") / arch / site / f"{arch}.xlsx"
+    return path if path.is_file() else None
 
 
 def find_cpu_inband_vlan(vlans):
@@ -190,6 +195,36 @@ def build_node_roles(groups):
     return role_map
 
 
+def read_workbook_roles(excel_path, groups):
+    """Read explicit Roles for enabled inventory servers; all-blank is legacy."""
+    from excel_parser import load_workbook_safe, parse_nodes, parse_settings
+    wb = load_workbook_safe(excel_path, data_only=True)
+    try:
+        nodes = parse_nodes(wb["Nodes"])
+        settings = parse_settings(wb["Settings"])
+    finally:
+        wb.close()
+    eligible = {name for group in GROUP_TO_OCP_ROLE for name in groups.get(group, [])}
+    active = [node for node in nodes if node["status"] == "Active"]
+    explicit = {node["name"]: node["ocp_role"] for node in active if node.get("ocp_role")}
+    if not explicit:
+        return None, settings.get("bmc_dns_subdomain")
+    if set(explicit) != eligible:
+        raise ValueError("Explicit Nodes.Role must cover exactly every enabled OCP inventory server")
+    for name, role in explicit.items():
+        if role not in WORKBOOK_ROLE_TO_OCP:
+            raise ValueError(f"Invalid Nodes.Role for {name}: {role!r}")
+    return explicit, settings.get("bmc_dns_subdomain")
+
+
+def build_explicit_node_roles(roles):
+    """Translate workbook Role independently of fabric Function and ABI membership."""
+    result = {}
+    for name, role in sorted(roles.items()):
+        result.setdefault(WORKBOOK_ROLE_TO_OCP[role], []).append(name)
+    return result
+
+
 def format_node_roles_yaml(role_map):
     """Render node_roles block as indented YAML lines."""
     lines = []
@@ -201,7 +236,8 @@ def format_node_roles_yaml(role_map):
 
 
 def write_settings(out_path, arch, site, node_roles_yaml,
-                   api_vip="", ingress_vip="", ocp=None, ssh_key_pub=None):
+                   api_vip="", ingress_vip="", ocp=None, ssh_key_pub=None,
+                   workbook_roles=None, bmc_dns_subdomain=None):
     """Write ocp-settings.yml, preferring values from the spreadsheet OPENSHIFT section.
 
     Priority for each field:
@@ -210,6 +246,13 @@ def write_settings(out_path, arch, site, node_roles_yaml,
       3. TODO placeholder
     """
     ocp = ocp or {}
+    previous = yaml.safe_load(out_path.read_text()) if out_path.exists() else {}
+    previous = previous or {}
+    if not isinstance(previous, dict):
+        raise ValueError("Existing ocp-settings.yml must be a mapping")
+    cluster_name = ocp.get("ocp_cluster_name") or previous.get("cluster", {}).get("name") or f"ocp-{site}"
+    if not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", cluster_name):
+        raise ValueError("ocp_cluster_name must be one DNS label")
 
     # domain
     domain = ocp.get("ocp_cluster_domain", "")
@@ -217,6 +260,27 @@ def write_settings(out_path, arch, site, node_roles_yaml,
         domain_line = f'  domain: "{domain}"\n'
     else:
         domain_line = '  domain: "era.example.com"  # TODO: set base domain\n'
+
+    generated_endpoints = None
+    if workbook_roles:
+        if not ocp.get("ocp_cluster_name") or not domain:
+            raise ValueError("Explicit Nodes.Role requires ocp_cluster_name and ocp_cluster_domain")
+        generated_endpoints = build_role_endpoints(
+            workbook_roles, cluster_name, domain, bmc_dns_subdomain
+        )
+        if previous.get("node_endpoints") and previous["node_endpoints"] != generated_endpoints:
+            raise ValueError("Preserved node_endpoints conflict with workbook-generated Role names; review before regeneration")
+
+    if previous.get("node_endpoints"):
+        roles = yaml.safe_load("node_roles:\n" + node_roles_yaml)["node_roles"]
+        keys = {key for nodes in roles.values() for key in nodes}
+        if set(previous["node_endpoints"]) != keys:
+            raise ValueError("Preserved node_endpoints must cover exactly the regenerated OCP nodes")
+        expected_domain = cluster_name + "." + dns_name(domain or "era.example.com")
+        for key in keys:
+            names = endpoint_names(previous, key)
+            if not names["rhcos_fqdn"].endswith("." + expected_domain):
+                raise ValueError(f"Preserved RHCOS FQDN differs from regenerated cluster domain: {key}")
 
     # version
     version = ocp.get("ocp_version", "")
@@ -249,7 +313,7 @@ def write_settings(out_path, arch, site, node_roles_yaml,
         f"# Fill in every field marked TODO before running: make generate-ocp ARCH={arch} SITE={site}\n"
         f"\n"
         f"cluster:\n"
-        f"  name: ocp-{site}\n"
+        f"  name: {cluster_name}\n"
         + domain_line
         + version_line
         + api_line
@@ -269,6 +333,10 @@ def write_settings(out_path, arch, site, node_roles_yaml,
         f"\n"
         f"day2: {{}}\n"
     )
+    final_endpoints = generated_endpoints if generated_endpoints is not None else previous.get("node_endpoints")
+    if final_endpoints is not None:
+        with out_path.open("a") as stream:
+            stream.write("\n" + yaml.safe_dump({"node_endpoints": final_endpoints}, sort_keys=False))
 
 
 def main():
@@ -310,6 +378,15 @@ def main():
 
     groups = parse_hosts_file(hosts_path)
     node_roles = build_node_roles(groups)
+    excel_path = args.workbook or find_excel(args.arch, args.site)
+    workbook_roles, bmc_dns_subdomain = (None, None)
+    if excel_path:
+        try:
+            workbook_roles, bmc_dns_subdomain = read_workbook_roles(excel_path, groups)
+            if workbook_roles:
+                node_roles = build_explicit_node_roles(workbook_roles)
+        except ValueError as exc:
+            sys.exit(f"ERROR: {exc}")
 
     if not node_roles:
         sys.exit(
@@ -319,7 +396,6 @@ def main():
 
     node_roles_yaml = format_node_roles_yaml(node_roles)
 
-    excel_path = find_excel(args.arch, args.site)
     cpu_inband_subnet, cpu_inband_gateway = read_cpu_inband_vlan(excel_path) if excel_path else (None, None)
     api_vip, ingress_vip = suggest_vips(cpu_inband_subnet) if cpu_inband_subnet else ("", "")
     ocp = read_ocp_settings(excel_path) if excel_path else {}
@@ -328,12 +404,16 @@ def main():
     air_ssh_key = vault.get("air_ssh_key_path", "")
     ssh_key_pub = (air_ssh_key + ".pub") if air_ssh_key else None
 
-    write_settings(out_path, args.arch, args.site, node_roles_yaml,
-                   api_vip=api_vip, ingress_vip=ingress_vip, ocp=ocp,
-                   ssh_key_pub=ssh_key_pub)
+    try:
+        write_settings(out_path, args.arch, args.site, node_roles_yaml,
+                       api_vip=api_vip, ingress_vip=ingress_vip, ocp=ocp,
+                       ssh_key_pub=ssh_key_pub, workbook_roles=workbook_roles,
+                       bmc_dns_subdomain=bmc_dns_subdomain)
+    except ValueError as exc:
+        sys.exit(f"ERROR: {exc}")
 
     print(f"\n  Wrote {out_path}")
-    print(f"\n  Node roles populated from ERA inventory:")
+    print(f"\n  Node roles populated from {'workbook Role' if workbook_roles else 'ERA inventory'}:")
     for role, hosts in node_roles.items():
         print(f"    {role:16s}: {', '.join(hosts)}")
 

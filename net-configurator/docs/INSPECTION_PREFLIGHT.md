@@ -183,9 +183,26 @@ Fresh Wire Map mismatches fail validation while preserving observed evidence and
 terminal cleanup. The adapter retains spreadsheet expectations and never replaces
 them with historical LLDP observations.
 
-Full inventories include GPU rail and OOB observations, but this first adapter
-reconciles only the selected CPU bond attachments. Successful CPU reconciliation
-does not certify GPU rails or OOB cabling. RAID checks run only when a selected
+The adapter now includes all selected CPU, GPU rail and host OOB NIC Wire Map
+rows, regardless of `Display in Air`. Each record carries `purpose: cpu`, `gpu`
+or `host_oob`. GPU and host OOB rows require reviewed aliases, MACs and switch/port
+assignments matching the generated inventory. iDRAC/BMC NIC/Port rows are excluded:
+those endpoints are not host NICs visible to the inspection ramdisk.
+
+CPU alias/MAC identity remains strict. GPU and host OOB aliases are resolved to
+the unique PCI-backed observed NIC by reviewed MAC; no OS rename is performed.
+Every required physical link must have explicit carrier up, LLDP and a unique
+MAC-bound Ironic Port whose persisted attachment agrees with the workbook.
+Findings record the purpose, reviewed alias, observed OS name, carrier and
+attachment failures. Missing/duplicate evidence, down carrier, wrong attachments
+and unplanned physical LLDP links fail reconciliation. Initial inspection/ABI
+network configuration remains CPU-only; GPU configuration stays Day2.
+
+New preparation bundles must be generated to include these full link records;
+previous sealed bundles are not upgraded or rewritten. Revised historical K8S
+names require service-tag/MAC correlation before comparing old reports.
+
+RAID checks run only when a selected
 collection `ocp_nodes` entry contains a separately reviewed `storagePolicy` with
 `controller_id`, `volume_id`, `raid_type` and `member_count`. Never reuse another
 node's controller/volume identifiers. GPU-01 identifiers remain unconfirmed;

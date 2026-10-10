@@ -18,6 +18,8 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "scripts"))
 import excel_parser  # noqa: E402
+from endpoint_naming import build_endpoint_manifest, ipv4, verify_bmc_resolution  # noqa: E402
+from utils import classify_net_profile  # noqa: E402
 
 
 def load_module(filename):
@@ -80,6 +82,62 @@ def validate_storage(policy):
     require(policy["raid_type"] != "RAID1" or policy["member_count"] == 2, "RAID1 requires two members")
 
 
+def auxiliary_links(name, wires, device):
+    """Review GPU/host-OOB links, including rows hidden in Air; exclude BMC endpoints."""
+    links = []
+    for wire in wires:
+        if wire["system_name"] != name:
+            continue
+        profile = classify_net_profile(wire["net_profile"])
+        if profile not in ("gpu", "oob"):
+            continue
+        if profile == "oob" and re.search(r"bmc|idrac", wire["nic_port"], re.IGNORECASE):
+            continue
+        alias, mac = wire["nic_alias"], wire["nic_mac"].lower()
+        require(bool(alias) and bool(re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac))
+                and bool(wire["switch_name"]) and bool(wire["switch_port"]),
+                f"Require reviewed {profile} host NIC alias, MAC, switch and port: {name}:{wire['nic_port']}")
+        generated = [entry for entry in device.get("nic_alias_map", {}).get(profile, []) if entry["alias"] == alias]
+        require(len(generated) == 1 and generated[0]["mac"].lower() == mac,
+                f"Workbook {profile} identity differs from generated inventory: {name}:{alias}")
+        links.append({"node": name, "interface": alias, "mac": mac,
+                      "purpose": "gpu" if profile == "gpu" else "host_oob",
+                      "expected_switch": wire["switch_name"], "expected_port": wire["switch_port"]})
+    return links
+
+
+def candidate_binding(base, settings, roles, site_vars, arch, endpoints, disks):
+    """Bind generated initial-install candidates when present; inspection alone stays usable."""
+    paths = [base / "ocp" / filename for filename in ("agent-config.yaml", "install-config.yaml")]
+    if not any(path.exists() for path in paths):
+        return {}, []
+    initial, _ = OCP.split_abi_membership(roles, site_vars["devices"])
+    agent = read_yaml(paths[0])
+    expected = OCP.build_agent_config(settings, initial, {}, site_vars, arch,
+                                      nic_mode="real-hw", disk_defaults=disks)
+    require(agent == expected, "ABI agent candidate differs from reviewed workbook/settings; regenerate OCP inventory")
+    install = read_yaml(paths[1])
+    cluster = settings["cluster"]
+    require(install.get("metadata", {}).get("name") == cluster["name"]
+            and install.get("baseDomain") == cluster["domain"], "ABI cluster identity mismatch")
+    require(install.get("controlPlane", {}).get("replicas") == sum(r == "control_plane" for r in initial.values())
+            and install.get("compute", [{}])[0].get("replicas") == sum(r != "control_plane" for r in initial.values()),
+            "ABI replica counts differ from initial membership")
+    require(install.get("platform", {}).get("baremetal", {}).get("apiVIPs") == [cluster["api_vip"]]
+            and install.get("platform", {}).get("baremetal", {}).get("ingressVIPs") == [cluster["ingress_vip"]]
+            and install.get("networking", {}).get("machineNetwork") == [{"cidr": site_vars["common"]["cpu_network"]}],
+            "ABI VIPs or machine network differ from reviewed settings")
+    mapping = {endpoints[name]["rhcos"]["hostname"] if endpoints else name: name for name in initial}
+    if endpoints:
+        path = base / "ocp/endpoint-map.yaml"
+        require(read_yaml(path) == build_endpoint_manifest(settings, site_vars["devices"], roles),
+                "Endpoint map differs from reviewed settings")
+        paths.append(path)
+    return {"schema_version": 1, "initial_node_names": sorted(initial),
+            "hostname_to_physical": mapping,
+            "manifest_sha256": {path.name: fingerprint(path) for path in paths}}, paths
+
+
 def prepare(root, arch, site, names, run_id, collection_root, concurrency):
     """Validate every selected node before creating a new run-specific preparation directory."""
     validate_run(run_id)
@@ -115,6 +173,8 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
     declared = cluster.get("ocp_nodes", [])
     require(isinstance(declared, list), "Collection ocp_nodes must be a list")
     disks = OCP.load_disk_defaults()
+    endpoint_manifest = build_endpoint_manifest(settings, site_vars.get("devices", {}), roles)
+    endpoints = endpoint_manifest["nodes"] if endpoint_manifest else {}
     overrides = settings.get("install_disk", {}).get("overrides", {})
     nodes, links, network_inputs = [], [], {}
     for name in names:
@@ -133,9 +193,16 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
         bmc = configured.get("bmc", {})
         require(isinstance(bmc, dict) and bool(bmc.get("driver")), f"Missing BMC policy: {name}")
         require(set(bmc) <= {"driver", "host", "system_id", "verify_ca"}, "Keep credentials in the existing vault")
-        require(str(bmc.get("host")) == str(row["mgmt_ip"]) == str(host.get("ansible_host"))
-                == str(device.get("eth0_ip")), f"Workbook/inventory/BMC endpoint mismatch: {name}")
-        ipaddress.ip_address(bmc["host"])
+        expected_bmc_ip = ipv4(row["mgmt_ip"])
+        require(expected_bmc_ip == ipv4(host.get("ansible_host")) == ipv4(device.get("eth0_ip")),
+                f"Workbook/inventory/BMC endpoint mismatch: {name}")
+        effective_bmc = dict(bmc)
+        if endpoints:
+            endpoint = endpoints[name]
+            require(bmc.get("host") in (expected_bmc_ip, endpoint["bmc"]["hostname"]),
+                    f"Collection BMC name differs from reviewed endpoint: {name}")
+            effective_bmc["host"] = endpoint["bmc"]["hostname"]
+        verify_bmc_resolution(effective_bmc.get("host", ""), expected_bmc_ip)
         disk, fallback = OCP.resolve_disk(name, role, arch, settings.get("oem"), disks, overrides)
         require(not fallback and isinstance(disk, str) and bool(re.fullmatch(r"/dev/disk/by-path/[A-Za-z0-9_.:-]+", disk)),
                 f"Reviewed literal by-path disk hint required: {name}")
@@ -143,8 +210,8 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
         early = OCP.build_inspection_early_network_interfaces(device, nmstate, nic_mode="real-hw")
         callback = nmstate["interfaces"][0]["ipv4"]["address"][0]["ip"]
         ipaddress.ip_address(callback)
-        node = {"name": name, "role": OCP.INSTALLER_ROLE[role], "bmc": bmc,
-                "devices": {"bond_ip": callback},
+        node = {"name": name, "role": OCP.INSTALLER_ROLE[role], "bmc": effective_bmc,
+                "devices": {"bond_ip": callback, "bmc_ip": expected_bmc_ip},
                 "interfaces": [{"name": item["name"], "macAddress": item["mac"]} for item in early],
                 "rootDeviceHints": {"deviceName": disk}}
         if "storagePolicy" in configured:
@@ -154,17 +221,24 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
             expected = [wire for wire in wires if wire["system_name"] == name and wire["nic_alias"] == identity["name"]]
             require(len(expected) == 1, f"Require one workbook CPU attachment: {name}:{identity['name']}")
             wire = expected[0]
-            require(wire["nic_mac"].lower() == identity["mac"] and wire["switch_name"] and wire["switch_port"],
+            require(classify_net_profile(wire["net_profile"]) == "cpu"
+                    and wire["nic_mac"].lower() == identity["mac"] and wire["switch_name"] and wire["switch_port"],
                     f"Workbook CPU identity differs from generated inventory: {name}:{identity['name']}")
             links.append({"node": name, "interface": identity["name"], "mac": identity["mac"],
+                          "purpose": "cpu",
                           "expected_switch": wire["switch_name"], "expected_port": wire["switch_port"]})
+        links.extend(auxiliary_links(name, wires, device))
         nodes.append(node)
         network_inputs[name] = (nmstate, {"interfaces": early})
     require(len({node["devices"]["bond_ip"] for node in nodes}) == len(nodes), "Duplicate callback addresses")
-    require(len({link["mac"] for link in links}) == len(links), "Duplicate selected CPU MACs")
+    require(len({link["mac"] for link in links}) == len(links), "Duplicate selected host NIC MACs")
+    require(len({(link["node"], link["interface"]) for link in links}) == len(links),
+            "Duplicate reviewed host NIC aliases")
     require(len({(link["expected_switch"], link["expected_port"]) for link in links}) == len(links),
-            "Duplicate desired CPU switch attachment")
+            "Duplicate desired host NIC switch attachment")
     base = root / "output" / arch / site
+    abi_handoff, candidate_paths = candidate_binding(base, settings, roles, site_vars, arch, endpoints, disks)
+    source_files.extend(candidate_paths)
     evidence = base / "reports/inspection" / run_id
     require(not evidence.exists() and not evidence.is_symlink(), "Evidence run already exists")
     bundle = base / "ocp/inspection/fleet" / run_id
@@ -181,6 +255,8 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
             "expected_node_count": len(nodes), "concurrency_limit": concurrency,
             "timeouts": {"manageable": 300, "inspection": 1200, "api_fetch": 30, "total_run": 3600},
             "wiremap": links, "switch_aliases": cluster.get("fleet_inspection_switch_aliases", {})}
+    if abi_handoff:
+        plan["abi_handoff"] = abi_handoff
     write_yaml(bundle / "plan.yml", {"inspect_fleet_plan": plan,
                "fleet_adapter_bundle": str(bundle), "fleet_adapter_expected_version": version,
                "fleet_adapter_collection_vars": str(cluster_path),
