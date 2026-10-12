@@ -97,6 +97,42 @@ ephemeral Ironic/customizer cleanup.
 
 ## Fleet inspection through net-configurator
 
+### Installation-volume preparation after successful inspection
+
+`make prepare-fleet-wipe` seals a reviewable installation-volume allowlist from
+an eligible physical inspection. Set `FLEET_RUN_ID` to that inspection ID, a new
+later UTC `FLEET_WIPE_RUN_ID`, and the exact inspected initial-install
+`FLEET_NODES` list. Pass these variables with explicit `ARCH` and `SITE`:
+
+    make prepare-fleet-wipe \
+      ARCH=<architecture> \
+      SITE=<site> \
+      FLEET_RUN_ID="$FLEET_RUN_ID" \
+      FLEET_WIPE_RUN_ID="$FLEET_WIPE_RUN_ID" \
+      FLEET_NODES="$FLEET_NODES"
+
+This requires the collection's `fleet_install_disk_plan` capability and the
+original sealed inspection bundle, receipt-bound evidence and unchanged current
+ABI manifests. The adapter reuses the ABI handoff validator, then requires each
+selected chassis serial and unique installation-volume by-path, serial, WWN,
+model and size to agree with the physical inventory and verified disk match.
+Preparation does not query hardware or require BMC credentials.
+
+Output is `output/<arch>/<site>/ocp/wipe/fleet/<wipe-run-id>/`:
+
+- `plan.yml`: exact host/volume identities, source hashes, manifest binding and
+  fixed concurrency 1 with stop-after-node-failure policy.
+- `review.txt`: concise private host/volume allowlist for operator review.
+- `prepared.yaml`: hashes sealing the plan and review summary.
+
+Plans explicitly have `execution_ready: false`; this phase supplies no physical
+authority or executable `wipe-fleet-install-disks` target. No wipe evidence root
+is created and no inspection evidence is changed. Existing output roots and
+symlink paths are refused; preserve incomplete preparation and choose a new ID.
+Review the collection's `docs/fleet-install-disk-reset-design.md` for the later
+agent payload, metadata readback, cleanup and linked ISO eligibility requirements.
+The existing ISO gate remains inspection-only until that integration ships.
+
 `make prepare-fleet-inspection` and `make inspect-fleet` adapt an explicit node
 list to the collection's `inspect_fleet.yml`. The collection owns the shared
 Ironic runtime, bounded node concurrency, inventory collection, reconciliation,
