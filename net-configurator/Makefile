@@ -16,7 +16,7 @@ SHELL := /bin/bash
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
-        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet
+        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -115,6 +115,9 @@ INSPECTION_CLEANUP_REPORT_PATH ?= $(patsubst %-inventory,%,$(basename $(INSPECTI
 # Explicit run/node selection. Preparation does not authorize physical execution.
 FLEET_CONCURRENCY ?= 2
 FLEET_PREP_DIR = $(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/fleet/$(FLEET_RUN_ID)
+
+# Wipe preparation is render-only; its serial policy is fixed at concurrency 1.
+FLEET_WIPE_PREP_DIR = $(CURDIR)/output/$(ARCH)/$(SITE)/ocp/wipe/fleet/$(FLEET_WIPE_RUN_ID)
 
 # Auto-detect LDAP: explicit LDAP=1 on command line takes priority,
 # otherwise detected at runtime inside targets (not at Makefile parse time).
@@ -716,6 +719,16 @@ prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared 
 		playbooks/prepare-fleet-inspection.yml \
 		-i "$(FLEET_PREP_DIR)/hosts.yml" -e "@$(FLEET_PREP_DIR)/plan.yml" \
 		"$${VAULT_ARGS[@]}"
+
+prepare-fleet-wipe:  ## Seal installation-volume allowlist from eligible inspection; no boot or disk writes
+	$(call check_arch,$@)
+	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_WIPE_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
+		echo "ERROR: FLEET_RUN_ID, fresh FLEET_WIPE_RUN_ID and explicit FLEET_NODES are required"; exit 1; \
+	fi
+	python3 scripts/prepare-fleet-wipe.py \
+		--arch "$(ARCH)" --site "$(SITE)" \
+		--inspection-run-id "$(FLEET_RUN_ID)" --wipe-run-id "$(FLEET_WIPE_RUN_ID)" \
+		--nodes "$(FLEET_NODES)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
 
 inspect-fleet:  ## Run separately authorized physical fleet inspection; exact run and node list required
 	$(call check_arch,$@)
