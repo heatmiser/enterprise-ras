@@ -97,12 +97,16 @@ ephemeral Ironic/customizer cleanup.
 
 ## Fleet inspection through net-configurator
 
-### Installation-volume preparation after successful inspection
+### Optional native metadata-cleaning preparation after successful inspection
 
-`make prepare-fleet-wipe` seals a reviewable installation-volume allowlist from
-an eligible physical inspection. Set `FLEET_RUN_ID` to that inspection ID, a new
-later UTC `FLEET_WIPE_RUN_ID`, and the exact inspected initial-install
-`FLEET_NODES` list. Pass these variables with explicit `ARCH` and `SITE`:
+Storage cleaning is optional: a successful eligible inspection can proceed directly
+through ABI ISO generation to an installation attempt. Preparing a cleaning plan
+leaves that inspection-only eligibility intact.
+
+`make prepare-fleet-wipe` now seals a non-executable native Ironic cleaning proposal.
+Set `FLEET_RUN_ID` to the successful inspection ID, a fresh later UTC
+`FLEET_WIPE_RUN_ID`, and the exact inspected initial-install `FLEET_NODES` list,
+then pass those variables with explicit `ARCH` and `SITE`:
 
     make prepare-fleet-wipe \
       ARCH=<architecture> \
@@ -111,27 +115,48 @@ later UTC `FLEET_WIPE_RUN_ID`, and the exact inspected initial-install
       FLEET_WIPE_RUN_ID="$FLEET_WIPE_RUN_ID" \
       FLEET_NODES="$FLEET_NODES"
 
-This requires the collection's `fleet_install_disk_plan` capability and the
-original sealed inspection bundle, receipt-bound evidence and unchanged current
-ABI manifests. The adapter reuses the ABI handoff validator, then requires each
-selected chassis serial and unique installation-volume by-path, serial, WWN,
-model and size to agree with the physical inventory and verified disk match.
-Preparation does not query hardware or require BMC credentials.
+This requires the collection's `fleet_native_disk_clean_plan` capability, the
+original sealed inspection bundle, receipt-bound evidence and unchanged ABI
+manifests. The adapter reuses the ABI handoff validator, then validates each chassis
+and uniquely matched installation volume against the raw inventory and disk policy.
+All observed disks require complete by-path, serial, WWN, model and byte-size
+identity; duplicates or hint-expression identity values are rejected. Preparation
+never queries hardware or requires BMC credentials.
 
 Output is `output/<arch>/<site>/ocp/wipe/fleet/<wipe-run-id>/`:
 
-- `plan.yml`: exact host/volume identities, source hashes, manifest binding and
-  fixed concurrency 1 with stop-after-node-failure policy.
-- `review.txt`: concise private host/volume allowlist for operator review.
-- `prepared.yaml`: hashes sealing the plan and review summary.
+- `plan.yml`: schema-2 `fleet_native_disk_clean_plan`, complete observed disk set,
+  protected non-target disks, proposed serial/WWN exclusions, source/manifest hashes,
+  one manual `deploy.erase_devices_metadata` step and concurrency 1/stop-on-failure.
+- `review.txt`: private target/protected disk summary, proposed exclusions and the
+  explicit live disk/partition verification gap.
+- `prepared.yaml`: schema-2 operation/provenance and hashes sealing plan/review.
 
-Plans explicitly have `execution_ready: false`; this phase supplies no physical
-authority or executable `wipe-fleet-install-disks` target. No wipe evidence root
-is created and no inspection evidence is changed. Existing output roots and
-symlink paths are refused; preserve incomplete preparation and choose a new ID.
-Review the collection's `docs/fleet-install-disk-reset-design.md` for the later
-agent payload, metadata readback, cleanup and linked ISO eligibility requirements.
-The existing ISO gate remains inspection-only until that integration ships.
+Plans always have `execution_ready: false`. Native exclusions apply to individual
+disk/partition records, not automatically to a parent's partitions. Historical
+inventory does not establish live disk-set or partition coverage; those checks and
+nonempty target scope remain unverified even for a single observed disk. Root-device
+hints alone do not restrict native cleaning. Proposed historical exclusions must
+not be dispatched as an executable wipe. Stock release-matched IPA/Ironic will be
+used; no derived image or extra registry authentication is required for this route.
+
+The adopted native completion policy requires verified target-only nonempty scope,
+expected command `SUCCEEDED`, node `manageable`, retained outcome/errors and verified
+power Off, media detach and runtime cleanup. Independent signature readback and a
+full post-clean inspection are not mandatory under this policy.
+
+No executable `wipe-fleet-install-disks` target or physical authority is supplied.
+No wipe evidence root is created and inspection evidence is unchanged. Existing
+bundles/evidence roots and symlink paths are refused; preserve legacy/incomplete
+preparation and use a fresh ID. See the collection's
+`docs/fleet-install-disk-reset-design.md` for live coverage and execution gaps.
+
+The current ISO gate remains inspection-only. Optional cleaning result/disposition
+integration must ship with executable cleaning before activation: started failed or
+incomplete cleaning blocks automatic progression until reviewed recovery or an
+explicit recorded operator choice to proceed without successful cleaning. Omitting
+a wipe ID must not bypass started-operation evidence. Running work or unverified
+cleanup blocks progression.
 
 `make prepare-fleet-inspection` and `make inspect-fleet` adapt an explicit node
 list to the collection's `inspect_fleet.yml`. The collection owns the shared

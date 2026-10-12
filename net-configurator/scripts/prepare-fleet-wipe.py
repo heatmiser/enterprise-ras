@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: MIT
-"""Seal a reviewable installation-volume plan; never boot nodes or write disks."""
+"""Seal optional native metadata-cleaning preparation; never boot nodes or write disks."""
 
 import argparse
 import importlib.util
@@ -39,7 +39,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
     original = base / "ocp/inspection/fleet" / inspection_run_id
     bundle = base / "ocp/wipe/fleet" / wipe_run_id
     evidence_root = base / "reports/wipe" / wipe_run_id
-    plugin_path = collection_root.absolute() / "plugins/filter/fleet_install_disk_plan.py"
+    plugin_path = collection_root.absolute() / "plugins/filter/fleet_native_disk_clean_plan.py"
     plugin_hash = gate.digest(plugin_path)
     builder = load_module(plugin_path, "wipe_plan_builder")
     document = gate.read_yaml(original / "plan.yml")
@@ -55,7 +55,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         "inspection_prepared": gate.digest(original / "prepared.yaml"),
         "plan_builder": plugin_hash,
     }
-    plan = builder.fleet_install_disk_plan(inspection_run_id, wipe_run_id,
+    plan = builder.fleet_native_disk_clean_plan(inspection_run_id, wipe_run_id,
         document["inspect_fleet_plan"]["authorized_nodes"], node_evidence, source_hashes)
     plan.update({"artifact_root": str(evidence_root), "inspection_artifact_root": str(source),
                  "manifest_sha256": receipt["manifest_sha256"]})
@@ -71,23 +71,35 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         gate.require(not path.exists(), "Wipe preparation or evidence run already exists")
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.mkdir(mode=0o700)
-    review = [f"Wipe preparation: {wipe_run_id}", f"Inspection source: {inspection_run_id}",
+    review = [f"Native metadata-cleaning preparation: {wipe_run_id}", f"Inspection source: {inspection_run_id}",
               "Status: PREPARED; execution ready: false; no physical authority",
-              "Concurrency: 1; stop subsequent nodes after failure", ""]
+              "Optional step: inspection-only ABI generation remains supported",
+              "Manual clean step: deploy.erase_devices_metadata only",
+              "Completion: nonempty target scope, SUCCEEDED, manageable, durable outcome, verified cleanup",
+              "Concurrency: 1; stop subsequent nodes after failure",
+              "Live disk and partition exclusions UNVERIFIED; proposals grant no execution authority", ""]
     for node in plan["authorized_nodes"]:
         disk = node["installation_volume"]
         review.extend([node["name"], f"  Chassis serial: {node['host_identity']['serial_number']}",
                        f"  Volume: {disk['by_path']}", f"  Serial: {disk['serial']}; WWN: {disk['wwn']}",
                        f"  Model: {disk['model']}; bytes: {disk['size']}",
-                       f"  Observed name only: {node['observed_device_name']}"])
+                       f"  Observed name only: {node['observed_device_name']}",
+                       f"  Observed whole disks: {len(node['observed_disks'])}; "
+                       f"protected whole disks: {len(node['protected_disks'])}"])
+        for disk in node["protected_disks"]:
+            review.append(f"  Protect: {disk['by_path']}; serial: {disk['serial']}; "
+                          f"WWN: {disk['wwn']}; model: {disk['model']}; bytes: {disk['size']}")
+        for hint in node["proposed_skip_block_devices"]:
+            review.append(f"  Proposed exclusion: serial={hint['serial']}; WWN={hint['wwn']}")
     for filename, text in {
-        "plan.yml": yaml.safe_dump({"fleet_install_disk_plan": plan}, sort_keys=False),
+        "plan.yml": yaml.safe_dump({"fleet_native_disk_clean_plan": plan}, sort_keys=False),
         "review.txt": "\n".join(review) + "\n",
     }.items():
         with (bundle / filename).open("x") as stream:
             stream.write(text)
         (bundle / filename).chmod(0o600)
-    prepared = {"schema_version": 1, "run_id": wipe_run_id, "inspection_run_id": inspection_run_id,
+    prepared = {"schema_version": 2, "operation": plan["operation"], "run_id": wipe_run_id,
+                "inspection_run_id": inspection_run_id,
                 "execution_ready": False, "node_names": sorted(names), "source_sha256": source_hashes,
                 "sha256": {name: gate.digest(bundle / name) for name in ("plan.yml", "review.txt")}}
     with (bundle / "prepared.yaml").open("x") as stream:

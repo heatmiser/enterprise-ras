@@ -34,7 +34,11 @@ def wipe_source(eligible_run):
                 "serial": f"fixture-volume-{index}", "wwn": f"fixture-wwn-{index}",
                 "model": "Example Boot Volume", "size": 1000000000}
         (evidence / name / "inventory-raw.json").write_text(json.dumps({"inventory": {
-            "disks": [disk], "system_vendor": {"manufacturer": "Example", "product_name": "Server",
+            "disks": [disk, *[
+                {"name": f"/dev/sd{letter}", "by_path": f"/dev/disk/by-path/example-data-{letter}",
+                 "serial": f"fixture-data-{index}-{letter}", "wwn": f"fixture-data-wwn-{index}-{letter}",
+                 "model": "Example Data Volume", "size": 2000000000} for letter in ("a", "b")]],
+            "system_vendor": {"manufacturer": "Example", "product_name": "Server",
                                                "serial_number": f"fixture-chassis-{index}"}}}))
         validation = gate.read_yaml(evidence / name / "validation.yaml")
         validation["disk_validation"].update(node=name, selected_disk=disk, disk_match_verified=True,
@@ -42,9 +46,9 @@ def wipe_source(eligible_run):
         write(evidence / name / "validation.yaml", validation)
     refresh_receipt(evidence)
     collection = root / "wipe-collection"
-    plugin = collection / "plugins/filter/fleet_install_disk_plan.py"
+    plugin = collection / "plugins/filter/fleet_native_disk_clean_plan.py"
     plugin.parent.mkdir(parents=True)
-    shutil.copyfile(COLLECTION / "plugins/filter/fleet_install_disk_plan.py", plugin)
+    shutil.copyfile(COLLECTION / "plugins/filter/fleet_native_disk_clean_plan.py", plugin)
     return root, bundle, evidence, collection
 
 
@@ -56,9 +60,22 @@ def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_so
     root, _, evidence, _ = wipe_source
     before = {str(p): p.read_bytes() for p in evidence.rglob("*") if p.is_file()}
     bundle = prepare(wipe_source)
-    plan = gate.read_yaml(bundle / "plan.yml")["fleet_install_disk_plan"]
+    plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
     sealed = gate.read_yaml(bundle / "prepared.yaml")
     assert plan["concurrency_limit"] == 1 and plan["execution_ready"] is False
+    assert plan["operation"] == "native_installation_volume_metadata_cleaning"
+    assert plan["clean_steps"] == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}]
+    assert plan["policy"]["optional"] is True
+    assert plan["policy"]["require_post_reset_readback"] is False
+    for node in plan["authorized_nodes"]:
+        assert len(node["observed_disks"]) == 3
+        assert len(node["protected_disks"]) == 2
+        assert len(node["proposed_skip_block_devices"]) == 2
+        assert node["scope_verification"]["live_partition_exclusions_verified"] is False
+        assert all("name" not in hint and "by_path" not in hint
+                   for hint in node["proposed_skip_block_devices"])
+    assert sealed["schema_version"] == 2 and sealed["operation"] == plan["operation"]
+    assert "UNVERIFIED" in (bundle / "review.txt").read_text()
     assert sealed["node_names"] == sorted(NAMES)
     assert plan["manifest_sha256"] == gate.read_yaml(evidence / "eligibility.yaml")["manifest_sha256"]
     for name, digest in sealed["sha256"].items():
@@ -69,12 +86,15 @@ def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_so
     assert all(p.stat().st_mode & 0o777 == 0o600 for p in bundle.iterdir())
     assert not (root / "output/2-8-5-200/test01/reports/wipe").exists()
     assert before == {str(p): p.read_bytes() for p in evidence.rglob("*") if p.is_file()}
+    # Preparation leaves the successful inspection-only ISO handoff eligible.
+    gate.validate_handoff(root, "2-8-5-200", "test01", RUN)
 
 
 @pytest.mark.parametrize("case", ["changed_evidence", "changed_manifest", "changed_workbook",
                                  "failed_validation", "missing_disk_serial", "missing_host_serial",
                                  "duplicate_disk", "missing_node", "duplicate_node", "extra_node",
-                                 "unsafe_run", "unsafe_site", "missing_plugin"])
+                                 "unsafe_run", "unsafe_site", "missing_plugin", "missing_protected_identity",
+                                 "ambiguous_protected_disks", "protected_hint_operator"])
 def test_invalid_preparation_creates_no_bundle(wipe_source, case):
     root, _, evidence, collection = wipe_source
     names, run, site = NAMES, WIPE, "test01"
@@ -100,6 +120,18 @@ def test_invalid_preparation_creates_no_bundle(wipe_source, case):
             raw["inventory"]["disks"].append(dict(raw["inventory"]["disks"][0]))
         path.write_text(json.dumps(raw))
         refresh_receipt(evidence)
+    elif case in ("missing_protected_identity", "ambiguous_protected_disks", "protected_hint_operator"):
+        path = evidence / NAMES[0] / "inventory-raw.json"
+        raw = json.loads(path.read_text())
+        disks = raw["inventory"]["disks"]
+        if case == "missing_protected_identity":
+            disks[1]["serial"] = ""
+        elif case == "ambiguous_protected_disks":
+            disks[2]["wwn"] = disks[1]["wwn"]
+        else:
+            disks[1]["serial"] = "<or> target <or> data"
+        path.write_text(json.dumps(raw))
+        refresh_receipt(evidence)
     elif case == "missing_node":
         names = NAMES[:1]
     elif case == "duplicate_node":
@@ -111,7 +143,7 @@ def test_invalid_preparation_creates_no_bundle(wipe_source, case):
     elif case == "unsafe_site":
         site = "../test01"
     else:
-        (collection / "plugins/filter/fleet_install_disk_plan.py").unlink()
+        (collection / "plugins/filter/fleet_native_disk_clean_plan.py").unlink()
     with pytest.raises((ValueError, FileNotFoundError)):
         wipe.prepare(root, "2-8-5-200", site, RUN, run, names, collection)
     assert not (root / "output/2-8-5-200/test01/ocp/wipe").exists()
@@ -169,3 +201,14 @@ def test_real_make_target_never_invokes_runtime_or_installer(wipe_source):
     assert result.returncode == 0, result.stdout + result.stderr
     assert not capture.exists()
     assert "no physical authority" in result.stdout
+
+
+def test_previous_preparation_is_preserved_when_fresh_native_plan_is_created(wipe_source):
+    root = wipe_source[0]
+    previous = root / "output/2-8-5-200/test01/ocp/wipe/fleet/20000101T123000Z"
+    previous.mkdir(parents=True)
+    marker = previous / "plan.yml"
+    marker.write_text("legacy preparation; execution_ready: false\n")
+    before = marker.read_bytes()
+    bundle = prepare(wipe_source)
+    assert bundle != previous and marker.read_bytes() == before
