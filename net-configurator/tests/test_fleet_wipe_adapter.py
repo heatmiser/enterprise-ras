@@ -46,9 +46,10 @@ def wipe_source(eligible_run):
         write(evidence / name / "validation.yaml", validation)
     refresh_receipt(evidence)
     collection = root / "wipe-collection"
-    plugin = collection / "plugins/filter/fleet_native_disk_clean_plan.py"
-    plugin.parent.mkdir(parents=True)
-    shutil.copyfile(COLLECTION / "plugins/filter/fleet_native_disk_clean_plan.py", plugin)
+    for relative in wipe.collection_hashes(COLLECTION):
+        target = collection / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(COLLECTION / relative, target)
     return root, bundle, evidence, collection
 
 
@@ -82,8 +83,11 @@ def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_so
         assert hashlib.sha256((bundle / name).read_bytes()).hexdigest() == digest
     text = (bundle / "plan.yml").read_text()
     assert "FIXTURE_NOT_A_CREDENTIAL" not in text and "redfish_password" not in text
-    assert set(bundle.iterdir()) == {bundle / name for name in ("plan.yml", "prepared.yaml", "review.txt")}
-    assert all(p.stat().st_mode & 0o777 == 0o600 for p in bundle.iterdir())
+    assert set(p.name for p in bundle.iterdir()) == {
+        "plan.yml", "prepared.yaml", "review.txt", "runtime-plan.yml", "hosts.yml", "nmstate", "early-network"}
+    assert sealed["runtime_sealed"] is False
+    assert all(p.stat().st_mode & 0o777 == 0o600 for p in bundle.rglob("*") if p.is_file())
+    assert all(p.stat().st_mode & 0o777 == 0o700 for p in bundle.rglob("*") if p.is_dir())
     assert not (root / "output/2-8-5-200/test01/reports/wipe").exists()
     assert before == {str(p): p.read_bytes() for p in evidence.rglob("*") if p.is_file()}
     # Preparation leaves the successful inspection-only ISO handoff eligible.
@@ -176,30 +180,37 @@ def test_existing_or_symlink_paths_are_preserved(wipe_source, case):
 
 def test_repeat_preparation_does_not_rewrite_seal(wipe_source):
     bundle = prepare(wipe_source)
-    before = {p.name: p.read_bytes() for p in bundle.iterdir()}
+    before = {str(p.relative_to(bundle)): p.read_bytes() for p in bundle.rglob("*") if p.is_file()}
     with pytest.raises(ValueError):
         prepare(wipe_source)
-    assert before == {p.name: p.read_bytes() for p in bundle.iterdir()}
+    assert before == {str(p.relative_to(bundle)): p.read_bytes() for p in bundle.rglob("*") if p.is_file()}
 
 
-def test_real_make_target_never_invokes_runtime_or_installer(wipe_source):
+def test_real_make_preparation_invokes_only_preflight_driver(wipe_source):
     root, _, _, collection = wipe_source
     shutil.copyfile(ROOT / "Makefile", root / "Makefile")
     shutil.copytree(ROOT / "scripts", root / "scripts")
     bin_dir = root / "bin"
     bin_dir.mkdir()
     capture = root / "unexpected-runtime"
-    for name in ("podman", "ansible-playbook", "openshift-install"):
+    for name in ("podman", "openshift-install"):
         command = bin_dir / name
         command.write_text("#!/bin/sh\nprintf 'unexpected' > \"$WIPE_RUNTIME_CAPTURE\"\nexit 99\n")
         command.chmod(0o700)
-    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "WIPE_RUNTIME_CAPTURE": str(capture)}
+    preflight_capture = root / "preflight-call.json"
+    command = bin_dir / "ansible-playbook"
+    command.write_text("#!/usr/bin/env python3\nimport json,os,sys\nfrom pathlib import Path\n"
+                       "Path(os.environ['PREFLIGHT_CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n")
+    command.chmod(0o700)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "WIPE_RUNTIME_CAPTURE": str(capture),
+           "PREFLIGHT_CAPTURE": str(preflight_capture)}
     command = ["make", "prepare-fleet-wipe", "ARCH=2-8-5-200", "SITE=test01", f"FLEET_RUN_ID={RUN}",
                f"FLEET_WIPE_RUN_ID={WIPE}", "FLEET_NODES=" + ",".join(NAMES),
                "RHV_BAREMETAL_OCP_ROOT=" + str(collection)]
     result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert not capture.exists()
+    assert "playbooks/prepare-fleet-wipe.yml" in json.loads(preflight_capture.read_text())
     assert "no physical authority" in result.stdout
 
 
@@ -212,3 +223,40 @@ def test_previous_preparation_is_preserved_when_fresh_native_plan_is_created(wip
     before = marker.read_bytes()
     bundle = prepare(wipe_source)
     assert bundle != previous and marker.read_bytes() == before
+
+
+def seal_bundle(source, bundle):
+    runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
+    original = gate.read_yaml(source[1] / "preflight-vars.yaml")
+    preflight = {**original, "ironic_deploy_provisioning_ip": "192.0.2.10",
+                 "ironic_deploy_provisioning_interface": "eth-test"}
+    write(bundle / "preflight-vars.yaml", preflight)
+    write(bundle / "callback-routes.yaml", {"nodes": [n["name"] for n in runtime["authorized_nodes"]],
+        "routes": [{"item": n, "stdout": json.dumps([{"dst": n["devices"]["bond_ip"],
+            "dev": "eth-test", "prefsrc": "192.0.2.10"}])} for n in runtime["authorized_nodes"]]})
+    wipe.seal(source[0], "2-8-5-200", "test01", bundle)
+    return bundle
+
+
+def test_fresh_seal_and_exact_authorization_do_not_start_execution(wipe_source):
+    bundle = prepare(wipe_source)
+    with pytest.raises(ValueError):
+        wipe.verify(wipe_source[0], "2-8-5-200", "test01", bundle)
+    seal_bundle(wipe_source, bundle)
+    authority = wipe.authorize(wipe_source[0], "2-8-5-200", "test01", bundle, WIPE, NAMES)
+    assert authority["fleet_wipe_authorization"]["confirmed"] is True
+    assert not (wipe_source[0] / "output/2-8-5-200/test01/reports/wipe").exists()
+    with pytest.raises(ValueError):
+        wipe.authorize(wipe_source[0], "2-8-5-200", "test01", bundle, WIPE, NAMES[:1])
+
+
+@pytest.mark.parametrize("case", ["executor", "network", "preflight", "route", "source"])
+def test_sealed_runtime_changes_are_rejected(wipe_source, case):
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    path = {"executor": wipe_source[3] / "roles/fleet_native_disk_clean_driver/tasks/clean_node.yml",
+            "network": bundle / "nmstate" / (NAMES[0] + ".yaml"),
+            "preflight": bundle / "preflight-vars.yaml", "route": bundle / "callback-routes.yaml",
+            "source": wipe_source[0] / "input/2-8-5-200/test01/2-8-5-200.xlsx"}[case]
+    path.write_bytes(path.read_bytes() + b"\n# changed\n")
+    with pytest.raises(ValueError):
+        wipe.verify(wipe_source[0], "2-8-5-200", "test01", bundle)

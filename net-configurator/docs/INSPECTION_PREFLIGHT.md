@@ -298,3 +298,43 @@ virtual media, or boot hardware. Authenticated Redfish GET and local ephemeral
 Ironic checks are later Gate-4 preflight activities and require Gate-4
 authorization. Hardware boot remains exclusively a separately approved Gate-6
 action.
+
+## Optional installation-volume metadata cleaning
+
+A completely eligible physical inspection can proceed directly to
+`generate-ocp-iso`. Metadata cleaning is optional. Preparing a cleaning plan does
+not invalidate that inspection or authorize hardware activity.
+
+For optional cleaning, retain the eligible inspection `FLEET_RUN_ID` and exact
+initial-cluster `FLEET_NODES`, then set a fresh `FLEET_WIPE_RUN_ID`.
+`make prepare-fleet-wipe ARCH=<arch> SITE=<site>` projects the intended installation
+volume and protected storage, copies the reviewed networking and resolves fresh
+callback routes and release-matched preflight inputs. Review `plan.yml`,
+`review.txt` and `prepared.yaml` under `ocp/wipe/fleet/<wipe-run>/`. Preparation
+uses the existing vaulted pull secret; it starts no Ironic service and boots no
+node. Existing bundles are preserved; a failed preparation needs a fresh run ID.
+
+After separate exact authorization, invoke `make wipe-fleet-install-disks` with
+`ARCH`, `SITE`, `FLEET_WIPE_RUN_ID`, `FLEET_AUTHORIZE_WIPE_RUN` equal to that wipe
+run, and `FLEET_AUTHORIZE_WIPE_NODES` equal to the reviewed full node list. The
+adapter revalidates source evidence, manifests, executor code and preparation
+before registering the started operation and invoking the collection. Cleaning
+runs at concurrency one and stops subsequent nodes after failure. Live exclusions
+cover protected disks and partitions; only the intended installation volume is
+eligible for stock `erase_devices_metadata`. No automatic destructive retry or
+mandatory full post-clean inspection is introduced.
+
+Review `reports/wipe/<wipe-run>/receipt.yaml`, `summary.yaml`, `runtime.yaml` and
+per-node `outcome.yaml`. Success requires expected native command `SUCCEEDED`,
+nonempty verified target scope, return to `manageable`, durable evidence and
+verified Off/media detach/runtime removal. Unknown submission or completion keeps
+the runtime and lock for reviewed recovery. Do not blindly rerun the target or
+remove retained services.
+
+ISO generation discovers every started cleaning operation for the site, regardless
+of whether a wipe ID was supplied. Failed/incomplete or altered evidence blocks
+automatic progression. Only a terminal failed run with verified cleanup can use
+`make record-fleet-wipe-disposition` with the exact wipe run, node authorization
+list and a nonempty exported `FLEET_WIPE_DISPOSITION_REASON`. That records the
+operator's explicit choice to attempt installation without successful cleaning;
+it cannot override running/uncertain work or unverified cleanup.

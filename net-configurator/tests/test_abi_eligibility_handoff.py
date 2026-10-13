@@ -201,3 +201,23 @@ def test_real_make_recipe_uses_gate_before_installer(eligible_run):
     capture.unlink()
     repeat = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=60)
     assert repeat.returncode != 0 and not capture.exists()  # Never reuse an installer work directory.
+
+
+def test_real_iso_command_rejects_started_cleaning_without_wipe_id(eligible_run):
+    root, _, _ = eligible_run
+    shutil.copyfile(ROOT / "Makefile", root / "Makefile")
+    shutil.copytree(ROOT / "scripts", root / "scripts")
+    site = root / "output/2-8-5-200/test01"
+    started = site / "reports/wipe/20000101T130000Z"
+    write(started / "execution-intent.yaml", {"status": "STARTED"})
+    bin_dir = root / "bin"
+    bin_dir.mkdir()
+    capture = root / "unexpected-installer"
+    podman = bin_dir / "podman"
+    podman.write_text("#!/bin/sh\nprintf called > \"$ABI_CAPTURE\"\nexit 99\n")
+    podman.chmod(0o700)
+    env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "ABI_CAPTURE": str(capture)}
+    result = subprocess.run(["make", "generate-ocp-iso", "ARCH=2-8-5-200", "SITE=test01", f"FLEET_RUN_ID={RUN}"],
+                            cwd=root, env=env, capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0 and not capture.exists()
+    assert not (site / "ocp-iso").exists()
