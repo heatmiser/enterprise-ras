@@ -272,3 +272,24 @@ Reports remain under `reports/wipe/<run-id>/`: `outcome.yaml` per node,
 remains optional; preparing alone preserves inspection-only ABI eligibility.
 Started failed or incomplete cleaning still requires successful completion or an
 explicit disposition after verified terminal failure and cleanup.
+
+## OEM binding for optional native metadata cleaning
+
+`make prepare-fleet-wipe` reads the canonical site workbook's Settings
+`ocp_oem` and requires agreement with `ocp-settings.yml` `oem`. It seals the
+declaration and complete native interface profile into the plan, runtime plan
+and `review.txt`. It does not modify the workbook or original inspection bundle.
+
+`dell` selects hardware type `idrac`, boot `idrac-redfish-virtual-media`,
+management `idrac-redfish` and supported native `redfish` power. The pinned
+Ironic `idrac-redfish` power class is unsupported/deprecated. Explicit `redfish` selects the generic native
+Redfish profile. Both retain `direct` deployment, `noop` networking, native
+Redfish credentials and configured system IDs. Missing or unverified OEMs are
+rejected; no inferred vendor or generic boot fallback is used. HPE/iLO and other
+native drivers need separately verified profile contracts before use.
+
+The executor checks every selected interface against the running hardware-type
+API before enrollment or boot. Result validation and retained provenance use
+the same profile. Older preparations without this OEM binding require a fresh
+run ID and review. The pinned-image iDRAC contract check precedes another physical
+attempt; local mocked tests do not verify live OEM media behavior.

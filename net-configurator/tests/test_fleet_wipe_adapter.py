@@ -15,7 +15,7 @@ import pytest
 from tests.test_abi_eligibility_handoff import (
     candidate_workspace, eligible_run, gate, refresh_receipt, write,
 )
-from tests.test_fleet_inspection_adapter import workspace, NAMES, RUN, ROOT
+from tests.test_fleet_inspection_adapter import workspace as inspection_workspace, NAMES, RUN, ROOT
 
 
 spec = importlib.util.spec_from_file_location("wipe_adapter", ROOT / "scripts/prepare-fleet-wipe.py")
@@ -23,6 +23,33 @@ wipe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wipe)
 WIPE = "20000101T130000Z"
 COLLECTION = ROOT.parents[1] / "rhvp.baremetal_ocp"
+
+
+@pytest.fixture
+def workspace(tmp_path, request):
+    """Declare OEM before inspection seals the workbook and generated settings."""
+    import openpyxl
+    root, collection = inspection_workspace.__wrapped__(tmp_path)
+    inputs = root / "input/2-8-5-200/test01"
+    oem, settings_oem = getattr(request, "param", ("dell", "dell"))
+    path = inputs / "2-8-5-200.xlsx"
+    workbook = openpyxl.load_workbook(path)
+    if oem is not None:
+        workbook["Settings"].append(["ocp_oem", oem])
+    workbook.save(path)
+    workbook.close()
+    settings = gate.read_yaml(inputs / "ocp-settings.yml")
+    settings["oem"] = settings_oem
+    if settings_oem == "redfish":
+        settings["install_disk"]["overrides"] = {name: f"/dev/disk/by-path/fixture-{name}" for name in NAMES}
+    write(inputs / "ocp-settings.yml", settings)
+    if oem == "redfish":
+        config = collection / "inventories/test01/cluster-vars.yaml"
+        value = gate.read_yaml(config)
+        for node in value["ocp_nodes"]:
+            node["bmc"]["driver"] = "redfish"
+        write(config, value)
+    return root, collection
 
 
 @pytest.fixture
@@ -57,6 +84,34 @@ def prepare(source, names=NAMES, run=WIPE):
     return wipe.prepare(source[0], "2-8-5-200", "test01", RUN, run, names, source[3])
 
 
+@pytest.mark.parametrize("workspace", [(None, "dell"), ("dell", "redfish")], indirect=True)
+def test_missing_or_mismatched_declaration_is_rejected_without_bundle(wipe_source):
+    with pytest.raises(ValueError, match="Explicit workbook ocp_oem"):
+        prepare(wipe_source)
+    assert not (wipe_source[0] / "output/2-8-5-200/test01/ocp/wipe").exists()
+
+
+@pytest.mark.parametrize("workspace", [("redfish", "redfish")], indirect=True)
+def test_explicit_generic_redfish_profile_is_sealed(wipe_source):
+    bundle = prepare(wipe_source)
+    plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
+    assert plan["oem"] == "redfish"
+    assert plan["native_profile"]["driver"] == "redfish"
+    assert plan["native_profile"]["boot_interface"] == "redfish-virtual-media"
+
+
+@pytest.mark.parametrize("case", ["plan", "runtime"])
+def test_tampered_sealed_profile_is_rejected(wipe_source, case):
+    bundle = prepare(wipe_source)
+    path = bundle / ("plan.yml" if case == "plan" else "runtime-plan.yml")
+    value = gate.read_yaml(path)
+    key = "fleet_native_disk_clean_plan" if case == "plan" else "fleet_wipe_runtime_plan"
+    value[key]["native_profile"]["boot_interface"] = "redfish-virtual-media"
+    write(path, value)
+    with pytest.raises(ValueError, match="Native OEM profile binding"):
+        wipe.verify_sources(wipe_source[0], "2-8-5-200", "test01", bundle)
+
+
 def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_source):
     root, _, evidence, _ = wipe_source
     before = {str(p): p.read_bytes() for p in evidence.rglob("*") if p.is_file()}
@@ -65,6 +120,12 @@ def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_so
     sealed = gate.read_yaml(bundle / "prepared.yaml")
     assert plan["concurrency_limit"] == 1 and plan["execution_ready"] is False
     assert plan["operation"] == "native_all_disks_metadata_cleaning"
+    assert plan["oem"] == "dell"
+    assert plan["native_profile"]["driver"] == "idrac"
+    assert plan["native_profile"]["boot_interface"] == "idrac-redfish-virtual-media"
+    runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
+    assert runtime["native_profile"] == plan["native_profile"] and runtime["oem"] == "dell"
+    assert "Workbook OEM: dell; native hardware type: idrac" in (bundle / "review.txt").read_text()
     assert plan["clean_steps"] == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}]
     assert plan["policy"]["optional"] is True
     assert "require_post_reset_readback" not in plan["policy"]

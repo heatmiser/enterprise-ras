@@ -39,6 +39,18 @@ def collection_hashes(collection):
     return {str(p.relative_to(collection)): gate.digest(p) for p in sorted(paths)}
 
 
+def declared_oem(root, arch, site):
+    """Require the workbook's explicit OEM to match generated OCP settings."""
+    inputs = root / "input" / arch / site
+    reader = load_module(ROOT / "scripts/init-ocp-settings.py", "wipe_settings_reader")
+    oem = reader.read_ocp_settings(inputs / f"{arch}.xlsx").get("ocp_oem", "")
+    settings_oem = gate.read_yaml(inputs / "ocp-settings.yml").get("oem")
+    gate.require(isinstance(oem, str) and bool(oem.strip()) and isinstance(settings_oem, str)
+                 and oem.strip().lower() == settings_oem.strip().lower(),
+                 "Explicit workbook ocp_oem must match ocp-settings.yml oem")
+    return oem.strip().lower()
+
+
 def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root):
     root = root.absolute()
     # This existing gate checks immutable physical evidence, exact initial ABI
@@ -56,8 +68,14 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
     plugin_path = collection_root.absolute() / "plugins/filter/fleet_native_disk_clean_plan.py"
     plugin_hash = gate.digest(plugin_path)
     builder = load_module(plugin_path, "wipe_plan_builder")
+    oem = declared_oem(root, arch, site)
+    profile = builder.fleet_native_disk_clean_profile(oem)
     code_hashes = collection_hashes(collection_root.absolute())
     document = gate.read_yaml(original / "plan.yml")
+    gate.require(all(node["bmc"]["driver"] in ("idrac", "redfish") if oem == "dell"
+                     else node["bmc"]["driver"] == "redfish"
+                     for node in document["inspect_fleet_plan"]["authorized_nodes"]),
+                 "Reviewed BMC inputs do not match the OEM credential contract")
     provenance = gate.read_yaml(original / "preflight-vars.yaml")["inspection_preflight_provenance"]
     node_evidence = {}
     for name in names:
@@ -72,7 +90,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         "plan_builder": plugin_hash,
     }
     plan = builder.fleet_native_disk_clean_plan(inspection_run_id, wipe_run_id,
-        document["inspect_fleet_plan"]["authorized_nodes"], node_evidence, source_hashes)
+        document["inspect_fleet_plan"]["authorized_nodes"], node_evidence, source_hashes, oem)
     plan.update({"artifact_root": str(evidence_root), "inspection_artifact_root": str(source),
                  "manifest_sha256": receipt["manifest_sha256"]})
     # Revalidate after projecting evidence so altered files cannot be sealed into
@@ -87,7 +105,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         gate.require(not path.exists(), "Wipe preparation or evidence run already exists")
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.mkdir(mode=0o700)
-    runtime = {"run_id": wipe_run_id, "artifact_root": str(evidence_root),
+    runtime = {"run_id": wipe_run_id, "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
                "authorized_nodes": document["inspect_fleet_plan"]["authorized_nodes"],
                "collection_root": str(collection_root.absolute()), "collection_sha256": code_hashes,
                "source_sha256": document["fleet_adapter_source_sha256"],
@@ -112,6 +130,10 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
               "No installation-volume selector; no operator disk exclusions",
               "IPA native safeguards and device selection remain in force",
               "Manual clean step: deploy.erase_devices_metadata only",
+              f"Workbook OEM: {oem}; native hardware type: {profile['driver']}",
+              f"Boot: {profile['boot_interface']}; management: {profile['management_interface']}; "
+              f"power: {profile['power_interface']}",
+              "Credentials: native redfish_* driver_info; configured system IDs preserved",
               "Completion: accepted native request, return to manageable, durable outcome, verified cleanup",
               "Concurrency: 1; stop subsequent nodes after failure", ""]
     for node in plan["authorized_nodes"]:
@@ -157,6 +179,12 @@ def verify_sources(root, arch, site, bundle):
                  and plan.get("clean_steps") == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}],
                  "Require fresh all-disk native preparation; installation-volume plans cannot execute")
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
+    builder = load_module(Path(runtime["collection_root"]) / "plugins/filter/fleet_native_disk_clean_plan.py",
+                          "wipe_profile_verifier")
+    oem = declared_oem(root, arch, site)
+    gate.require(plan.get("oem") == oem and runtime.get("oem") == oem
+                 and plan.get("native_profile") == builder.fleet_native_disk_clean_profile(oem)
+                 and runtime.get("native_profile") == plan["native_profile"], "Native OEM profile binding changed")
     _, _, receipt = gate.validate_handoff(root, arch, site, plan["inspection_run_id"])
     gate.require(plan["manifest_sha256"] == receipt["manifest_sha256"]
                  and sorted(n["name"] for n in plan["authorized_nodes"]) == sorted(receipt["node_names"]), "Inspection binding changed")
