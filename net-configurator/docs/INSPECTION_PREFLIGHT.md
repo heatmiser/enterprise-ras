@@ -97,48 +97,14 @@ ephemeral Ironic/customizer cleanup.
 
 ## Fleet inspection through net-configurator
 
-### Installation-volume preparation after successful inspection
+### Optional native all-disk metadata-cleaning preparation
 
-`make prepare-fleet-wipe` seals a reviewable installation-volume allowlist from
-an eligible physical inspection. Set `FLEET_RUN_ID` to that inspection ID, a new
-later UTC `FLEET_WIPE_RUN_ID`, and the exact inspected initial-install
-`FLEET_NODES` list. Pass these variables with explicit `ARCH` and `SITE`:
+`make prepare-fleet-wipe` creates a fresh non-executable preparation from eligible
+physical inspection. Its scope is **all native eligible disks and partitions** on
+the selected nodes. Review `review.txt`; installation-volume hints do not limit
+this operation and no operator disk exclusions are supplied. IPA's built-in
+safeguards remain active. Preparation does not boot nodes or wipe storage.
 
-    make prepare-fleet-wipe \
-      ARCH=<architecture> \
-      SITE=<site> \
-      FLEET_RUN_ID="$FLEET_RUN_ID" \
-      FLEET_WIPE_RUN_ID="$FLEET_WIPE_RUN_ID" \
-      FLEET_NODES="$FLEET_NODES"
-
-This requires the collection's `fleet_install_disk_plan` capability and the
-original sealed inspection bundle, receipt-bound evidence and unchanged current
-ABI manifests. The adapter reuses the ABI handoff validator, then requires each
-selected chassis serial and unique installation-volume by-path, serial, WWN,
-model and size to agree with the physical inventory and verified disk match.
-Preparation does not query hardware or require BMC credentials.
-
-Output is `output/<arch>/<site>/ocp/wipe/fleet/<wipe-run-id>/`:
-
-- `plan.yml`: exact host/volume identities, source hashes, manifest binding and
-  fixed concurrency 1 with stop-after-node-failure policy.
-- `review.txt`: concise private host/volume allowlist for operator review.
-- `prepared.yaml`: hashes sealing the plan and review summary.
-
-Plans explicitly have `execution_ready: false`; this phase supplies no physical
-authority or executable `wipe-fleet-install-disks` target. No wipe evidence root
-is created and no inspection evidence is changed. Existing output roots and
-symlink paths are refused; preserve incomplete preparation and choose a new ID.
-Review the collection's `docs/fleet-install-disk-reset-design.md` for the later
-agent payload, metadata readback, cleanup and linked ISO eligibility requirements.
-The existing ISO gate remains inspection-only until that integration ships.
-
-`make prepare-fleet-inspection` and `make inspect-fleet` adapt an explicit node
-list to the collection's `inspect_fleet.yml`. The collection owns the shared
-Ironic runtime, bounded node concurrency, inventory collection, reconciliation,
-power-off verification, media detach and cleanup. These targets require the
-collection's fleet inspection, physical attachment, RAID and disk-matching updates.
-They do not generate ABI manifests, stage an install or boot an ABI ISO.
 
 ### Inputs and preparation
 
@@ -273,3 +239,57 @@ virtual media, or boot hardware. Authenticated Redfish GET and local ephemeral
 Ironic checks are later Gate-4 preflight activities and require Gate-4
 authorization. Hardware boot remains exclusively a separately approved Gate-6
 action.
+
+## Optional native all-disk metadata cleaning
+
+Use the exported ARCH, SITE, FLEET_RUN_ID and FLEET_NODES from the successful
+inspection. Only the wipe run ID changes in an existing shell:
+
+export FLEET_WIPE_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+
+make prepare-fleet-wipe
+
+Verify the fresh bundle and review its `review.txt`. It explicitly lists the
+all-disk scope and historical disks for review. Older installation-volume bundles
+cannot execute this operation.
+
+After reviewing and authorizing that exact run and node set:
+
+make wipe-fleet-disks FLEET_AUTHORIZE_WIPE_RUN="$FLEET_WIPE_RUN_ID"
+
+`FLEET_AUTHORIZE_WIPE_NODES` must contain the reviewed node set. The retired
+`wipe-fleet-install-disks` command fails rather than silently broadening its scope.
+
+Standard Ironic/IPA handles discovery, TLS, hardware managers, metadata erasure
+and continuation. The wrapper submits one manual-clean request per node and stops
+later nodes after failure. Completion requires native return to `manageable`
+with no active step or error, durable evidence, verified Off/media detachment and
+runtime/firewall cleanup. An uncertain submission or active operation retains
+runtime for review; no wrapper retry is performed.
+
+Reports remain under `reports/wipe/<run-id>/`: `outcome.yaml` per node,
+`diagnostics.yaml`, `summary.yaml`, `runtime.yaml` and `receipt.yaml`. Cleaning
+remains optional; preparing alone preserves inspection-only ABI eligibility.
+Started failed or incomplete cleaning still requires successful completion or an
+explicit disposition after verified terminal failure and cleanup.
+
+## OEM binding for optional native metadata cleaning
+
+`make prepare-fleet-wipe` reads the canonical site workbook's Settings
+`ocp_oem` and requires agreement with `ocp-settings.yml` `oem`. It seals the
+declaration and complete native interface profile into the plan, runtime plan
+and `review.txt`. It does not modify the workbook or original inspection bundle.
+
+`dell` selects hardware type `idrac`, boot `idrac-redfish-virtual-media`,
+management `idrac-redfish` and supported native `redfish` power. The pinned
+Ironic `idrac-redfish` power class is unsupported/deprecated. Explicit `redfish` selects the generic native
+Redfish profile. Both retain `direct` deployment, `noop` networking, native
+Redfish credentials and configured system IDs. Missing or unverified OEMs are
+rejected; no inferred vendor or generic boot fallback is used. HPE/iLO and other
+native drivers need separately verified profile contracts before use.
+
+The executor checks every selected interface against the running hardware-type
+API before enrollment or boot. Result validation and retained provenance use
+the same profile. Older preparations without this OEM binding require a fresh
+run ID and review. The pinned-image iDRAC contract check precedes another physical
+attempt; local mocked tests do not verify live OEM media behavior.

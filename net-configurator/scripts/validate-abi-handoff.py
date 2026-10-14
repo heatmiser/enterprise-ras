@@ -14,6 +14,9 @@ import sys
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
+STATE_SPEC = importlib.util.spec_from_file_location("abi_cleaning_state", ROOT / "scripts/fleet-cleaning-state.py")
+cleaning_state = importlib.util.module_from_spec(STATE_SPEC)
+STATE_SPEC.loader.exec_module(cleaning_state)
 NODE_FILES = ("inventory.yaml", "inventory-raw.json", "ports-raw.json",
               "validation.yaml", "cleanup.yaml", "outcome.yaml")
 
@@ -161,18 +164,20 @@ def main():
     args = parser.parse_args()
     try:
         root = args.root.absolute()
-        image, candidates, receipt = validate_handoff(root, args.arch, args.site, args.run_id,
-                                                       args.ee_image, args.installer)
-        stage = Path(args.stage_dir).absolute()
-        require(stage == root / "output" / args.arch / args.site / "ocp-iso" / args.run_id,
-                "Require site/run-specific ISO staging path")
-        require(not any(p.is_symlink() for p in (stage, *stage.parents)), "Symlink ISO staging path")
-        stage.mkdir(parents=True, exist_ok=False, mode=0o700)
-        for filename, content in candidates.items():
-            (stage / filename).write_bytes(content)
-            (stage / filename).chmod(0o600)
-        (stage / "eligibility.yaml").write_text(yaml.safe_dump(receipt))
-        print(image)
+        base = cleaning_state.site_root(root, args.arch, args.site)
+        with cleaning_state.Lease(base):
+            cleaning_state.check(base)
+            image, candidates, receipt = validate_handoff(root, args.arch, args.site, args.run_id,
+                                                           args.ee_image, args.installer)
+            stage = Path(args.stage_dir).absolute()
+            require(stage == base / "ocp-iso" / args.run_id, "Require site/run-specific ISO staging path")
+            require(not any(p.is_symlink() for p in (stage, *stage.parents)), "Symlink ISO staging path")
+            stage.mkdir(parents=True, exist_ok=False, mode=0o700)
+            for filename, content in candidates.items():
+                (stage / filename).write_bytes(content)
+                (stage / filename).chmod(0o600)
+            (stage / "eligibility.yaml").write_text(yaml.safe_dump(receipt))
+            print(image)
     except (ValueError, KeyError, IndexError, OSError, TypeError, yaml.YAMLError, subprocess.SubprocessError):
         # Never echo parsed candidate data: install-config contains a pull secret.
         parser.exit(1, "ERROR: ABI handoff rejected; inspect the run evidence, unchanged prepared inputs, membership, and installer provenance.\n")

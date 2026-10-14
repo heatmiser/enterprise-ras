@@ -16,7 +16,8 @@ SHELL := /bin/bash
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
-        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe
+        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
+        wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -720,7 +721,7 @@ prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared 
 		-i "$(FLEET_PREP_DIR)/hosts.yml" -e "@$(FLEET_PREP_DIR)/plan.yml" \
 		"$${VAULT_ARGS[@]}"
 
-prepare-fleet-wipe:  ## Seal installation-volume allowlist from eligible inspection; no boot or disk writes
+prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks on selected nodes; no boot or writes
 	$(call check_arch,$@)
 	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_WIPE_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
 		echo "ERROR: FLEET_RUN_ID, fresh FLEET_WIPE_RUN_ID and explicit FLEET_NODES are required"; exit 1; \
@@ -729,6 +730,42 @@ prepare-fleet-wipe:  ## Seal installation-volume allowlist from eligible inspect
 		--arch "$(ARCH)" --site "$(SITE)" \
 		--inspection-run-id "$(FLEET_RUN_ID)" --wipe-run-id "$(FLEET_WIPE_RUN_ID)" \
 		--nodes "$(FLEET_NODES)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+	@VAULT_ARGS=(); \
+	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
+		playbooks/prepare-fleet-wipe.yml -i "$(FLEET_WIPE_PREP_DIR)/hosts.yml" \
+		-e "@$(FLEET_WIPE_PREP_DIR)/runtime-plan.yml" "$${VAULT_ARGS[@]}"
+
+wipe-fleet-install-disks:  ## Retired installation-volume command; requires a fresh all-disk review
+	@echo "ERROR: installation-volume-only execution is retired. Review a fresh all-disk preparation and use make wipe-fleet-disks."; exit 1
+
+wipe-fleet-disks:  ## Run separately authorized native metadata cleaning of ALL eligible disks
+	$(call check_arch,$@)
+	python3 scripts/fleet-cleaning-state.py lease --root "$(CURDIR)" --arch "$(ARCH)" --site "$(SITE)" -- \
+		$(MAKE) --no-print-directory _wipe-fleet-disks
+
+_wipe-fleet-disks:
+	@if [ -z "$(FLEET_AUTHORIZE_WIPE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_WIPE_NODES)" ] || \
+	    [ "$(FLEET_AUTHORIZE_WIPE_RUN)" != "$(FLEET_WIPE_RUN_ID)" ]; then \
+		echo "ERROR: exact FLEET_AUTHORIZE_WIPE_RUN and FLEET_AUTHORIZE_WIPE_NODES are required"; exit 1; \
+	fi; \
+	SECRETS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/secrets.yaml"; \
+	if [ ! -f "$$SECRETS" ]; then echo "ERROR: selected site vault is missing"; exit 1; fi; \
+	AUTH="$$(python3 scripts/prepare-fleet-wipe.py begin --root "$(CURDIR)" \
+		--arch "$(ARCH)" --site "$(SITE)" --bundle "$(FLEET_WIPE_PREP_DIR)" \
+		--wipe-run-id "$(FLEET_AUTHORIZE_WIPE_RUN)" --nodes "$(FLEET_AUTHORIZE_WIPE_NODES)")" || exit 1; \
+	VAULT_ARGS=(); \
+	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
+		playbooks/wipe-fleet-install-disks.yml -i "$(FLEET_WIPE_PREP_DIR)/hosts.yml" \
+		-e "@$(FLEET_WIPE_PREP_DIR)/plan.yml" -e "@$(FLEET_WIPE_PREP_DIR)/runtime-plan.yml" \
+		-e "@$$SECRETS" -e "$$AUTH" "$${VAULT_ARGS[@]}"
+
+export FLEET_WIPE_DISPOSITION_REASON
+record-fleet-wipe-disposition:  ## Record explicit choice after failed native cleaning and verified safe cleanup
+	$(call check_arch,$@)
+	python3 scripts/fleet-cleaning-state.py disposition --root "$(CURDIR)" --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_WIPE_RUN_ID)" --nodes "$(FLEET_AUTHORIZE_WIPE_NODES)"
 
 inspect-fleet:  ## Run separately authorized physical fleet inspection; exact run and node list required
 	$(call check_arch,$@)
@@ -788,6 +825,11 @@ inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical 
 
 generate-ocp-iso:  ## Generate ABI ISO from an eligible physical inspection - requires ARCH, SITE, FLEET_RUN_ID
 	$(call check_arch,$@)
+	python3 scripts/fleet-cleaning-state.py lease --root "$(CURDIR)" --arch "$(ARCH)" --site "$(SITE)" -- \
+		$(MAKE) --no-print-directory _generate-ocp-iso
+
+_generate-ocp-iso:
+	@if [ -z "$$RHV_NATIVE_OPERATION_LOCK_FD" ]; then echo "ERROR: ISO generation requires the site lease"; exit 1; fi
 	@if [ -z "$(FLEET_RUN_ID)" ]; then \
 		echo "ERROR: FLEET_RUN_ID of a successful eligible physical inspection is required"; \
 		exit 1; \
