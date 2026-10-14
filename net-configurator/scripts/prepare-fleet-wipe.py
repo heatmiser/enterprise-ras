@@ -32,13 +32,10 @@ def collection_hashes(collection):
     gate.require(len(paths) == 12, "Native fleet executor is incomplete")
     paths += [collection / relative for relative in (
         "playbooks/wipe_fleet_install_disks.yml", "plugins/filter/fleet_native_disk_clean_result.py",
-        "plugins/filter/fleet_native_disk_clean_plan.py", "plugins/filter/fleet_native_disk_clean_scope.py",
+        "plugins/filter/fleet_native_disk_clean_plan.py",
         "plugins/filter/runtime_diagnostics.py",
-        "roles/ironic_deploy/files/native_disk_clean/rhvp_ironic_native_disk_clean.py",
-        "roles/ironic_deploy/files/native_disk_clean/rhvp_ironic_native_disk_clean-1.0.0.dist-info/METADATA",
-        "roles/ironic_deploy/files/native_disk_clean/rhvp_ironic_native_disk_clean-1.0.0.dist-info/entry_points.txt",
         "roles/ironic_deploy/tasks/main.yml", "roles/ironic_deploy/tasks/deploy_ephemeral.yml",
-        "roles/ironic_deploy/tasks/prepare_native_disk_clean.yml", "roles/ironic_deploy/defaults/main.yml")]
+        "roles/ironic_deploy/defaults/main.yml")]
     return {str(p.relative_to(collection)): gate.digest(p) for p in sorted(paths)}
 
 
@@ -109,26 +106,20 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
                                                 "fleet_wipe_arch": arch, "fleet_wipe_site": site})
     write_document(bundle / "hosts.yml", {"all": {"children": {"bootstrap": {"hosts": {
         "localhost": {"ansible_connection": "local"}}}}}})
-    review = [f"Native metadata-cleaning preparation: {wipe_run_id}", f"Inspection source: {inspection_run_id}",
+    review = [f"Native all-disk metadata-cleaning preparation: {wipe_run_id}", f"Inspection source: {inspection_run_id}",
               "Status: PREPARED; execution ready: false; no physical authority",
-              "Optional step: inspection-only ABI generation remains supported",
+              "SCOPE: ALL NATIVE ELIGIBLE DISKS AND PARTITIONS ON EVERY SELECTED NODE",
+              "No installation-volume selector; no operator disk exclusions",
+              "IPA native safeguards and device selection remain in force",
               "Manual clean step: deploy.erase_devices_metadata only",
-              "Completion: nonempty target scope, SUCCEEDED, manageable, durable outcome, verified cleanup",
-              "Concurrency: 1; stop subsequent nodes after failure",
-              "Live disk and partition exclusions UNVERIFIED; proposals grant no execution authority", ""]
+              "Completion: accepted native request, return to manageable, durable outcome, verified cleanup",
+              "Concurrency: 1; stop subsequent nodes after failure", ""]
     for node in plan["authorized_nodes"]:
-        disk = node["installation_volume"]
         review.extend([node["name"], f"  Chassis serial: {node['host_identity']['serial_number']}",
-                       f"  Volume: {disk['by_path']}", f"  Serial: {disk['serial']}; WWN: {disk['wwn']}",
-                       f"  Model: {disk['model']}; bytes: {disk['size']}",
-                       f"  Observed name only: {node['observed_device_name']}",
-                       f"  Observed whole disks: {len(node['observed_disks'])}; "
-                       f"protected whole disks: {len(node['protected_disks'])}"])
-        for disk in node["protected_disks"]:
-            review.append(f"  Protect: {disk['by_path']}; serial: {disk['serial']}; "
-                          f"WWN: {disk['wwn']}; model: {disk['model']}; bytes: {disk['size']}")
-        for hint in node["proposed_skip_block_devices"]:
-            review.append(f"  Proposed exclusion: serial={hint['serial']}; WWN={hint['wwn']}")
+                       "  Previously inspected disks (review information; native discovery selects at execution):"])
+        for disk in node["observed_disks"]:
+            review.append(f"    {disk['observed_device_name']}; model: {disk['model']}; "
+                          f"bytes: {disk['size']}; serial: {disk['serial']}; WWN: {disk['wwn']}")
     for filename, text in {
         "plan.yml": yaml.safe_dump({"fleet_native_disk_clean_plan": plan}, sort_keys=False),
         "review.txt": "\n".join(review) + "\n",
@@ -136,7 +127,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         with (bundle / filename).open("x") as stream:
             stream.write(text)
         (bundle / filename).chmod(0o600)
-    prepared = {"schema_version": 2, "operation": plan["operation"], "run_id": wipe_run_id,
+    prepared = {"schema_version": 3, "operation": plan["operation"], "scope": plan["scope"], "run_id": wipe_run_id,
                 "inspection_run_id": inspection_run_id,
                 "execution_ready": False, "node_names": sorted(names), "source_sha256": source_hashes,
                 "runtime_sealed": False,
@@ -160,6 +151,11 @@ def bundle_hashes(bundle):
 
 def verify_sources(root, arch, site, bundle):
     plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
+    gate.require(plan.get("schema_version") == 3 and plan.get("operation") == state.OPERATION
+                 and plan.get("scope") == state.SCOPE
+                 and plan.get("policy", {}).get("operator_disk_exclusions") == []
+                 and plan.get("clean_steps") == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}],
+                 "Require fresh all-disk native preparation; installation-volume plans cannot execute")
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
     _, _, receipt = gate.validate_handoff(root, arch, site, plan["inspection_run_id"])
     gate.require(plan["manifest_sha256"] == receipt["manifest_sha256"]
@@ -208,7 +204,9 @@ def verify(root, arch, site, bundle):
     plan, runtime = verify_sources(root, arch, site, bundle)
     gate.require(bundle == root / "output" / arch / site / "ocp/wipe/fleet" / plan["run_id"], "Wrong preparation path")
     prepared = gate.read_yaml(bundle / "prepared.yaml")
-    gate.require(prepared.get("runtime_sealed") is True and prepared.get("execution_ready") is False
+    gate.require(prepared.get("schema_version") == 3 and prepared.get("operation") == state.OPERATION
+                 and prepared.get("scope") == state.SCOPE
+                 and prepared.get("runtime_sealed") is True and prepared.get("execution_ready") is False
                  and prepared["run_id"] == plan["run_id"] and prepared["inspection_run_id"] == plan["inspection_run_id"]
                  and prepared["sha256"] == bundle_hashes(bundle), "Incomplete or altered preparation")
     gate.require(gate.read_yaml(bundle / "preflight-vars.yaml")["inspection_preflight_provenance"]
@@ -257,7 +255,7 @@ def main():
                                       args.wipe_run_id, adapter.selection(args.nodes), start=True)))
     except (ValueError, KeyError, IndexError, OSError, TypeError, ImportError, yaml.YAMLError):
         parser.exit(1, "ERROR: Wipe preparation rejected; review physical eligibility, unchanged inputs, "
-                    "exact membership, host/volume identity, collection capability and fresh output paths.\n")
+                    "exact membership, all-disk scope, collection capability and fresh output paths.\n")
 
 
 if __name__ == "__main__":

@@ -97,73 +97,14 @@ ephemeral Ironic/customizer cleanup.
 
 ## Fleet inspection through net-configurator
 
-### Optional native metadata-cleaning preparation after successful inspection
+### Optional native all-disk metadata-cleaning preparation
 
-Storage cleaning is optional: a successful eligible inspection can proceed directly
-through ABI ISO generation to an installation attempt. Preparing a cleaning plan
-leaves that inspection-only eligibility intact.
+`make prepare-fleet-wipe` creates a fresh non-executable preparation from eligible
+physical inspection. Its scope is **all native eligible disks and partitions** on
+the selected nodes. Review `review.txt`; installation-volume hints do not limit
+this operation and no operator disk exclusions are supplied. IPA's built-in
+safeguards remain active. Preparation does not boot nodes or wipe storage.
 
-`make prepare-fleet-wipe` now seals a non-executable native Ironic cleaning proposal.
-Set `FLEET_RUN_ID` to the successful inspection ID, a fresh later UTC
-`FLEET_WIPE_RUN_ID`, and the exact inspected initial-install `FLEET_NODES` list,
-then pass those variables with explicit `ARCH` and `SITE`:
-
-    make prepare-fleet-wipe \
-      ARCH=<architecture> \
-      SITE=<site> \
-      FLEET_RUN_ID="$FLEET_RUN_ID" \
-      FLEET_WIPE_RUN_ID="$FLEET_WIPE_RUN_ID" \
-      FLEET_NODES="$FLEET_NODES"
-
-This requires the collection's `fleet_native_disk_clean_plan` capability, the
-original sealed inspection bundle, receipt-bound evidence and unchanged ABI
-manifests. The adapter reuses the ABI handoff validator, then validates each chassis
-and uniquely matched installation volume against the raw inventory and disk policy.
-All observed disks require complete by-path, serial, WWN, model and byte-size
-identity; duplicates or hint-expression identity values are rejected. Preparation
-never queries hardware or requires BMC credentials.
-
-Output is `output/<arch>/<site>/ocp/wipe/fleet/<wipe-run-id>/`:
-
-- `plan.yml`: schema-2 `fleet_native_disk_clean_plan`, complete observed disk set,
-  protected non-target disks, proposed serial/WWN exclusions, source/manifest hashes,
-  one manual `deploy.erase_devices_metadata` step and concurrency 1/stop-on-failure.
-- `review.txt`: private target/protected disk summary, proposed exclusions and the
-  explicit live disk/partition verification gap.
-- `prepared.yaml`: schema-2 operation/provenance and hashes sealing plan/review.
-
-Plans always have `execution_ready: false`. Native exclusions apply to individual
-disk/partition records, not automatically to a parent's partitions. Historical
-inventory does not establish live disk-set or partition coverage; those checks and
-nonempty target scope remain unverified even for a single observed disk. Root-device
-hints alone do not restrict native cleaning. Proposed historical exclusions must
-not be dispatched as an executable wipe. Stock release-matched IPA/Ironic will be
-used; no derived image or extra registry authentication is required for this route.
-
-The adopted native completion policy requires verified target-only nonempty scope,
-expected command `SUCCEEDED`, node `manageable`, retained outcome/errors and verified
-power Off, media detach and runtime cleanup. Independent signature readback and a
-full post-clean inspection are not mandatory under this policy.
-
-No executable `wipe-fleet-install-disks` target or physical authority is supplied.
-No wipe evidence root is created and inspection evidence is unchanged. Existing
-bundles/evidence roots and symlink paths are refused; preserve legacy/incomplete
-preparation and use a fresh ID. See the collection's
-`docs/fleet-install-disk-reset-design.md` for live coverage and execution gaps.
-
-The current ISO gate remains inspection-only. Optional cleaning result/disposition
-integration must ship with executable cleaning before activation: started failed or
-incomplete cleaning blocks automatic progression until reviewed recovery or an
-explicit recorded operator choice to proceed without successful cleaning. Omitting
-a wipe ID must not bypass started-operation evidence. Running work or unverified
-cleanup blocks progression.
-
-`make prepare-fleet-inspection` and `make inspect-fleet` adapt an explicit node
-list to the collection's `inspect_fleet.yml`. The collection owns the shared
-Ironic runtime, bounded node concurrency, inventory collection, reconciliation,
-power-off verification, media detach and cleanup. These targets require the
-collection's fleet inspection, physical attachment, RAID and disk-matching updates.
-They do not generate ABI manifests, stage an install or boot an ABI ISO.
 
 ### Inputs and preparation
 
@@ -299,42 +240,35 @@ Ironic checks are later Gate-4 preflight activities and require Gate-4
 authorization. Hardware boot remains exclusively a separately approved Gate-6
 action.
 
-## Optional installation-volume metadata cleaning
+## Optional native all-disk metadata cleaning
 
-A completely eligible physical inspection can proceed directly to
-`generate-ocp-iso`. Metadata cleaning is optional. Preparing a cleaning plan does
-not invalidate that inspection or authorize hardware activity.
+Use the exported ARCH, SITE, FLEET_RUN_ID and FLEET_NODES from the successful
+inspection. Only the wipe run ID changes in an existing shell:
 
-For optional cleaning, retain the eligible inspection `FLEET_RUN_ID` and exact
-initial-cluster `FLEET_NODES`, then set a fresh `FLEET_WIPE_RUN_ID`.
-`make prepare-fleet-wipe ARCH=<arch> SITE=<site>` projects the intended installation
-volume and protected storage, copies the reviewed networking and resolves fresh
-callback routes and release-matched preflight inputs. Review `plan.yml`,
-`review.txt` and `prepared.yaml` under `ocp/wipe/fleet/<wipe-run>/`. Preparation
-uses the existing vaulted pull secret; it starts no Ironic service and boots no
-node. Existing bundles are preserved; a failed preparation needs a fresh run ID.
+export FLEET_WIPE_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 
-After separate exact authorization, invoke `make wipe-fleet-install-disks` with
-`ARCH`, `SITE`, `FLEET_WIPE_RUN_ID`, `FLEET_AUTHORIZE_WIPE_RUN` equal to that wipe
-run, and `FLEET_AUTHORIZE_WIPE_NODES` equal to the reviewed full node list. The
-adapter revalidates source evidence, manifests, executor code and preparation
-before registering the started operation and invoking the collection. Cleaning
-runs at concurrency one and stops subsequent nodes after failure. Live exclusions
-cover protected disks and partitions; only the intended installation volume is
-eligible for stock `erase_devices_metadata`. No automatic destructive retry or
-mandatory full post-clean inspection is introduced.
+make prepare-fleet-wipe
 
-Review `reports/wipe/<wipe-run>/receipt.yaml`, `summary.yaml`, `runtime.yaml` and
-per-node `outcome.yaml`. Success requires expected native command `SUCCEEDED`,
-nonempty verified target scope, return to `manageable`, durable evidence and
-verified Off/media detach/runtime removal. Unknown submission or completion keeps
-the runtime and lock for reviewed recovery. Do not blindly rerun the target or
-remove retained services.
+Verify the fresh bundle and review its `review.txt`. It explicitly lists the
+all-disk scope and historical disks for review. Older installation-volume bundles
+cannot execute this operation.
 
-ISO generation discovers every started cleaning operation for the site, regardless
-of whether a wipe ID was supplied. Failed/incomplete or altered evidence blocks
-automatic progression. Only a terminal failed run with verified cleanup can use
-`make record-fleet-wipe-disposition` with the exact wipe run, node authorization
-list and a nonempty exported `FLEET_WIPE_DISPOSITION_REASON`. That records the
-operator's explicit choice to attempt installation without successful cleaning;
-it cannot override running/uncertain work or unverified cleanup.
+After reviewing and authorizing that exact run and node set:
+
+make wipe-fleet-disks FLEET_AUTHORIZE_WIPE_RUN="$FLEET_WIPE_RUN_ID"
+
+`FLEET_AUTHORIZE_WIPE_NODES` must contain the reviewed node set. The retired
+`wipe-fleet-install-disks` command fails rather than silently broadening its scope.
+
+Standard Ironic/IPA handles discovery, TLS, hardware managers, metadata erasure
+and continuation. The wrapper submits one manual-clean request per node and stops
+later nodes after failure. Completion requires native return to `manageable`
+with no active step or error, durable evidence, verified Off/media detachment and
+runtime/firewall cleanup. An uncertain submission or active operation retains
+runtime for review; no wrapper retry is performed.
+
+Reports remain under `reports/wipe/<run-id>/`: `outcome.yaml` per node,
+`diagnostics.yaml`, `summary.yaml`, `runtime.yaml` and `receipt.yaml`. Cleaning
+remains optional; preparing alone preserves inspection-only ABI eligibility.
+Started failed or incomplete cleaning still requires successful completion or an
+explicit disposition after verified terminal failure and cleanup.

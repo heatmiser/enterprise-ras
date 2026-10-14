@@ -64,19 +64,17 @@ def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_so
     plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
     sealed = gate.read_yaml(bundle / "prepared.yaml")
     assert plan["concurrency_limit"] == 1 and plan["execution_ready"] is False
-    assert plan["operation"] == "native_installation_volume_metadata_cleaning"
+    assert plan["operation"] == "native_all_disks_metadata_cleaning"
     assert plan["clean_steps"] == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}]
     assert plan["policy"]["optional"] is True
-    assert plan["policy"]["require_post_reset_readback"] is False
+    assert "require_post_reset_readback" not in plan["policy"]
+    assert plan["schema_version"] == 3 and plan["scope"] == "all_native_eligible_disks"
     for node in plan["authorized_nodes"]:
         assert len(node["observed_disks"]) == 3
-        assert len(node["protected_disks"]) == 2
-        assert len(node["proposed_skip_block_devices"]) == 2
-        assert node["scope_verification"]["live_partition_exclusions_verified"] is False
-        assert all("name" not in hint and "by_path" not in hint
-                   for hint in node["proposed_skip_block_devices"])
-    assert sealed["schema_version"] == 2 and sealed["operation"] == plan["operation"]
-    assert "UNVERIFIED" in (bundle / "review.txt").read_text()
+        assert "installation_volume" not in node and "protected_disks" not in node
+    assert plan["policy"]["operator_disk_exclusions"] == []
+    assert sealed["schema_version"] == 3 and sealed["operation"] == plan["operation"]
+    assert "ALL NATIVE ELIGIBLE DISKS AND PARTITIONS" in (bundle / "review.txt").read_text()
     assert sealed["node_names"] == sorted(NAMES)
     assert plan["manifest_sha256"] == gate.read_yaml(evidence / "eligibility.yaml")["manifest_sha256"]
     for name, digest in sealed["sha256"].items():
@@ -95,10 +93,9 @@ def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_so
 
 
 @pytest.mark.parametrize("case", ["changed_evidence", "changed_manifest", "changed_workbook",
-                                 "failed_validation", "missing_disk_serial", "missing_host_serial",
+                                 "failed_validation", "missing_host_serial",
                                  "duplicate_disk", "missing_node", "duplicate_node", "extra_node",
-                                 "unsafe_run", "unsafe_site", "missing_plugin", "missing_protected_identity",
-                                 "ambiguous_protected_disks", "protected_hint_operator"])
+                                 "unsafe_run", "unsafe_site", "missing_plugin"])
 def test_invalid_preparation_creates_no_bundle(wipe_source, case):
     root, _, evidence, collection = wipe_source
     names, run, site = NAMES, WIPE, "test01"
@@ -122,18 +119,6 @@ def test_invalid_preparation_creates_no_bundle(wipe_source, case):
             raw["inventory"]["system_vendor"]["serial_number"] = ""
         else:
             raw["inventory"]["disks"].append(dict(raw["inventory"]["disks"][0]))
-        path.write_text(json.dumps(raw))
-        refresh_receipt(evidence)
-    elif case in ("missing_protected_identity", "ambiguous_protected_disks", "protected_hint_operator"):
-        path = evidence / NAMES[0] / "inventory-raw.json"
-        raw = json.loads(path.read_text())
-        disks = raw["inventory"]["disks"]
-        if case == "missing_protected_identity":
-            disks[1]["serial"] = ""
-        elif case == "ambiguous_protected_disks":
-            disks[2]["wwn"] = disks[1]["wwn"]
-        else:
-            disks[1]["serial"] = "<or> target <or> data"
         path.write_text(json.dumps(raw))
         refresh_receipt(evidence)
     elif case == "missing_node":
@@ -260,3 +245,34 @@ def test_sealed_runtime_changes_are_rejected(wipe_source, case):
     path.write_bytes(path.read_bytes() + b"\n# changed\n")
     with pytest.raises(ValueError):
         wipe.verify(wipe_source[0], "2-8-5-200", "test01", bundle)
+
+
+def test_old_installation_volume_preparation_cannot_authorize_all_disks(wipe_source):
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    path = bundle / "plan.yml"
+    value = gate.read_yaml(path)
+    value["fleet_native_disk_clean_plan"].update(schema_version=2, operation=wipe.state.LEGACY_OPERATION)
+    write(path, value)
+    with pytest.raises(ValueError, match="fresh all-disk"):
+        wipe.authorize(wipe_source[0], "2-8-5-200", "test01", bundle, WIPE, NAMES, start=True)
+    assert not (wipe_source[0] / "output/2-8-5-200/test01/reports/wipe").exists()
+
+
+def test_historical_data_disk_serials_do_not_become_exclusion_hints(wipe_source):
+    path = wipe_source[2] / NAMES[0] / "inventory-raw.json"
+    raw = json.loads(path.read_text())
+    raw["inventory"]["disks"][1]["serial"] = None
+    raw["inventory"]["disks"][2]["wwn"] = None
+    path.write_text(json.dumps(raw))
+    refresh_receipt(wipe_source[2])
+    bundle = prepare(wipe_source)
+    plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
+    assert plan["policy"]["operator_disk_exclusions"] == []
+
+
+def test_retired_make_command_cannot_silently_widen_scope(wipe_source):
+    root = wipe_source[0]
+    shutil.copyfile(ROOT / "Makefile", root / "Makefile")
+    result = subprocess.run(["make", "wipe-fleet-install-disks"], cwd=root, capture_output=True, text=True, timeout=10)
+    assert result.returncode != 0
+    assert "fresh all-disk preparation" in result.stdout

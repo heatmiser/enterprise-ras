@@ -19,42 +19,66 @@ results = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(results)
 
 
-def terminal(source, status="SUCCEEDED"):
+def terminal(source, status="SUCCEEDED", legacy=False):
     root = source[0]
     bundle = seal_bundle(source, prepare(source))
     plan = state.read(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
+    if legacy:
+        plan.update(schema_version=2, operation=state.LEGACY_OPERATION)
+        plan.pop("scope")
+        state.write(bundle / "plan.yml", {"fleet_native_disk_clean_plan": plan})
+        prepared = state.read(bundle / "prepared.yaml")
+        prepared.update(schema_version=2, operation=state.LEGACY_OPERATION, sha256=wipe.bundle_hashes(bundle))
+        prepared.pop("scope")
+        state.write(bundle / "prepared.yaml", prepared)
     base = state.site_root(root, "2-8-5-200", "test01")
-    with state.Lease(base):
-        state.begin(base, plan, state.digest(bundle / "prepared.yaml"))
     folder = state.evidence_root(base, WIPE)
+    with state.Lease(base):
+        if legacy:
+            # Model an already started historical run; new execution rejects this operation.
+            intent = {"schema_version": 1, "operation": state.LEGACY_OPERATION, "run_id": WIPE,
+                      "inspection_run_id": RUN, "node_names": sorted(NAMES),
+                      "preparation_sha256": state.fingerprint(plan),
+                      "prepared_sha256": state.digest(bundle / "prepared.yaml"),
+                      "manifest_sha256": plan["manifest_sha256"], "status": "STARTED"}
+            state.write(folder / "execution-intent.yaml", intent)
+            state.write(base / "ocp/cleaning-registry.yaml", {"schema_version": 1, "runs": {
+                WIPE: {"intent_sha256": state.digest(folder / "execution-intent.yaml")}}})
+        else:
+            state.begin(base, plan, state.digest(bundle / "prepared.yaml"))
     runtime = {"run_id": WIPE, "status": "removed", "cleanup_status": "complete",
                "runtime_retained": False, "lock_owned": False,
-               "uuids": {name: f"00000000-0000-4000-8000-{index + 1:012d}" for index, name in enumerate(NAMES)},
-               "agent_endpoints": {name: f"http://192.0.2.{index + 1}:9999" for index, name in enumerate(NAMES)},
-               "agent_metadata": {"version": "11.6.fixture"},
-               "native_extension": {"source_sha256": {k: "c" * 64 for k in (
-                   "rhvp_ironic_native_disk_clean.py", "fleet_native_disk_clean_scope.py", "runtime_diagnostics.py")}}}
-    request = {"preparation": plan, "authorization": {"action": "erase_devices_metadata", "run_id": WIPE,
-        "node_names": sorted(NAMES), "preparation_sha256": state.fingerprint(plan), "node_uuids": runtime["uuids"],
-        "agent_endpoints": runtime["agent_endpoints"], "agent_version": runtime["agent_metadata"]["version"],
-        "conductor_sha256": "c" * 64, "scope_validator_sha256": "c" * 64, "redactor_sha256": "c" * 64}}
+               "uuids": {name: f"00000000-0000-4000-8000-{index + 1:012d}" for index, name in enumerate(NAMES)}}
+    authority = {"action": "erase_devices_metadata", "scope": state.SCOPE, "run_id": WIPE,
+                 "node_names": sorted(NAMES), "preparation_sha256": state.fingerprint(plan),
+                 "node_uuids": runtime["uuids"]}
+    if legacy:
+        runtime.update(agent_endpoints={name: f"http://192.0.2.{i+1}:9999" for i, name in enumerate(NAMES)},
+                       agent_metadata={"version": "11.6.fixture"}, native_extension={"source_sha256": {
+                           k: "c" * 64 for k in ("rhvp_ironic_native_disk_clean.py", "fleet_native_disk_clean_scope.py", "runtime_diagnostics.py")}})
+        authority.pop("scope")
+        authority.update(agent_endpoints=runtime["agent_endpoints"], agent_version="11.6.fixture",
+                         conductor_sha256="c" * 64, scope_validator_sha256="c" * 64, redactor_sha256="c" * 64)
+    request = {"preparation": plan, "authorization": authority}
     outcomes = {}
     for target in plan["authorized_nodes"]:
         name = target["name"]
-        _, raw = results.fixture()
+        _, raw = results.fixture() if legacy else results.stock_fixture()
         raw.update(name=name, uuid=runtime["uuids"][name])
-        binding = {"node": name, "uuid": raw["uuid"], "request_sha256": state.fingerprint(request),
-                   "preparation_sha256": state.fingerprint(plan)}
-        info = raw["driver_internal_info"]
-        info["rhvp_native_disk_clean_boot"].update(binding)
-        record = info["rhvp_native_disk_clean"]
-        record.update(binding, run_id=WIPE, inspection_run_id=RUN)
-        record["scope"].update(node=name, node_plan_sha256=state.fingerprint(target), host_identity=target["host_identity"])
+        if legacy:
+            binding = {"node": name, "uuid": raw["uuid"], "request_sha256": state.fingerprint(request),
+                       "preparation_sha256": state.fingerprint(plan)}
+            raw["driver_internal_info"]["rhvp_native_disk_clean_boot"].update(binding)
+            record = raw["driver_internal_info"]["rhvp_native_disk_clean"]
+            record.update(binding, run_id=WIPE, inspection_run_id=RUN)
+            record["scope"].update(node=name, node_plan_sha256=state.fingerprint(target), host_identity=target["host_identity"])
         if status == "FAILED" and name == NAMES[0]:
-            raw["provision_state"] = "clean failed"
-            record.update(phase="NATIVE_FAILED", native_result_succeeded=False)
-            record["command_outcome"]["command_status"] = "FAILED"
-        outcome = results.contract.fleet_native_disk_clean_result(raw, request, name, raw["uuid"], True)
+            raw.update(provision_state="clean failed", clean_step={}, last_error="native metadata cleaning failed")
+            if legacy:
+                record.update(phase="NATIVE_FAILED", native_result_succeeded=False)
+                record["command_outcome"]["command_status"] = "FAILED"
+        outcome = results.contract.fleet_native_disk_clean_result(raw, request, name, raw["uuid"], True,
+            submission={"attempts": 1, "accepted": True, "http_status": 202})
         outcome["cleanup"] = {"verified": True, "power_state": "Off", "media_detached": True}
         outcomes[name] = outcome
         state.write(folder / name / "outcome.yaml", outcome)
@@ -112,9 +136,9 @@ def test_incomplete_changed_or_unsafe_evidence_blocks_progression(wipe_source, c
         if case == "retained_runtime":
             value["runtime_retained"] = True
         elif case == "scope":
-            value["scope"]["skip_block_devices"] = []
+            value["scope"] = "installation_volume"
         elif case == "command":
-            value["command"]["command_id"] = "00000000-0000-4000-8000-000000000099"
+            value["submission"]["accepted"] = False
         else:
             value["cleanup"]["verified"] = False
         state.write(path, value)
@@ -154,3 +178,22 @@ def test_kernel_lease_survives_recursive_make_and_blocks_competitor(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     with state.Lease(base):
         state.check(base)
+
+
+@pytest.mark.parametrize("status", ["SUCCEEDED", "FAILED"])
+def test_historical_installation_volume_receipts_remain_readable(wipe_source, status):
+    base, folder, _ = terminal(wipe_source, status, legacy=True)
+    if status == "FAILED":
+        state.disposition(base, WIPE, NAMES, "Historical cleanup verified; continue")
+    state.check(base)
+    assert state.read(folder / "receipt.yaml")["operation"] == state.LEGACY_OPERATION
+
+
+def test_begin_rejects_old_scope_even_under_site_lease(wipe_source):
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    plan = state.read(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
+    plan.update(schema_version=2, operation=state.LEGACY_OPERATION)
+    base = state.site_root(wipe_source[0], "2-8-5-200", "test01")
+    with state.Lease(base), pytest.raises(ValueError, match="fresh all-disk"):
+        state.begin(base, plan, state.digest(bundle / "prepared.yaml"))
+    assert not (base / "reports/wipe").exists()

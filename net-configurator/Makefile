@@ -17,7 +17,7 @@ SHELL := /bin/bash
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
         inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
-        wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-install-disks _generate-ocp-iso
+        wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -721,7 +721,7 @@ prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared 
 		-i "$(FLEET_PREP_DIR)/hosts.yml" -e "@$(FLEET_PREP_DIR)/plan.yml" \
 		"$${VAULT_ARGS[@]}"
 
-prepare-fleet-wipe:  ## Seal installation-volume allowlist from eligible inspection; no boot or disk writes
+prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks on selected nodes; no boot or writes
 	$(call check_arch,$@)
 	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_WIPE_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
 		echo "ERROR: FLEET_RUN_ID, fresh FLEET_WIPE_RUN_ID and explicit FLEET_NODES are required"; exit 1; \
@@ -736,12 +736,15 @@ prepare-fleet-wipe:  ## Seal installation-volume allowlist from eligible inspect
 		playbooks/prepare-fleet-wipe.yml -i "$(FLEET_WIPE_PREP_DIR)/hosts.yml" \
 		-e "@$(FLEET_WIPE_PREP_DIR)/runtime-plan.yml" "$${VAULT_ARGS[@]}"
 
-wipe-fleet-install-disks:  ## Run exact separately authorized native installation-volume metadata cleaning
+wipe-fleet-install-disks:  ## Retired installation-volume command; requires a fresh all-disk review
+	@echo "ERROR: installation-volume-only execution is retired. Review a fresh all-disk preparation and use make wipe-fleet-disks."; exit 1
+
+wipe-fleet-disks:  ## Run separately authorized native metadata cleaning of ALL eligible disks
 	$(call check_arch,$@)
 	python3 scripts/fleet-cleaning-state.py lease --root "$(CURDIR)" --arch "$(ARCH)" --site "$(SITE)" -- \
-		$(MAKE) --no-print-directory _wipe-fleet-install-disks
+		$(MAKE) --no-print-directory _wipe-fleet-disks
 
-_wipe-fleet-install-disks:
+_wipe-fleet-disks:
 	@if [ -z "$(FLEET_AUTHORIZE_WIPE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_WIPE_NODES)" ] || \
 	    [ "$(FLEET_AUTHORIZE_WIPE_RUN)" != "$(FLEET_WIPE_RUN_ID)" ]; then \
 		echo "ERROR: exact FLEET_AUTHORIZE_WIPE_RUN and FLEET_AUTHORIZE_WIPE_NODES are required"; exit 1; \

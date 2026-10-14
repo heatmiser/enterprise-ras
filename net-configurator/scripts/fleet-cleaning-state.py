@@ -15,7 +15,9 @@ import tempfile
 import yaml
 
 
-OPERATION = "native_installation_volume_metadata_cleaning"
+LEGACY_OPERATION = "native_installation_volume_metadata_cleaning"
+OPERATION = "native_all_disks_metadata_cleaning"
+SCOPE = "all_native_eligible_disks"
 
 
 def require(value, reason):
@@ -133,13 +135,15 @@ def begin(base, plan, prepared_sha):
         run = plan["run_id"]
         destination = evidence_root(base, run)
         require(plan.get("artifact_root") == str(destination) and not destination.exists(), "Existing or wrong execution destination")
-        require(plan.get("operation") == OPERATION and plan.get("execution_ready") is False, "Wrong native operation")
+        require(plan.get("schema_version") == 3 and plan.get("operation") == OPERATION
+                and plan.get("scope") == SCOPE and plan.get("policy", {}).get("operator_disk_exclusions") == []
+                and plan.get("execution_ready") is False, "Require fresh all-disk native preparation")
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         destination.mkdir(mode=0o700)
         intent = {"schema_version": 1, "operation": OPERATION, "run_id": run,
                   "inspection_run_id": plan["inspection_run_id"], "node_names": sorted(n["name"] for n in plan["authorized_nodes"]),
                   "preparation_sha256": fingerprint(plan), "prepared_sha256": prepared_sha,
-                  "manifest_sha256": plan["manifest_sha256"], "status": "STARTED"}
+                  "manifest_sha256": plan["manifest_sha256"], "scope": SCOPE, "status": "STARTED"}
         write(destination / "execution-intent.yaml", intent)
         state = registry(base)
         require(run not in state["runs"], "Cleaning run already registered")
@@ -175,55 +179,92 @@ def validate_receipt(base, run, intent):
     require(runtime.get("run_id") == run and runtime.get("status") == "removed"
             and runtime.get("cleanup_status") == "complete" and runtime.get("runtime_retained") is False
             and runtime.get("lock_owned") is False and receipt.get("cleanup_verified") is True, "Cleaning runtime not safely removed")
-    expected_request = {"preparation": plan, "authorization": {
-        "action": "erase_devices_metadata", "run_id": run, "node_names": names,
-        "preparation_sha256": intent["preparation_sha256"], "node_uuids": runtime.get("uuids", {}),
-        "agent_endpoints": runtime.get("agent_endpoints", {}), "agent_version": runtime.get("agent_metadata", {}).get("version"),
-        "conductor_sha256": runtime.get("native_extension", {}).get("source_sha256", {}).get("rhvp_ironic_native_disk_clean.py"),
-        "scope_validator_sha256": runtime.get("native_extension", {}).get("source_sha256", {}).get("fleet_native_disk_clean_scope.py"),
-        "redactor_sha256": runtime.get("native_extension", {}).get("source_sha256", {}).get("runtime_diagnostics.py")}}
-    request_sha = fingerprint(expected_request)
-    successes = []
-    for name in names:
-        node = read(folder / name / "outcome.yaml")
-        require(node.get("run_id") == run and node.get("node") == name, "Wrong cleaning node")
-        if node.get("status") == "SKIPPED":
-            require(node.get("submitted") is False, "Skipped node may have started cleaning")
-        else:
-            cleanup = node.get("cleanup", {})
-            require(node.get("cleanup_safe") is True and cleanup.get("verified") is True
-                    and cleanup.get("power_state") == "Off" and cleanup.get("media_detached") is True,
-                    "Node cleanup not verified")
-        if node.get("submitted") is True:
-            require(node.get("request_sha256") == request_sha and node.get("uuid") == runtime["uuids"].get(name),
-                    "Native request identity changed")
-            boot = node.get("boot", {})
-            require(boot.get("node") == name and boot.get("uuid") == node["uuid"]
-                    and boot.get("phase") == "BOOT_AUTHORIZED" and boot.get("mutation_attempted") is False
-                    and boot.get("request_sha256") == request_sha
-                    and boot.get("preparation_sha256") == intent["preparation_sha256"], "Missing native boot binding")
-            if node.get("mutation_attempted") is True:
-                target = next(n for n in plan["authorized_nodes"] if n["name"] == name)
-                scope, command = node.get("scope", {}), node.get("command", {})
-                require(scope.get("node_plan_sha256") == fingerprint(target)
-                        and scope.get("host_identity") == target["host_identity"]
-                        and scope.get("status") == "SNAPSHOT_VERIFIED" and scope.get("target_devices")
-                        and scope.get("skip_block_devices") == [{"name": d} for d in scope.get("protected_devices", [])]
-                        and not set(scope["target_devices"]) & set(scope["protected_devices"])
-                        and command.get("request_sha256") == request_sha
-                        and command.get("preparation_sha256") == intent["preparation_sha256"]
-                        and command.get("terminal_confirmed") is True and command.get("dispatch_count") == 1
-                        and command.get("command_id") == node.get("command_outcome", {}).get("id")
-                        and node.get("command_outcome", {}).get("clean_step") == plan["clean_steps"][0],
-                        "Missing terminal scoped native command")
-        success = node.get("status") == "SUCCEEDED" and node.get("native_success") is True
-        if success:
-            require(node.get("final_state") == "manageable" and node.get("mutation_attempted") is True
-                    and node.get("scope", {}).get("target_devices") and node.get("command", {}).get("dispatch_count") == 1
-                    and node.get("command", {}).get("terminal_confirmed") is True
-                    and node.get("command_outcome", {}).get("command_name") == "execute_clean_step"
-                    and node["command_outcome"].get("command_status") == "SUCCEEDED", "Missing native completion")
-        successes.append(success)
+    require(plan.get("operation") == intent.get("operation"), "Cleaning operation changed")
+    if intent["operation"] == OPERATION:
+        require(plan.get("schema_version") == 3 and plan.get("scope") == SCOPE
+                and intent.get("scope") == receipt.get("scope") == SCOPE
+                and plan.get("policy", {}).get("operator_disk_exclusions") == []
+                and plan.get("clean_steps") == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}],
+                "Wrong all-disk cleaning scope")
+        expected_request = {"preparation": plan, "authorization": {
+            "action": "erase_devices_metadata", "scope": SCOPE, "run_id": run, "node_names": names,
+            "preparation_sha256": intent["preparation_sha256"], "node_uuids": runtime.get("uuids", {})}}
+        request_sha = fingerprint(expected_request)
+        successes = []
+        for name in names:
+            node = read(folder / name / "outcome.yaml")
+            require(node.get("run_id") == run and node.get("node") == name, "Wrong cleaning node")
+            if node.get("status") == "SKIPPED":
+                require(node.get("submitted") is False, "Skipped node may have started cleaning")
+            else:
+                cleanup = node.get("cleanup", {})
+                require(node.get("cleanup_safe") is True and cleanup.get("verified") is True
+                        and cleanup.get("power_state") == "Off" and cleanup.get("media_detached") is True,
+                        "Node cleanup not verified")
+                require(node.get("scope") == SCOPE and node.get("request_sha256") == request_sha
+                        and node.get("uuid") == runtime.get("uuids", {}).get(name), "Native request identity changed")
+                if node.get("submitted") is True:
+                    require(node.get("submission") == {"attempts": 1, "accepted": True, "http_status": 202}
+                            and node.get("native_step") == plan["clean_steps"][0]
+                            and node.get("clean_step_present") is False
+                            and node.get("final_state") in ("manageable", "clean failed"), "Missing native terminal result")
+            success = node.get("status") == "SUCCEEDED" and node.get("native_success") is True
+            if success:
+                require(node.get("submitted") is True and node.get("final_state") == "manageable"
+                        and not node.get("last_error") and node.get("maintenance") is False
+                        and node.get("target_provision_state") in (None, "manageable"), "Missing native completion")
+            successes.append(success)
+    else:
+        require(intent["operation"] == LEGACY_OPERATION, "Unknown cleaning operation")
+        expected_request = {"preparation": plan, "authorization": {
+            "action": "erase_devices_metadata", "run_id": run, "node_names": names,
+            "preparation_sha256": intent["preparation_sha256"], "node_uuids": runtime.get("uuids", {}),
+            "agent_endpoints": runtime.get("agent_endpoints", {}), "agent_version": runtime.get("agent_metadata", {}).get("version"),
+            "conductor_sha256": runtime.get("native_extension", {}).get("source_sha256", {}).get("rhvp_ironic_native_disk_clean.py"),
+            "scope_validator_sha256": runtime.get("native_extension", {}).get("source_sha256", {}).get("fleet_native_disk_clean_scope.py"),
+            "redactor_sha256": runtime.get("native_extension", {}).get("source_sha256", {}).get("runtime_diagnostics.py")}}
+        request_sha = fingerprint(expected_request)
+        successes = []
+        for name in names:
+            node = read(folder / name / "outcome.yaml")
+            require(node.get("run_id") == run and node.get("node") == name, "Wrong cleaning node")
+            if node.get("status") == "SKIPPED":
+                require(node.get("submitted") is False, "Skipped node may have started cleaning")
+            else:
+                cleanup = node.get("cleanup", {})
+                require(node.get("cleanup_safe") is True and cleanup.get("verified") is True
+                        and cleanup.get("power_state") == "Off" and cleanup.get("media_detached") is True,
+                        "Node cleanup not verified")
+            if node.get("submitted") is True:
+                require(node.get("request_sha256") == request_sha and node.get("uuid") == runtime["uuids"].get(name),
+                        "Native request identity changed")
+                boot = node.get("boot", {})
+                require(boot.get("node") == name and boot.get("uuid") == node["uuid"]
+                        and boot.get("phase") == "BOOT_AUTHORIZED" and boot.get("mutation_attempted") is False
+                        and boot.get("request_sha256") == request_sha
+                        and boot.get("preparation_sha256") == intent["preparation_sha256"], "Missing native boot binding")
+                if node.get("mutation_attempted") is True:
+                    target = next(n for n in plan["authorized_nodes"] if n["name"] == name)
+                    scope, command = node.get("scope", {}), node.get("command", {})
+                    require(scope.get("node_plan_sha256") == fingerprint(target)
+                            and scope.get("host_identity") == target["host_identity"]
+                            and scope.get("status") == "SNAPSHOT_VERIFIED" and scope.get("target_devices")
+                            and scope.get("skip_block_devices") == [{"name": d} for d in scope.get("protected_devices", [])]
+                            and not set(scope["target_devices"]) & set(scope["protected_devices"])
+                            and command.get("request_sha256") == request_sha
+                            and command.get("preparation_sha256") == intent["preparation_sha256"]
+                            and command.get("terminal_confirmed") is True and command.get("dispatch_count") == 1
+                            and command.get("command_id") == node.get("command_outcome", {}).get("id")
+                            and node.get("command_outcome", {}).get("clean_step") == plan["clean_steps"][0],
+                            "Missing terminal scoped native command")
+            success = node.get("status") == "SUCCEEDED" and node.get("native_success") is True
+            if success:
+                require(node.get("final_state") == "manageable" and node.get("mutation_attempted") is True
+                        and node.get("scope", {}).get("target_devices") and node.get("command", {}).get("dispatch_count") == 1
+                        and node.get("command", {}).get("terminal_confirmed") is True
+                        and node.get("command_outcome", {}).get("command_name") == "execute_clean_step"
+                        and node["command_outcome"].get("command_status") == "SUCCEEDED", "Missing native completion")
+            successes.append(success)
     if receipt.get("status") == "SUCCEEDED":
         require(all(successes) and receipt.get("native_completion_verified") is True, "False successful receipt")
     else:
@@ -241,7 +282,7 @@ def check(base):
         folder = evidence_root(base, run)
         require(digest(folder / "execution-intent.yaml") == entry.get("intent_sha256"), "Cleaning intent changed")
         intent = read(folder / "execution-intent.yaml")
-        require(intent.get("run_id") == run and intent.get("operation") == OPERATION, "Wrong cleaning intent")
+        require(intent.get("run_id") == run and intent.get("operation") in (OPERATION, LEGACY_OPERATION), "Wrong cleaning intent")
         receipt = validate_receipt(base, run, intent)
         if receipt["status"] == "FAILED":
             disposition = read(folder / "disposition.yaml")
