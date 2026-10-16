@@ -49,7 +49,7 @@ subsequent separately reviewed phases. The workbook OEM selects the subsequent b
 one-time virtual-media override before power-on; completion cleanup ejects media
 without powering off the installed cluster.
 
-## Boot handoff under development
+## Boot, monitoring and completion cleanup
 
 After successful serving, `make prepare-ocp-boot` derives the selected nodes from
 that same inspected fleet and reads the successful attempt through the retained
@@ -58,10 +58,9 @@ it does not restart serving, contact a BMC, regenerate media, inspect, or clean.
 Existing serving preparations remain valid because boot implementation hashes are
 bound separately. No new node list or run ID is needed.
 
-The planned operator entry point is `make boot-ocp-nodes` with one explicit
-`FLEET_AUTHORIZE_BOOT_RUN` matching `FLEET_RUN_ID`. **Execution remains disabled
-until installer monitoring and completion cleanup are implemented.** Reviewing
-boot preparation is not physical authorization.
+The operator entry point is `make boot-ocp-nodes` with one explicit
+`FLEET_AUTHORIZE_BOOT_RUN` matching `FLEET_RUN_ID`. It boots the fleet, monitors native installer completion and performs completion-only cleanup.
+Reviewing boot preparation is not physical authorization.
 
 The workbook `ocp_oem` setting selects a boot profile, sealed independently of the
 serving plan. Currently `dell` selects OpenManage virtual media, UEFI/CD/Once,
@@ -91,5 +90,31 @@ automatically by the driver.
 
 `BOOTED` means the reviewed media and one-time override were verified before
 power-on and the system was observed On. It does not prove ISO startup or
-OpenShift installation completion. Installer monitoring and completion-gated
-media/runtime cleanup remain the next phase; operator execution stays disabled.
+OpenShift installation completion. The pinned installer EE runs native `agent wait-for bootstrap-complete` and
+`agent wait-for install-complete`. Default outer deadlines are 60 and 90 minutes;
+the installer has no timeout flag. Each wait uses a uniquely named temporary
+container; timeout removes only that waiter, retaining ISO-serving resources.
+
+Monitoring copies sealed installer assets into `boot/installer/`, excluding the
+ISO. The original stage, auth and installer state remain unchanged. Private
+bootstrap/install logs and a bounded ring of API readiness, node and cluster
+operator snapshots are retained beside `runtime.yaml`. These files may contain
+credentials or sensitive cluster information; do not publish the report tree.
+
+After native install completion, cleanup verifies every node remains powered On,
+disables the temporary override without resetting or changing persistent boot
+order, ejects only the optical device and ISO recorded during boot, and verifies
+detachment. It archives bounded redacted service logs, removes owned services,
+secrets, volume and runtime firewall rules, verifies absence and releases ownership.
+`SUCCEEDED` requires installation completion and verified cleanup.
+
+For a failed installer wait after all selected nodes were booted:
+
+    make resume-ocp-install FLEET_AUTHORIZE_BOOT_RUN=<inspection-run-id>
+
+Resume revalidates the same handoff and serving owner. It never attaches media or
+submits power actions, and skips native wait phases already completed. An existing
+waiter or observation claim prevents concurrent observation. Partial boot and
+interrupted shared teardown require reviewed recovery instead of automatic replay.
+Original auth remains private; installed nodes are never powered off by completion
+cleanup. Mixed-OEM fleets remain a follow-up.

@@ -186,7 +186,7 @@ OEM_BOOT_PROFILES = {
 def boot_hashes(collection):
     paths = [collection / "playbooks/install_abi.yml"]
     paths.extend(sorted((collection / "roles/abi_install_driver").rglob("*.yml")))
-    require(len(paths) == 7, "Incomplete ABI boot driver packaging")
+    require(len(paths) == 9, "Incomplete ABI installation driver packaging")
     return {str(path.relative_to(collection)): digest(path) for path in paths}
 
 
@@ -233,7 +233,8 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
             "serving_sha256": digest(attempt / "runtime.yaml"), "runtime_lock": str(lock),
             "node_names": serving["node_names"], "nodes": sorted(nodes, key=lambda node: node["name"]),
             "profile": profile, "automated_clean": False, "physical_authority": False,
-            "workflow_ready": False, "collection_sha256": boot_hashes(collection),
+            "workflow_ready": True, "collection_sha256": boot_hashes(collection),
+            "installer_dir": str(Path(serving["iso_path"]).parent),
             "artifact_root": str(Path(serving["reports_dir"]).parent / "boot")}
     target = state.safe_path(bundle / "boot")
     require(not target.exists(), "Boot preparation exists; verify it instead of overwriting")
@@ -246,7 +247,8 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
               "Virtual media boot ONCE before power-on; persistent BIOS boot order is unchanged.",
               "No Ironic enrollment, provisioning transitions, inspection or cleaning.",
               "Boot authority: none. No hardware was contacted by preparation.",
-              "EXECUTION DISABLED until installer monitoring and completion cleanup are ready."]
+              "Includes bounded installer monitoring and completion-only media/runtime cleanup.",
+              "Failures retain runtime/evidence; resume observation never repeats node boot."]
     (target / "review.txt").write_text("\n".join(review) + "\n")
     (target / "review.txt").chmod(0o600)
     return target
@@ -270,7 +272,7 @@ def verify_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
     return bundle / "boot", plan
 
 
-def boot(root, arch, site, run_id, collection, lease, authorize_run):
+def boot(root, arch, site, run_id, collection, lease, authorize_run, resume=False):
     bundle, plan = verify_boot(root, arch, site, run_id, collection)
     require(authorize_run == run_id, "Explicit FLEET_AUTHORIZE_BOOT_RUN must match the inspected run")
     require(plan["workflow_ready"] is True,
@@ -278,12 +280,20 @@ def boot(root, arch, site, run_id, collection, lease, authorize_run):
     secrets = state.safe_path(collection / "inventories" / site / "secrets.yaml")
     require(secrets.is_file(), "Missing selected site BMC vault")
     artifact = state.safe_path(Path(plan["artifact_root"]))
-    require(not artifact.exists(), "Boot already attempted; review durable evidence before recovery")
-    artifact.mkdir(parents=True, mode=0o700)
-    state.write(artifact / "plan.yml", {"abi_boot_plan": plan})
+    if resume:
+        previous = state.read(artifact / "runtime.yaml")
+        require(previous.get("boot_complete") is True and previous.get("runtime_retained") is True
+                and not previous.get("cleanup_started", False),
+                "Resume requires completed boot and retained runtime before shared cleanup")
+        require(state.read(artifact / "plan.yml") == {"abi_boot_plan": plan}, "Executed boot plan changed")
+    else:
+        require(not artifact.exists(), "Boot already attempted; use resume-ocp-install for observation")
+        artifact.mkdir(parents=True, mode=0o700)
+        state.write(artifact / "plan.yml", {"abi_boot_plan": plan})
     command = ["ansible-playbook", str(ROOT / "playbooks/install-ocp.yml"), "-i", "localhost,",
                "-e", "@" + str(bundle / "plan.yml"), "-e", "@" + str(secrets),
-               "-e", "abi_install_driver_authorize_run=" + authorize_run]
+               "-e", "abi_install_driver_authorize_run=" + authorize_run,
+               "-e", "abi_install_driver_action=" + ("resume" if resume else "install")]
     vault = root / ".era-secrets/vault-pass"
     command += ["--vault-password-file", str(vault)] if vault.is_file() else ["--ask-vault-pass"]
     print(f"Boot evidence: {artifact}", flush=True)
@@ -294,7 +304,7 @@ def boot(root, arch, site, run_id, collection, lease, authorize_run):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "verify", "serve", "prepare-boot", "verify-boot", "boot"))
+    parser.add_argument("action", choices=("prepare", "verify", "serve", "prepare-boot", "verify-boot", "boot", "resume"))
     parser.add_argument("--root", type=Path, default=ROOT)
     for name in ("arch", "site", "run-id"):
         parser.add_argument("--" + name, required=True)
@@ -314,12 +324,13 @@ def main():
                 serve(root, args.arch, args.site, args.run_id, collection, lease)
             elif args.action == "prepare-boot":
                 target = prepare_boot(root, args.arch, args.site, args.run_id, collection)
-                print(f"Prepared boot review: {target}; execution disabled. No hardware contacted.")
+                print(f"Prepared installation review: {target}; no physical authority. No hardware contacted.")
             elif args.action == "verify-boot":
                 verify_boot(root, args.arch, args.site, args.run_id, collection)
                 print("ABI boot preparation verified; no boot authorized.")
             else:
-                boot(root, args.arch, args.site, args.run_id, collection, lease, args.authorize_run)
+                boot(root, args.arch, args.site, args.run_id, collection, lease, args.authorize_run,
+                     resume=args.action == "resume")
     except (ValueError, KeyError, TypeError, IndexError, OSError, yaml.YAMLError, subprocess.SubprocessError) as error:
         # Errors describe paths/checks, never credential-bearing candidate data.
         reason = str(error) if isinstance(error, ValueError) else type(error).__name__

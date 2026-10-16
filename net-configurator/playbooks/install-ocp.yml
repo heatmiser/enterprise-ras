@@ -28,5 +28,5 @@
       ansible.builtin.set_fact:
         abi_install_driver_plan: "{{ abi_boot_plan }}"
 
-- name: Boot through the reusable collection
+- name: Install or resume through the reusable collection
   ansible.builtin.import_playbook: rhvp.baremetal_ocp.install_abi

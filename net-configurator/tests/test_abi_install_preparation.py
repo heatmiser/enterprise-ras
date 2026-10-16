@@ -166,7 +166,8 @@ def test_boot_preparation_adopts_serving_without_mutating_it(served_install):
     assert plan['profile'] == install.OEM_BOOT_PROFILES['dell']
     assert plan['profile'] == defaults['abi_install_driver_oem_boot_profiles']['dell']
     assert plan['profile']['enabled'] == 'once' and plan['profile']['reset_type'] == 'none'
-    assert plan['automated_clean'] is False and plan['workflow_ready'] is False
+    assert plan['automated_clean'] is False and plan['workflow_ready'] is True
+    assert plan['installer_dir'] == str(Path(plan['serving_plan']['iso_path']).parent)
     assert plan['physical_authority'] is False
     assert all(node['system_id'] == 'System.Embedded.1' for node in plan['nodes'])
     assert before == {p: p.read_bytes() for p in before}
@@ -204,6 +205,7 @@ def test_operator_entrypoint_cannot_boot_before_monitoring_is_ready(served_insta
     root, collection, _, _, lock = served_install
     install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
     _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    plan['workflow_ready'] = False
     monkeypatch.setattr(install, 'verify_boot', lambda *args: (root, plan))
     monkeypatch.setattr(install.subprocess, 'run', lambda *args, **kwargs: pytest.fail('Unexpected execution'))
     with pytest.raises(ValueError, match='Explicit FLEET_AUTHORIZE_BOOT_RUN|Boot execution disabled'):
@@ -225,3 +227,51 @@ def test_boot_rejects_unimplemented_workbook_oem_before_artifacts(served_install
     with pytest.raises(ValueError, match='unavailable for workbook OEM'):
         install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
     assert not (bundle / 'boot').exists()
+
+
+def test_monitoring_implementation_drift_blocks_execution(served_install):
+    root, collection, _, _, lock = served_install
+    install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    path = collection / 'roles/abi_install_driver/tasks/monitor.yml'
+    path.write_text(path.read_text() + '\n# drift\n')
+    with pytest.raises(ValueError, match='Boot implementation changed'):
+        install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+
+
+@pytest.mark.parametrize('receipt', [
+    {'boot_complete': False, 'runtime_retained': True},
+    {'boot_complete': True, 'runtime_retained': False},
+    {'boot_complete': True, 'runtime_retained': True, 'cleanup_started': True},
+])
+def test_resume_cannot_replay_boot_or_interrupt_shared_cleanup(served_install, monkeypatch, receipt):
+    root, collection, _, _, lock = served_install
+    install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    artifact = Path(plan['artifact_root'])
+    artifact.mkdir(parents=True)
+    (artifact / 'runtime.yaml').write_text(yaml.safe_dump(receipt))
+    secrets = collection / 'inventories/test01/secrets.yaml'
+    secrets.write_text('fixture: vaulted')
+    monkeypatch.setattr(install, 'verify_boot', lambda *args: (root, plan))
+    monkeypatch.setattr(install.subprocess, 'run', lambda *a, **k: pytest.fail('Unexpected boot replay'))
+    with pytest.raises(ValueError, match='Resume requires completed boot'):
+        install.boot(root, '2-8-5-200', 'test01', RUN, collection, SimpleNamespace(fd=123), RUN, resume=True)
+
+
+def test_resume_passes_observation_action_without_replacing_original_plan(served_install, monkeypatch):
+    root, collection, _, _, lock = served_install
+    target = install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    artifact = Path(plan['artifact_root'])
+    artifact.mkdir(parents=True)
+    (artifact / 'runtime.yaml').write_text(yaml.safe_dump({'boot_complete': True, 'runtime_retained': True}))
+    (artifact / 'plan.yml').write_bytes((target / 'plan.yml').read_bytes())
+    secrets = collection / 'inventories/test01/secrets.yaml'
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.write_text('fixture: vaulted')
+    calls = []
+    monkeypatch.setattr(install, 'verify_boot', lambda *args: (root, plan))
+    monkeypatch.setattr(install.subprocess, 'run', lambda *a, **k: calls.append((a, k)) or SimpleNamespace(returncode=0))
+    install.boot(root, '2-8-5-200', 'test01', RUN, collection, SimpleNamespace(fd=123), RUN, resume=True)
+    assert 'abi_install_driver_action=resume' in calls[0][0][0]
+    assert (artifact / 'plan.yml').read_bytes() == (target / 'plan.yml').read_bytes()
