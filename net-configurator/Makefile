@@ -17,7 +17,8 @@ SHELL := /bin/bash
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
         inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
-        wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso
+        wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso \
+        prepare-ocp-install serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -822,6 +823,36 @@ inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical 
 		-e "controlled_inspection_cleanup_report_path=$$CLEANUP_REPORT" \
 		-e "controlled_inspection_collection_playbook=$$COLLECTION_PLAYBOOK" \
 		"$${VAULT_ARGS[@]}"
+
+prepare-ocp-install:  ## Bind an existing ABI ISO and inspected fleet for review; no services or boot
+	$(call check_arch,$@)
+	python3 scripts/prepare-abi-install.py prepare --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+
+serve-ocp-iso:  ## Serve the reviewed existing ABI ISO; no node enrollment, power or cleaning
+	$(call check_arch,$@)
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
+		python3 scripts/prepare-abi-install.py serve --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+
+prepare-ocp-boot:  ## Bind the running ISO server and initial fleet for boot review; no hardware calls
+	$(call check_arch,$@)
+	python3 scripts/prepare-abi-install.py prepare-boot --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+
+boot-ocp-nodes:  ## Authorized Dell boot, installation monitoring and completion-only cleanup
+	$(call check_arch,$@)
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
+		python3 scripts/prepare-abi-install.py boot --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
+		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
+
+resume-ocp-install:  ## Resume installer observation and completion cleanup without booting nodes again
+	$(call check_arch,$@)
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
+		python3 scripts/prepare-abi-install.py resume --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
+		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
 
 generate-ocp-iso:  ## Generate ABI ISO from an eligible physical inspection - requires ARCH, SITE, FLEET_RUN_ID
 	$(call check_arch,$@)

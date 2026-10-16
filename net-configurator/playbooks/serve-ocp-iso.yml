@@ -1,0 +1,36 @@
+---
+- name: Materialize the existing shared registry authfile for ABI serving
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Read the shared vaulted OpenShift pull secret
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../.era-secrets/air-secrets.yml"
+      no_log: true
+
+    - name: Require the shared pull secret
+      ansible.builtin.assert:
+        that:
+          - ocp_pull_secret | default('') | length > 0
+      no_log: true
+
+    - name: Prepare the local authfile parent
+      ansible.builtin.file:
+        path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets"
+        state: directory
+        mode: "0700"
+
+    - name: Materialize the registry authfile through the existing pattern
+      ansible.builtin.copy:
+        content: "{{ ocp_pull_secret | trim }}\n"
+        dest: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets/pull-secret.json"
+        mode: "0600"
+      no_log: true
+
+    - name: Bind the registry authfile for collection use
+      ansible.builtin.set_fact:
+        abi_install_pull_secret_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets/pull-secret.json"
+
+- name: Serve the existing ISO through the reusable collection
+  ansible.builtin.import_playbook: rhvp.baremetal_ocp.serve_abi_iso
