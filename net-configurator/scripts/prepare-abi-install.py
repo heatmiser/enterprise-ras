@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""Prepare and serve an existing ABI ISO; never enroll, boot or clean nodes."""
+"""Prepare existing ABI media and its separately authorized boot handoff."""
 
 import argparse
 import hashlib
@@ -173,13 +173,133 @@ def serve(root, arch, site, run_id, collection, lease):
     return attempt
 
 
+# Boot preparation is separate so an already running serving implementation and
+# its sealed hashes remain valid when boot orchestration is added.
+RUNTIME_LOCK = Path("/tmp/rhvp-fleet-inspection-runtime.lock")
+OEM_BOOT_PROFILES = {
+    "dell": {"method": "dell_virtual_media_once", "media_module": "dellemc.openmanage.idrac_virtual_media",
+             "boot_module": "dellemc.openmanage.idrac_boot", "power_module": "dellemc.openmanage.redfish_powerstate",
+             "mode": "uefi", "target": "cd", "enabled": "once", "reset_type": "none", "power_action": "On"},
+}
+
+
+def boot_hashes(collection):
+    paths = [collection / "playbooks/install_abi.yml"]
+    paths.extend(sorted((collection / "roles/abi_install_driver").rglob("*.yml")))
+    require(len(paths) == 7, "Incomplete ABI boot driver packaging")
+    return {str(path.relative_to(collection)): digest(path) for path in paths}
+
+
+def serving_handoff(plan, lock):
+    marker = state.safe_path(lock / "owner")
+    require(marker.is_file(), "Missing serving runtime owner")
+    attempt = state.safe_path(Path(marker.read_text().strip()))
+    require(attempt.is_absolute() and attempt.parent == Path(plan["reports_dir"])
+            and bool(re.fullmatch(r"attempt-[A-Za-z0-9_-]+", attempt.name)), "Unexpected serving owner")
+    require(gate.read_yaml(attempt / "plan.yml")["abi_install_plan"] == plan, "Serving plan changed")
+    receipt = state.read(attempt / "runtime.yaml")
+    require(receipt["schema_version"] == 1 and receipt["status"] == "SERVING"
+            and receipt["attempt"] == str(attempt)
+            and receipt["inspection_run_id"] == plan["inspection_run_id"]
+            and receipt["node_names"] == plan["node_names"]
+            and receipt["iso_sha256"] == plan["iso_sha256"]
+            and receipt["runtime_retained"] is True and receipt["ownership_confirmed"] is True
+            and receipt["lock_owned"] is True and receipt["physical_execution"] is False,
+            "Serving receipt is not eligible for adoption")
+    require(receipt["url"] == f"http://{plan['provisioning_ip']}:{plan['http_port']}/redfish/agent.x86_64.iso",
+            "Unexpected served ISO URL")
+    require(bool(re.fullmatch(r"[^\s]+@sha256:[a-f0-9]{64}", receipt["ironic_image"])),
+            "Serving image is not immutable")
+    return attempt, receipt
+
+
+def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
+    bundle, serving = verify(root, arch, site, run_id, collection)
+    require(serving["oem"] in OEM_BOOT_PROFILES, "ABI boot implementation unavailable for workbook OEM")
+    attempt, receipt = serving_handoff(serving, lock)
+    _, _, _, _, _, inspected, _ = inputs(root, arch, site, run_id)
+    nodes = []
+    for node in inspected:
+        bmc = node["bmc"]
+        system_id = bmc.get("system_id") or ("System.Embedded.1" if serving["oem"] == "dell" else "1")
+        system_id = system_id.removeprefix("/redfish/v1/Systems/").rstrip("/")
+        require(bool(re.fullmatch(r"[A-Za-z0-9_.:-]+", system_id)), "Invalid BMC system ID")
+        require(system_id == "System.Embedded.1", "Dell OpenManage virtual media requires System.Embedded.1")
+        nodes.append({"name": node["name"], "bmc_host": bmc["host"], "system_id": system_id,
+                      "verify_ca": bool(bmc.get("verify_ca", False))})
+    profile = dict(OEM_BOOT_PROFILES[serving["oem"]])
+    plan = {"schema_version": 1, "operation": "boot_existing_abi_iso", "inspection_run_id": run_id,
+            "serving_plan": serving, "serving_attempt": str(attempt), "serving_receipt": receipt,
+            "serving_sha256": digest(attempt / "runtime.yaml"), "runtime_lock": str(lock),
+            "node_names": serving["node_names"], "nodes": sorted(nodes, key=lambda node: node["name"]),
+            "profile": profile, "automated_clean": False, "physical_authority": False,
+            "workflow_ready": False, "collection_sha256": boot_hashes(collection),
+            "artifact_root": str(Path(serving["reports_dir"]).parent / "boot")}
+    target = state.safe_path(bundle / "boot")
+    require(not target.exists(), "Boot preparation exists; verify it instead of overwriting")
+    target.mkdir(mode=0o700)
+    state.write(target / "plan.yml", {"abi_boot_plan": plan})
+    state.write(target / "prepared.yaml", {"plan_sha256": state.fingerprint(plan)})
+    review = [f"ABI boot preparation: {run_id}", f"Serving owner: {attempt}", f"ISO URL: {receipt['url']}",
+              f"ISO SHA256: {serving['iso_sha256']}", "Nodes: " + ", ".join(plan["node_names"]),
+              "Workbook OEM: " + serving["oem"], "Boot profile: " + json.dumps(profile, sort_keys=True),
+              "Virtual media boot ONCE before power-on; persistent BIOS boot order is unchanged.",
+              "No Ironic enrollment, provisioning transitions, inspection or cleaning.",
+              "Boot authority: none. No hardware was contacted by preparation.",
+              "EXECUTION DISABLED until installer monitoring and completion cleanup are ready."]
+    (target / "review.txt").write_text("\n".join(review) + "\n")
+    (target / "review.txt").chmod(0o600)
+    return target
+
+
+def verify_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
+    bundle, serving = verify(root, arch, site, run_id, collection)
+    plan = state.read(bundle / "boot/plan.yml")["abi_boot_plan"]
+    require(state.read(bundle / "boot/prepared.yaml")["plan_sha256"] == state.fingerprint(plan),
+            "Boot plan changed")
+    attempt, receipt = serving_handoff(serving, lock)
+    require(plan["serving_plan"] == serving and plan["serving_attempt"] == str(attempt)
+            and plan["runtime_lock"] == str(lock) and plan["serving_receipt"] == receipt
+            and plan["serving_sha256"] == digest(attempt / "runtime.yaml"), "Serving evidence changed")
+    require(plan["collection_sha256"] == boot_hashes(collection), "Boot implementation changed")
+    require(plan["profile"] == OEM_BOOT_PROFILES.get(serving["oem"]), "Workbook OEM boot profile changed")
+    require(plan["node_names"] == serving["node_names"]
+            and [node["name"] for node in plan["nodes"]] == plan["node_names"]
+            and plan["automated_clean"] is False and plan["physical_authority"] is False,
+            "Boot membership or cleaning contract changed")
+    return bundle / "boot", plan
+
+
+def boot(root, arch, site, run_id, collection, lease, authorize_run):
+    bundle, plan = verify_boot(root, arch, site, run_id, collection)
+    require(authorize_run == run_id, "Explicit FLEET_AUTHORIZE_BOOT_RUN must match the inspected run")
+    require(plan["workflow_ready"] is True,
+            "Boot execution disabled until installer monitoring and completion cleanup are implemented")
+    secrets = state.safe_path(collection / "inventories" / site / "secrets.yaml")
+    require(secrets.is_file(), "Missing selected site BMC vault")
+    artifact = state.safe_path(Path(plan["artifact_root"]))
+    require(not artifact.exists(), "Boot already attempted; review durable evidence before recovery")
+    artifact.mkdir(parents=True, mode=0o700)
+    state.write(artifact / "plan.yml", {"abi_boot_plan": plan})
+    command = ["ansible-playbook", str(ROOT / "playbooks/install-ocp.yml"), "-i", "localhost,",
+               "-e", "@" + str(bundle / "plan.yml"), "-e", "@" + str(secrets),
+               "-e", "abi_install_driver_authorize_run=" + authorize_run]
+    vault = root / ".era-secrets/vault-pass"
+    command += ["--vault-password-file", str(vault)] if vault.is_file() else ["--ask-vault-pass"]
+    print(f"Boot evidence: {artifact}", flush=True)
+    result = subprocess.run(command, cwd=root, pass_fds=(lease.fd,))
+    require(result.returncode == 0, f"Boot incomplete; retain runtime and review {artifact}/runtime.yaml")
+    return artifact
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "verify", "serve"))
+    parser.add_argument("action", choices=("prepare", "verify", "serve", "prepare-boot", "verify-boot", "boot"))
     parser.add_argument("--root", type=Path, default=ROOT)
     for name in ("arch", "site", "run-id"):
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--collection-root", type=Path, required=True)
+    parser.add_argument("--authorize-run", default="")
     args = parser.parse_args()
     try:
         root, collection = args.root.absolute(), args.collection_root.absolute()
@@ -190,8 +310,16 @@ def main():
             elif args.action == "verify":
                 verify(root, args.arch, args.site, args.run_id, collection)
                 print("ABI serving preparation verified.")
-            else:
+            elif args.action == "serve":
                 serve(root, args.arch, args.site, args.run_id, collection, lease)
+            elif args.action == "prepare-boot":
+                target = prepare_boot(root, args.arch, args.site, args.run_id, collection)
+                print(f"Prepared boot review: {target}; execution disabled. No hardware contacted.")
+            elif args.action == "verify-boot":
+                verify_boot(root, args.arch, args.site, args.run_id, collection)
+                print("ABI boot preparation verified; no boot authorized.")
+            else:
+                boot(root, args.arch, args.site, args.run_id, collection, lease, args.authorize_run)
     except (ValueError, KeyError, TypeError, IndexError, OSError, yaml.YAMLError, subprocess.SubprocessError) as error:
         # Errors describe paths/checks, never credential-bearing candidate data.
         reason = str(error) if isinstance(error, ValueError) else type(error).__name__

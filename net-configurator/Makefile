@@ -18,7 +18,7 @@ SHELL := /bin/bash
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
         inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
         wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso \
-        prepare-ocp-install serve-ocp-iso
+        prepare-ocp-install serve-ocp-iso prepare-ocp-boot boot-ocp-nodes
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -834,6 +834,18 @@ serve-ocp-iso:  ## Serve the reviewed existing ABI ISO; no node enrollment, powe
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
 		python3 scripts/prepare-abi-install.py serve --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+
+prepare-ocp-boot:  ## Bind the running ISO server and initial fleet for boot review; no hardware calls
+	$(call check_arch,$@)
+	python3 scripts/prepare-abi-install.py prepare-boot --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+
+boot-ocp-nodes:  ## Authorized ABI boot; disabled until monitoring and completion cleanup are ready
+	$(call check_arch,$@)
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
+		python3 scripts/prepare-abi-install.py boot --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
+		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
 
 generate-ocp-iso:  ## Generate ABI ISO from an eligible physical inspection - requires ARCH, SITE, FLEET_RUN_ID
 	$(call check_arch,$@)

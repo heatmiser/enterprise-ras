@@ -45,6 +45,51 @@ Do not delete the lock or use broad Podman/firewall cleanup to force a retry.
 
 This phase does not enroll nodes, change power or media, inspect hardware, erase
 storage, or run installer monitoring. Node boot and completion-gated cleanup are
-subsequent separately reviewed phases. Native virtual-media boot may select
-persistent CD-ROM boot; installation completion must restore local-disk boot and
-eject media without powering off the installed cluster.
+subsequent separately reviewed phases. The workbook OEM selects the subsequent boot implementation. For Dell, use a
+one-time virtual-media override before power-on; completion cleanup ejects media
+without powering off the installed cluster.
+
+## Boot handoff under development
+
+After successful serving, `make prepare-ocp-boot` derives the selected nodes from
+that same inspected fleet and reads the successful attempt through the retained
+runtime lock owner. It creates a separate `ocp/install/fleet/<run>/boot/` review;
+it does not restart serving, contact a BMC, regenerate media, inspect, or clean.
+Existing serving preparations remain valid because boot implementation hashes are
+bound separately. No new node list or run ID is needed.
+
+The planned operator entry point is `make boot-ocp-nodes` with one explicit
+`FLEET_AUTHORIZE_BOOT_RUN` matching `FLEET_RUN_ID`. **Execution remains disabled
+until installer monitoring and completion cleanup are implemented.** Reviewing
+boot preparation is not physical authorization.
+
+The workbook `ocp_oem` setting selects a boot profile, sealed independently of the
+serving plan. Currently `dell` selects OpenManage virtual media, UEFI/CD/Once,
+`reset_type: none`, and a separate Redfish power-on. Unsupported OEMs are rejected
+at preparation; additional OEM/BMC profiles require their own implementation and
+verification. Dell virtual-media support in OpenManage 9.3.0 uses
+`System.Embedded.1`; another system ID is rejected explicitly.
+
+The collection adopts the running Ironic/HTTPD and private API secrets, verifies
+media, requires an empty Ironic inventory and all selected systems Off, then boots
+the exact fleet directly through its OEM profile. Ironic serves the ISO but does
+not enroll or provision these nodes. Inspection and cleaning are not requested.
+
+For each Dell node, discover the optical device from advertised media types,
+attach the exact published ISO, and verify its insertion and URL. Configure and
+read back UEFI/CD/Once while the system remains Off. Power on once, then poll
+read-only for On. `reset_type: none` prevents the boot-configuration module from
+restarting the server. The persistent BIOS boot order is unchanged; after the
+one-time override is consumed, firmware resumes its normal boot order.
+
+Each selected node's intent and boot outcome are retained under
+`reports/installation/<run>/boot/runtime.yaml`. A claim prevents silently
+re-executing a partially submitted fleet. Failures stop subsequent nodes and
+retain services, media and the serving lock for reviewed recovery, with bounded
+redacted diagnostics. An uncertain mutation response is never resubmitted
+automatically by the driver.
+
+`BOOTED` means the reviewed media and one-time override were verified before
+power-on and the system was observed On. It does not prove ISO startup or
+OpenShift installation completion. Installer monitoring and completion-gated
+media/runtime cleanup remain the next phase; operator execution stays disabled.

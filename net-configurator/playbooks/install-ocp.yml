@@ -1,0 +1,32 @@
+---
+- name: Adapt only the reviewed initial fleet credentials
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Require selected site credentials
+      ansible.builtin.assert:
+        that:
+          - bmc_credentials[item].username | default('') | length > 0
+          - bmc_credentials[item].password | default('') | length > 0
+      loop: "{{ abi_boot_plan.node_names }}"
+      no_log: true
+
+    - name: Initialize private boot credentials
+      ansible.builtin.set_fact:
+        abi_install_driver_credentials: {}
+      no_log: true
+
+    - name: Adapt selected credentials without publishing secrets
+      ansible.builtin.set_fact:
+        abi_install_driver_credentials: >-
+          {{ abi_install_driver_credentials | combine({item: bmc_credentials[item]}) }}
+      loop: "{{ abi_boot_plan.node_names }}"
+      no_log: true
+
+    - name: Bind the reviewed boot handoff
+      ansible.builtin.set_fact:
+        abi_install_driver_plan: "{{ abi_boot_plan }}"
+
+- name: Boot through the reusable collection
+  ansible.builtin.import_playbook: rhvp.baremetal_ocp.install_abi
