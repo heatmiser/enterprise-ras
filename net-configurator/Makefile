@@ -18,7 +18,7 @@ SHELL := /bin/bash
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
         inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
         wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso \
-        prepare-ocp-install serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install
+        prepare-ocp-install prepare-ocp-reinstall serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -827,6 +827,11 @@ inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical 
 prepare-ocp-install:  ## Bind an existing ABI ISO and inspected fleet for review; no services or boot
 	$(call check_arch,$@)
 	python3 scripts/prepare-abi-install.py prepare --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+
+prepare-ocp-reinstall:  ## Prepare and select a fresh installation attempt using the existing ISO; no services or boot
+	$(call check_arch,$@)
+	python3 scripts/prepare-abi-install.py prepare-repeat --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
 
 serve-ocp-iso:  ## Serve the reviewed existing ABI ISO; no node enrollment, power or cleaning

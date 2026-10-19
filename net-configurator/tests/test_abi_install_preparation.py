@@ -290,3 +290,186 @@ def test_resume_passes_observation_action_without_replacing_original_plan(served
     install.boot(root, '2-8-5-200', 'test01', RUN, collection, SimpleNamespace(fd=123), RUN, resume=True)
     assert 'abi_install_driver_action=resume' in calls[0][0][0]
     assert (artifact / 'plan.yml').read_bytes() == (target / 'plan.yml').read_bytes()
+
+
+@pytest.fixture
+def completed_install(served_install):
+    root, collection, bundle, owner, lock = served_install
+    target = install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    report = owner.parent.parent / 'boot'
+    report.mkdir()
+    (report / 'execution.claim').mkdir()
+    (report / 'plan.yml').write_bytes((target / 'plan.yml').read_bytes())
+    install.state.write(report / 'runtime.yaml', {
+        'status': 'SUCCEEDED', 'inspection_run_id': RUN, 'serving_attempt': str(owner),
+        'runtime_retained': False, 'cleanup_status': 'complete', 'boot_complete': True})
+    (lock / 'owner').unlink()
+    lock.rmdir()
+    return root, collection, bundle, owner, lock
+
+
+def test_repeat_selects_fresh_paths_and_preserves_iso_and_old_evidence(completed_install):
+    root, collection, original, owner, lock = completed_install
+    before = {p: p.read_bytes() for p in root.rglob('*') if p.is_file()}
+    fresh = install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    bundle, plan = install.verify(root, '2-8-5-200', 'test01', RUN, collection)
+    old = yaml.safe_load((original / 'plan.yml').read_text())['abi_install_plan']
+    assert bundle == fresh and fresh.parent == original / 'attempts'
+    assert plan['inspection_run_id'] == RUN and plan['installation_attempt_id'] == fresh.name
+    assert plan['iso_path'] == old['iso_path'] and plan['source_sha256'] == old['source_sha256']
+    assert Path(plan['reports_dir']) == owner.parent.parent / 'attempts' / fresh.name / 'serving'
+    assert not Path(plan['reports_dir']).exists() and not (fresh / 'media').exists()
+    assert before == {p: p.read_bytes() for p in before}
+    assert 'PRIVATE_FIXTURE' not in (fresh / 'review.txt').read_text()
+    reference = install.state.read(original / 'current-attempt.yaml')
+    assert reference['installation_attempt_id'] == fresh.name
+    assert reference['plan_sha256'] == install.state.fingerprint(plan)
+
+
+def test_repeated_preparation_creates_distinct_attempts_without_replacing_them(completed_install):
+    root, collection, original, _, lock = completed_install
+    first = install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    before = {p: p.read_bytes() for p in first.iterdir() if p.is_file()}
+    second = install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    assert first != second
+    assert install.verify(root, '2-8-5-200', 'test01', RUN, collection)[0] == second
+    assert before == {p: p.read_bytes() for p in before}
+    assert (original / 'boot/plan.yml').is_file()
+
+
+def test_repeat_refuses_existing_runtime_lock(served_install):
+    root, collection, original, _, lock = served_install
+    with pytest.raises(ValueError, match='Serving runtime is retained'):
+        install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    assert not (original / 'attempts').exists()
+    assert not (original / 'current-attempt.yaml').exists()
+
+
+def test_repeat_refuses_unresolved_serving_even_if_lock_is_missing(served_install):
+    root, collection, original, _, lock = served_install
+    (lock / 'owner').unlink()
+    lock.rmdir()
+    with pytest.raises(ValueError, match='Previous serving runtime cleanup is unresolved'):
+        install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    assert not (original / 'current-attempt.yaml').exists()
+
+
+@pytest.mark.parametrize('change', ['retained', 'incomplete', 'missing_receipt', 'wrong_owner'])
+def test_repeat_refuses_unresolved_boot_evidence(completed_install, change):
+    root, collection, original, owner, lock = completed_install
+    path = owner.parent.parent / 'boot/runtime.yaml'
+    receipt = install.state.read(path)
+    if change == 'missing_receipt':
+        path.unlink()
+    else:
+        if change == 'retained':
+            receipt['runtime_retained'] = True
+        elif change == 'incomplete':
+            receipt['cleanup_status'] = 'failed'
+        else:
+            receipt['serving_attempt'] = str(root / 'unrelated/attempt-elsewhere')
+        install.state.write(path, receipt)
+    with pytest.raises(ValueError):
+        install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    assert not (original / 'current-attempt.yaml').exists()
+
+
+def test_failed_repeat_preparation_keeps_current_selection(completed_install, monkeypatch):
+    root, collection, original, _, lock = completed_install
+    first = install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    marker = original / 'current-attempt.yaml'
+    before = marker.read_bytes()
+
+    def fail(*args, **kwargs):
+        raise ValueError('fixture input drift')
+
+    monkeypatch.setattr(install, 'network', fail)
+    with pytest.raises(ValueError, match='fixture input drift'):
+        install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    assert marker.read_bytes() == before and (first / 'plan.yml').is_file()
+
+
+@pytest.mark.parametrize('change', ['traversal', 'empty', 'wrong_inspection', 'wrong_fingerprint', 'symlink'])
+def test_repeat_reference_cannot_redirect_to_unreviewed_paths(completed_install, change):
+    root, collection, original, _, lock = completed_install
+    fresh = install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    marker = original / 'current-attempt.yaml'
+    current = install.state.read(marker)
+    if change == 'traversal':
+        current['installation_attempt_id'] = '../elsewhere'
+    elif change == 'empty':
+        current['installation_attempt_id'] = ''
+    elif change == 'wrong_inspection':
+        current['inspection_run_id'] = '20260101T000000Z'
+    elif change == 'wrong_fingerprint':
+        current['plan_sha256'] = '0' * 64
+    else:
+        marker.unlink()
+        marker.symlink_to(fresh / 'prepared.yaml')
+    if change != 'symlink':
+        install.state.write(marker, current)
+    with pytest.raises(ValueError):
+        install.verify(root, '2-8-5-200', 'test01', RUN, collection)
+
+
+@pytest.fixture
+def served_repeat(completed_install):
+    root, collection, original, old_owner, lock = completed_install
+    fresh = install.prepare_repeat(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify(root, '2-8-5-200', 'test01', RUN, collection)
+    owner = Path(plan['reports_dir']) / 'attempt-repeat-fixture'
+    owner.mkdir(parents=True)
+    install.state.write(owner / 'plan.yml', {'abi_install_plan': plan})
+    receipt = install.state.read(old_owner / 'runtime.yaml')
+    receipt.update(attempt=str(owner), installation_attempt_id=fresh.name)
+    install.state.write(owner / 'runtime.yaml', receipt)
+    lock.mkdir()
+    (lock / 'owner').write_text(str(owner) + '\n')
+    return root, collection, original, fresh, owner, lock
+
+
+def test_repeat_boot_adopts_selected_attempt_and_original_private_assets(served_repeat):
+    root, collection, original, fresh, owner, lock = served_repeat
+    old_boot = (original / 'boot/plan.yml').read_bytes()
+    target = install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    assert target == fresh / 'boot'
+    assert plan['installation_attempt_id'] == fresh.name and plan['inspection_run_id'] == RUN
+    assert plan['serving_attempt'] == str(owner)
+    assert plan['installer_dir'] == str(root / 'output/2-8-5-200/test01/ocp-iso' / RUN)
+    assert plan['artifact_root'] == str(owner.parent.parent / 'boot')
+    assert f'FLEET_AUTHORIZE_BOOT_RUN={fresh.name}' in (target / 'review.txt').read_text()
+    assert (original / 'boot/plan.yml').read_bytes() == old_boot
+
+
+@pytest.mark.parametrize('authorization', ['', RUN, 'another-attempt'])
+def test_repeat_boot_rejects_inspection_or_previous_attempt_authorization(served_repeat, monkeypatch, authorization):
+    root, collection, _, _, _, lock = served_repeat
+    install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    monkeypatch.setattr(install, 'verify_boot', lambda *args: (root, plan))
+    monkeypatch.setattr(install.subprocess, 'run', lambda *args, **kwargs: pytest.fail('Unexpected physical execution'))
+    with pytest.raises(ValueError, match='must match the reviewed installation attempt'):
+        install.boot(root, '2-8-5-200', 'test01', RUN, collection, SimpleNamespace(fd=123), authorization)
+    assert not Path(plan['artifact_root']).exists()
+
+
+def test_repeat_serving_receipt_from_another_attempt_cannot_be_adopted(served_repeat):
+    root, collection, _, _, owner, lock = served_repeat
+    receipt = install.state.read(owner / 'runtime.yaml')
+    receipt['installation_attempt_id'] = 'another-attempt'
+    install.state.write(owner / 'runtime.yaml', receipt)
+    with pytest.raises(ValueError, match='not eligible for adoption'):
+        install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+
+
+@pytest.mark.parametrize('field', ['installation_attempt_id', 'artifact_root', 'installer_dir'])
+def test_resealed_boot_plan_cannot_change_attempt_or_private_asset_paths(served_repeat, field):
+    root, collection, _, _, _, lock = served_repeat
+    target = install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    document = install.state.read(target / 'plan.yml')
+    document['abi_boot_plan'][field] = 'another-attempt' if field == 'installation_attempt_id' else str(root / 'elsewhere')
+    install.state.write(target / 'plan.yml', document)
+    install.state.write(target / 'prepared.yaml', {'plan_sha256': install.state.fingerprint(document['abi_boot_plan'])})
+    with pytest.raises(ValueError, match='Boot installation attempt identity or paths changed'):
+        install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
