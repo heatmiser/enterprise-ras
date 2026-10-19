@@ -161,6 +161,9 @@ def test_boot_preparation_adopts_serving_without_mutating_it(served_install):
     _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
     assert target == bundle / 'boot'
     assert plan['node_names'] == plan['serving_plan']['node_names']
+    mapping = yaml.safe_load((Path(plan['installer_dir']) / 'endpoint-map.yaml').read_text())['rhcos_to_physical']
+    assert plan['expected_cluster_nodes'] == sorted(
+        hostname for hostname, physical in mapping.items() if physical in plan['node_names'])
     defaults = yaml.safe_load((COLLECTION / 'roles/abi_install_driver/defaults/main.yml').read_text())
     assert plan['serving_plan']['oem'] == 'dell'
     assert plan['profile'] == install.OEM_BOOT_PROFILES['dell']
@@ -172,6 +175,18 @@ def test_boot_preparation_adopts_serving_without_mutating_it(served_install):
     assert all(node['system_id'] == 'System.Embedded.1' for node in plan['nodes'])
     assert before == {p: p.read_bytes() for p in before}
     assert not Path(plan['artifact_root']).exists()
+
+
+def test_readiness_membership_cannot_be_removed_from_a_resealed_plan(served_install):
+    root, collection, bundle, _, lock = served_install
+    target = install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    document = yaml.safe_load((target / 'plan.yml').read_text())
+    document['abi_boot_plan']['expected_cluster_nodes'].pop()
+    (target / 'plan.yml').write_text(yaml.safe_dump(document))
+    (target / 'prepared.yaml').write_text(yaml.safe_dump({
+        'plan_sha256': install.state.fingerprint(document['abi_boot_plan'])}))
+    with pytest.raises(ValueError, match='Expected Kubernetes membership changed'):
+        install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
 
 
 @pytest.mark.parametrize('change', ['owner', 'receipt', 'implementation', 'membership', 'oem_profile'])

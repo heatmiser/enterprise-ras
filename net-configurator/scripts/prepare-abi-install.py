@@ -228,10 +228,12 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
         nodes.append({"name": node["name"], "bmc_host": bmc["host"], "system_id": system_id,
                       "verify_ca": bool(bmc.get("verify_ca", False))})
     profile = dict(OEM_BOOT_PROFILES[serving["oem"]])
+    expected_nodes = expected_cluster_nodes(serving)
     plan = {"schema_version": 1, "operation": "boot_existing_abi_iso", "inspection_run_id": run_id,
             "serving_plan": serving, "serving_attempt": str(attempt), "serving_receipt": receipt,
             "serving_sha256": digest(attempt / "runtime.yaml"), "runtime_lock": str(lock),
             "node_names": serving["node_names"], "nodes": sorted(nodes, key=lambda node: node["name"]),
+            "expected_cluster_nodes": expected_nodes,
             "profile": profile, "automated_clean": False, "physical_authority": False,
             "workflow_ready": True, "collection_sha256": boot_hashes(collection),
             "installer_dir": str(Path(serving["iso_path"]).parent),
@@ -247,11 +249,24 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
               "Virtual media boot ONCE before power-on; persistent BIOS boot order is unchanged.",
               "No Ironic enrollment, provisioning transitions, inspection or cleaning.",
               "Boot authority: none. No hardware was contacted by preparation.",
-              "Includes bounded installer monitoring and completion-only media/runtime cleanup.",
+              "Expected Ready Kubernetes nodes: " + ", ".join(expected_nodes),
+              "Native installer completion AND every expected node Ready are required before cleanup.",
+              "Complete private service logs are retained automatically; no additional CLI variables.",
               "Failures retain runtime/evidence; resume observation never repeats node boot."]
     (target / "review.txt").write_text("\n".join(review) + "\n")
     (target / "review.txt").chmod(0o600)
     return target
+
+
+def expected_cluster_nodes(serving):
+    """Resolve API node names from the sealed ISO's physical endpoint map."""
+    mapping = gate.read_yaml(Path(serving["iso_path"]).parent / "endpoint-map.yaml")["rhcos_to_physical"]
+    selected = set(serving["node_names"])
+    expected = sorted(hostname for hostname, physical in mapping.items() if physical in selected)
+    require(len(expected) == len(selected)
+            and {mapping[hostname] for hostname in expected} == selected,
+            "Endpoint map must identify every selected Kubernetes node exactly once")
+    return expected
 
 
 def verify_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
@@ -269,6 +284,8 @@ def verify_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
             and [node["name"] for node in plan["nodes"]] == plan["node_names"]
             and plan["automated_clean"] is False and plan["physical_authority"] is False,
             "Boot membership or cleaning contract changed")
+    require(plan.get("expected_cluster_nodes") == expected_cluster_nodes(serving),
+            "Expected Kubernetes membership changed; prepare a fresh boot review")
     return bundle / "boot", plan
 
 
