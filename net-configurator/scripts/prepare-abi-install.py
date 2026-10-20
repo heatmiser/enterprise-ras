@@ -3,6 +3,7 @@
 """Prepare existing ABI media and its separately authorized boot handoff."""
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import ipaddress
@@ -14,6 +15,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import uuid
 
 import yaml
 
@@ -100,7 +102,72 @@ def inputs(root, arch, site, run_id):
     return base, iso, source_hashes, image, release, inspection["authorized_nodes"], rendezvous
 
 
-def prepare(root, arch, site, run_id, collection):
+def installation_paths(base, run_id, attempt_id=""):
+    require(isinstance(run_id, str) and bool(re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", run_id)), "Invalid inspection run identity")
+    bundle = state.safe_path(base / "ocp/install/fleet" / run_id)
+    reports = state.safe_path(base / "reports/installation" / run_id)
+    if attempt_id:
+        require(isinstance(attempt_id, str) and bool(re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[a-f0-9]{8}", attempt_id)),
+                "Invalid installation attempt identity")
+        bundle = state.safe_path(bundle / "attempts" / attempt_id)
+        reports = state.safe_path(reports / "attempts" / attempt_id)
+    return bundle, reports
+
+
+def selected_installation(base, run_id):
+    original, _ = installation_paths(base, run_id)
+    marker = state.safe_path(original / "current-attempt.yaml")
+    if not marker.exists():
+        return original, ""
+    current = state.read(marker)
+    require(current.get("schema_version") == 1 and current.get("inspection_run_id") == run_id,
+            "Current installation reference changed")
+    attempt_id = current["installation_attempt_id"]
+    require(isinstance(attempt_id, str) and bool(attempt_id), "Current installation attempt identity is empty")
+    bundle, _ = installation_paths(base, run_id, attempt_id)
+    require(current["plan_sha256"] == state.read(bundle / "prepared.yaml")["plan_sha256"],
+            "Current installation reference differs from prepared plan")
+    return bundle, attempt_id
+
+
+def require_previous_cleanup(base, run_id, lock):
+    require(not state.safe_path(lock).exists(), "Serving runtime is retained; resolve it before preparing another attempt")
+    _, reports = installation_paths(base, run_id)
+    completed = set()
+    # A successful boot cleanup consumes its serving owner without rewriting the
+    # original SERVING receipt. Match that exact owner instead of treating every
+    # historical SERVING receipt as a still-active service.
+    for boot_dir in list(reports.glob("boot")) + list(reports.glob("attempts/*/boot")):
+        previous = state.read(boot_dir / "runtime.yaml")
+        require(previous.get("runtime_retained") is False and previous.get("cleanup_status") == "complete",
+                "Previous boot runtime cleanup is unresolved")
+        owner = state.safe_path(Path(previous["serving_attempt"]))
+        require(owner.parent == boot_dir.parent / "serving" and owner.name.startswith("attempt-"),
+                "Previous boot cleanup owner differs from its serving reports")
+        completed.add(str(owner))
+    for attempt in list(reports.glob("serving/attempt-*")) + list(reports.glob("attempts/*/serving/attempt-*")):
+        previous = state.read(attempt / "runtime.yaml")
+        require(str(attempt) in completed or (previous.get("runtime_retained") is False
+                and previous.get("cleanup_status") in ("complete", "not_needed")),
+                "Previous serving runtime cleanup is unresolved")
+
+
+def prepare_repeat(root, arch, site, run_id, collection, lock=None):
+    base = state.site_root(root, arch, site)
+    require_previous_cleanup(base, run_id, RUNTIME_LOCK if lock is None else lock)
+    attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+    bundle = prepare(root, arch, site, run_id, collection, attempt_id=attempt_id)
+    prepared = state.read(bundle / "prepared.yaml")
+    original, _ = installation_paths(base, run_id)
+    # CLI callers hold the site lease. Publish the reference only after all
+    # preparation writes succeed, leaving earlier attempts available for review.
+    state.write(original / "current-attempt.yaml", {
+        "schema_version": 1, "inspection_run_id": run_id,
+        "installation_attempt_id": attempt_id, "plan_sha256": prepared["plan_sha256"]})
+    return bundle
+
+
+def prepare(root, arch, site, run_id, collection, attempt_id=""):
     base, iso, hashes, ee, release, nodes, rendezvous = inputs(root, arch, site, run_id)
     state.check(base)
     selected, routes, bmc_sources = network(nodes)
@@ -109,8 +176,9 @@ def prepare(root, arch, site, run_id, collection):
     oem = gate.read_yaml(root / "input" / arch / site / "ocp-settings.yml").get("oem", "")
     require(isinstance(oem, str) and oem.lower() in ("dell", "redfish")
             and workbook_oem.lower() == oem.lower(), "Workbook/settings must agree on Dell or native Redfish OEM")
-    bundle = state.safe_path(base / "ocp/install/fleet" / run_id)
+    bundle, reports = installation_paths(base, run_id, attempt_id)
     require(not bundle.exists(), "Installation preparation exists; use verify/serve instead of overwriting it")
+    require(not reports.exists(), "Installation reports already exist; require a fresh attempt")
     plan = {"schema_version": 1, "inspection_run_id": run_id, "operation": "serve_existing_abi_iso",
             "iso_path": str(iso), "iso_sha256": hashes["agent.x86_64.iso"], "iso_size": iso.stat().st_size,
             "source_sha256": hashes, "installer_ee": ee, "release_image": release,
@@ -121,14 +189,17 @@ def prepare(root, arch, site, run_id, collection):
             "http_port": 6180, "api_port": 6385, "firewall_zone": "public",
             "firewall_rules": [{"source": source, "port": 6180} for source in bmc_sources],
             "bundle": str(bundle), "media_dir": str(bundle / "media"),
-            "reports_dir": str(base / "reports/installation" / run_id / "serving"),
+            "reports_dir": str(reports / "serving"),
             "collection_root": str(collection), "collection_sha256": collection_hashes(collection),
             "physical_authority": False}
+    if attempt_id:
+        plan["installation_attempt_id"] = attempt_id
     require(hashes == inputs(root, arch, site, run_id)[2], "ISO inputs changed during preparation")
     bundle.mkdir(parents=True, mode=0o700)
     state.write(bundle / "plan.yml", {"abi_install_plan": plan})
     state.write(bundle / "prepared.yaml", {"plan_sha256": state.fingerprint(plan)})
-    review = [f"ABI serving preparation: {run_id}", f"ISO: {iso}", f"SHA256: {plan['iso_sha256']}",
+    review = [f"ABI serving preparation: {attempt_id or run_id}", f"Inspection source: {run_id}",
+              f"ISO: {iso}", f"SHA256: {plan['iso_sha256']}",
               f"Rendezvous: {rendezvous}", "Selected initial nodes: " + ", ".join(plan["node_names"]),
               f"Release: {release}", f"Installer EE: {ee}",
               "Scope: start Ironic/HTTPD and publish the existing ISO; NO node enrollment, boot or cleaning.",
@@ -141,9 +212,13 @@ def prepare(root, arch, site, run_id, collection):
 def verify(root, arch, site, run_id, collection):
     base, _, hashes, ee, release, nodes, rendezvous = inputs(root, arch, site, run_id)
     state.check(base)
-    bundle = base / "ocp/install/fleet" / run_id
+    bundle, attempt_id = selected_installation(base, run_id)
     plan = gate.read_yaml(bundle / "plan.yml")["abi_install_plan"]
     require(gate.read_yaml(bundle / "prepared.yaml")["plan_sha256"] == state.fingerprint(plan), "Prepared plan changed")
+    _, reports = installation_paths(base, run_id, attempt_id)
+    require(plan["inspection_run_id"] == run_id and plan.get("installation_attempt_id", run_id) == (attempt_id or run_id)
+            and plan["bundle"] == str(bundle) and plan["media_dir"] == str(bundle / "media")
+            and plan["reports_dir"] == str(reports / "serving"), "Installation attempt paths or identity changed")
     require(plan["source_sha256"] == hashes and plan["installer_ee"] == ee
             and plan["release_image"] == release and plan["rendezvous_ip"] == rendezvous,
             "ISO or prepared provenance changed")
@@ -201,6 +276,8 @@ def serving_handoff(plan, lock):
     require(receipt["schema_version"] == 1 and receipt["status"] == "SERVING"
             and receipt["attempt"] == str(attempt)
             and receipt["inspection_run_id"] == plan["inspection_run_id"]
+            and receipt.get("installation_attempt_id", receipt["inspection_run_id"])
+                == plan.get("installation_attempt_id", plan["inspection_run_id"])
             and receipt["node_names"] == plan["node_names"]
             and receipt["iso_sha256"] == plan["iso_sha256"]
             and receipt["runtime_retained"] is True and receipt["ownership_confirmed"] is True
@@ -238,12 +315,16 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
             "workflow_ready": True, "collection_sha256": boot_hashes(collection),
             "installer_dir": str(Path(serving["iso_path"]).parent),
             "artifact_root": str(Path(serving["reports_dir"]).parent / "boot")}
+    if "installation_attempt_id" in serving:
+        plan["installation_attempt_id"] = serving["installation_attempt_id"]
     target = state.safe_path(bundle / "boot")
     require(not target.exists(), "Boot preparation exists; verify it instead of overwriting")
     target.mkdir(mode=0o700)
     state.write(target / "plan.yml", {"abi_boot_plan": plan})
     state.write(target / "prepared.yaml", {"plan_sha256": state.fingerprint(plan)})
-    review = [f"ABI boot preparation: {run_id}", f"Serving owner: {attempt}", f"ISO URL: {receipt['url']}",
+    identity = plan.get("installation_attempt_id", run_id)
+    review = [f"ABI boot preparation: {identity}", f"Inspection source: {run_id}",
+              f"Serving owner: {attempt}", f"ISO URL: {receipt['url']}",
               f"ISO SHA256: {serving['iso_sha256']}", "Nodes: " + ", ".join(plan["node_names"]),
               "Workbook OEM: " + serving["oem"], "Boot profile: " + json.dumps(profile, sort_keys=True),
               "Virtual media boot ONCE before power-on; persistent BIOS boot order is unchanged.",
@@ -252,7 +333,8 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
               "Expected Ready Kubernetes nodes: " + ", ".join(expected_nodes),
               "Native installer completion AND every expected node Ready are required before cleanup.",
               "Complete private service logs are retained automatically; no additional CLI variables.",
-              "Failures retain runtime/evidence; resume observation never repeats node boot."]
+              "Failures retain runtime/evidence; resume observation never repeats node boot.",
+              f"After review: make boot-ocp-nodes FLEET_AUTHORIZE_BOOT_RUN={identity}"]
     (target / "review.txt").write_text("\n".join(review) + "\n")
     (target / "review.txt").chmod(0o600)
     return target
@@ -278,6 +360,11 @@ def verify_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
     require(plan["serving_plan"] == serving and plan["serving_attempt"] == str(attempt)
             and plan["runtime_lock"] == str(lock) and plan["serving_receipt"] == receipt
             and plan["serving_sha256"] == digest(attempt / "runtime.yaml"), "Serving evidence changed")
+    require(plan["inspection_run_id"] == run_id
+            and plan.get("installation_attempt_id", run_id) == serving.get("installation_attempt_id", run_id)
+            and plan["installer_dir"] == str(Path(serving["iso_path"]).parent)
+            and plan["artifact_root"] == str(Path(serving["reports_dir"]).parent / "boot"),
+            "Boot installation attempt identity or paths changed")
     require(plan["collection_sha256"] == boot_hashes(collection), "Boot implementation changed")
     require(plan["profile"] == OEM_BOOT_PROFILES.get(serving["oem"]), "Workbook OEM boot profile changed")
     require(plan["node_names"] == serving["node_names"]
@@ -291,7 +378,8 @@ def verify_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
 
 def boot(root, arch, site, run_id, collection, lease, authorize_run, resume=False):
     bundle, plan = verify_boot(root, arch, site, run_id, collection)
-    require(authorize_run == run_id, "Explicit FLEET_AUTHORIZE_BOOT_RUN must match the inspected run")
+    require(authorize_run == plan.get("installation_attempt_id", run_id),
+            "Explicit FLEET_AUTHORIZE_BOOT_RUN must match the reviewed installation attempt")
     require(plan["workflow_ready"] is True,
             "Boot execution disabled until installer monitoring and completion cleanup are implemented")
     secrets = state.safe_path(collection / "inventories" / site / "secrets.yaml")
@@ -321,7 +409,7 @@ def boot(root, arch, site, run_id, collection, lease, authorize_run, resume=Fals
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "verify", "serve", "prepare-boot", "verify-boot", "boot", "resume"))
+    parser.add_argument("action", choices=("prepare", "prepare-repeat", "verify", "serve", "prepare-boot", "verify-boot", "boot", "resume"))
     parser.add_argument("--root", type=Path, default=ROOT)
     for name in ("arch", "site", "run-id"):
         parser.add_argument("--" + name, required=True)
@@ -334,6 +422,11 @@ def main():
             if args.action == "prepare":
                 bundle = prepare(root, args.arch, args.site, args.run_id, collection)
                 print(f"Prepared: {bundle}; review review.txt. No services or hardware touched.")
+            elif args.action == "prepare-repeat":
+                bundle = prepare_repeat(root, args.arch, args.site, args.run_id, collection)
+                print(f"Prepared repeat: {bundle}; review review.txt. No services or hardware touched.")
+                print(f"Inspection source: {args.run_id}; installation attempt: {bundle.name}")
+                print("Existing serve/prepare-boot/boot/resume commands automatically select this attempt.")
             elif args.action == "verify":
                 verify(root, args.arch, args.site, args.run_id, collection)
                 print("ABI serving preparation verified.")

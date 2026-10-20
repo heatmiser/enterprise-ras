@@ -16,6 +16,49 @@ No new run-ID or node-list exports are needed. Membership comes from the inspect
 initial ABI manifests. An unsuccessful or unresolved optional cleaning operation
 continues to block preparation/serving through the existing cleaning ledger.
 
+## Repeat installation using the existing ISO
+
+For a repeat, retain `FLEET_RUN_ID` as the original successful inspection ID. Use:
+
+    make prepare-ocp-reinstall
+
+This creates a fresh UTC/unique-suffix installation attempt ID, validates the
+existing ISO and private source assets, and prints the new preparation path for
+review. It starts no services, submits no cleaning and contacts no BMC. Native
+all-disk metadata cleaning remains separately prepared, reviewed and authorized
+through the existing wipe workflow before the repeat boot.
+
+Each repeat uses `ocp/install/fleet/<inspection-run-id>/attempts/<attempt-id>/`
+for its preparation and `reports/installation/<inspection-run-id>/attempts/<attempt-id>/`
+for serving and boot evidence. Original preparation, claims, reports, ISO and auth
+are preserved. A private `current-attempt.yaml` reference selects the new attempt
+under the site lease only after its preparation succeeds. The reference binds the
+inspection, attempt ID and prepared plan fingerprint; subsequent verification
+checks them before execution. No new attempt-ID export is needed.
+
+Preparation refuses a retained runtime lock, unresolved prior boot cleanup, or an
+unconsumed serving runtime, including when its lock is missing. A prior serving
+receipt remains immutable: its exact owner may instead be proven consumed by the
+corresponding completed boot cleanup receipt. Re-running preparation creates
+another distinct attempt, never overwrites a previous attempt or retries boot.
+
+After reviewing the new preparation, existing commands select it automatically:
+
+    make serve-ocp-iso
+    make prepare-ocp-boot
+
+The printed boot review includes the exact authorization command:
+
+    make boot-ocp-nodes FLEET_AUTHORIZE_BOOT_RUN=<installation-attempt-id>
+
+Use that same attempt ID for `resume-ocp-install` if observation must resume.
+Authorization for the original inspection or another installation attempt is
+rejected. Plans predating attempt selection retain their original paths and
+inspection-ID authorization. The collection also binds its boot/resume receipt to
+the selected attempt, separately from the unchanged inspection provenance.
+
+## Serving and boot behavior
+
 Preparation verifies physical inspection eligibility, staged eligibility and
 endpoint mapping, immutable installer/release provenance, selected membership,
 routes and reviewed BMC addresses. It records hashes for the ISO and private
@@ -96,17 +139,26 @@ the installer has no timeout flag. Each wait uses a uniquely named temporary
 container; timeout removes only that waiter, retaining ISO-serving resources.
 
 Monitoring copies sealed installer assets into `boot/installer/`, excluding the
-ISO. The original stage, auth and installer state remain unchanged. Private
+ISO. The original stage, auth and installer state remain unchanged. Complete private
 bootstrap/install logs and a bounded ring of API readiness, node and cluster
 operator snapshots are retained beside `runtime.yaml`. These files may contain
 credentials or sensitive cluster information; do not publish the report tree.
 
-After native install completion, cleanup verifies every node remains powered On,
+Native completion is followed by a bounded API gate requiring every expected
+Kubernetes node from the sealed endpoint map to be present and Ready, with no
+unexpected nodes. The default readiness deadline is 900 seconds. Missing or
+not-Ready nodes retain serving services and virtual media; `fleet-ready.json`
+records the last observation. Resume repeats this gate even when native waits
+have already completed. Output reception times in `installer-observations.jsonl`
+are observation timestamps, not reconstructed historical source event times.
+
+After native install completion and full-fleet readiness, cleanup verifies every node remains powered On,
 disables the temporary override without resetting or changing persistent boot
 order, ejects only the optical device and ISO recorded during boot, and verifies
-detachment. It archives bounded redacted service logs, removes owned services,
+detachment. It archives complete private timestamped service logs with size and
+SHA256 manifests, retains bounded redacted diagnostics, and removes owned services,
 secrets, volume and runtime firewall rules, verifies absence and releases ownership.
-`SUCCEEDED` requires installation completion and verified cleanup.
+`SUCCEEDED` requires native installation completion, expected-fleet readiness and verified cleanup.
 
 For a failed installer wait after all selected nodes were booted:
 
