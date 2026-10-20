@@ -99,8 +99,8 @@ ephemeral Ironic/customizer cleanup.
 
 ### Optional native all-disk metadata-cleaning preparation
 
-`make prepare-fleet-wipe` creates a fresh non-executable preparation from eligible
-physical inspection. Its scope is **all native eligible disks and partitions** on
+`make prepare-fleet-wipe` creates a fresh non-executable preparation from verified physical
+inspection. Its scope is **all native eligible disks and partitions** on
 the selected nodes. Review `review.txt`; installation-volume hints do not limit
 this operation and no operator disk exclusions are supplied. IPA's built-in
 safeguards remain active. Preparation does not boot nodes or wipe storage.
@@ -242,8 +242,10 @@ action.
 
 ## Optional native all-disk metadata cleaning
 
-Use the exported ARCH, SITE, FLEET_RUN_ID and FLEET_NODES from the successful
-inspection. Only the wipe run ID changes in an existing shell:
+Set ARCH, SITE and FLEET_RUN_ID to the successful source inspection. FLEET_NODES
+is an explicit nonempty selection from that inspection: one node, several nodes,
+or the complete inspected set. Cleaning does not require initial ABI membership.
+Create a fresh wipe run ID; never reuse an earlier execution or its authorization:
 
 export FLEET_WIPE_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
 
@@ -255,7 +257,7 @@ cannot execute this operation.
 
 After reviewing and authorizing that exact run and node set:
 
-make wipe-fleet-disks FLEET_AUTHORIZE_WIPE_RUN="$FLEET_WIPE_RUN_ID"
+make wipe-fleet-disks FLEET_AUTHORIZE_WIPE_RUN="$FLEET_WIPE_RUN_ID" FLEET_AUTHORIZE_WIPE_NODES="$FLEET_NODES"
 
 `FLEET_AUTHORIZE_WIPE_NODES` must contain the reviewed node set. The retired
 `wipe-fleet-install-disks` command fails rather than silently broadening its scope.
@@ -268,10 +270,46 @@ runtime/firewall cleanup. An uncertain submission or active operation retains
 runtime for review; no wrapper retry is performed.
 
 Reports remain under `reports/wipe/<run-id>/`: `outcome.yaml` per node,
-`diagnostics.yaml`, `summary.yaml`, `runtime.yaml` and `receipt.yaml`. Cleaning
+`diagnostics.yaml`, `summary.yaml`, `runtime.yaml` and `receipt.yaml`. Complete
+Ironic and HTTPD logs are written from service creation to
+`service-logs/metal3-ironic-ironic.log` and `service-logs/metal3-ironic-httpd.log`.
+These private files persist separately from the bounded redacted diagnostics
+when the owned runtime is removed. Cleaning
 remains optional; preparing alone preserves inspection-only ABI eligibility.
 Started failed or incomplete cleaning still requires successful completion or an
 explicit disposition after verified terminal failure and cleanup.
+
+### Day 2 inspection and cleaning
+
+Use `FLEET_INSPECTION_PURPOSE=node-lifecycle` with `make prepare-fleet-inspection`
+for Day 2 nodes or a node maintenance run. Set `FLEET_NODES` explicitly and use
+`FLEET_CONCURRENCY=1` for a single node. This purpose skips optional initial ABI
+candidate binding, including obsolete candidates left by an earlier installation;
+it retains workbook, inventory, identity, network, storage and release validation.
+The default purpose `auto` preserves existing initial-install preparation behavior.
+Inspection execution still requires its separate exact run/node authorization.
+
+After successful physical inspection and verified terminal cleanup, the collection
+writes `physical-readiness.yaml`. This receipt hashes the aggregate and per-node
+evidence and identifies the inspected set independently of ABI eligibility.
+Cleaning accepts an explicit subset of that set and seals only its selected nodes,
+network inputs and chassis/disk observations. Review the fresh `review.txt` before
+separately authorizing `make wipe-fleet-disks` for that exact selection.
+
+The physical readiness gate requires successful physical validation and cleanup;
+`eligible: false` alone is never sufficient. Existing verified `eligibility.yaml`
+ABI receipts remain supported under their original sealed source contract. A
+present invalid physical receipt is rejected without falling back to an ABI
+receipt. Old diagnostic runs without either valid receipt are not rewritten or
+silently promoted; prepare a separately authorized new inspection when needed.
+
+ABI ISO generation continues to require `eligibility.yaml`, exact initial fleet
+membership and matching initial manifests. A physical readiness receipt grants
+neither ABI installation eligibility nor Day 2 node installation authority. The
+existing site lock and unresolved-cleaning guards continue to apply across both
+initial-install and Day 2 operations. New node-scoped cleaning receipts retain the
+existing format; `manifest_sha256: {}` records the absence of ABI manifest binding,
+while inspection identity and the preparation fingerprint bind the cleaning run.
 
 ## OEM binding for optional native metadata cleaning
 

@@ -9,9 +9,9 @@ import sys
 
 import pytest
 
-from tests.test_fleet_wipe_adapter import wipe, wipe_source, prepare, seal_bundle, WIPE, COLLECTION
+from tests.test_fleet_wipe_adapter import wipe, wipe_source, prepare, seal_bundle, WIPE, COLLECTION, workspace
 from tests.test_abi_eligibility_handoff import eligible_run, candidate_workspace, write
-from tests.test_fleet_inspection_adapter import workspace, NAMES, RUN
+from tests.test_fleet_inspection_adapter import NAMES, RUN
 
 state = wipe.state
 spec = importlib.util.spec_from_file_location("native_result_fixture", COLLECTION / "tests/scripts/test_fleet_native_disk_clean_result.py")
@@ -19,9 +19,10 @@ results = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(results)
 
 
-def terminal(source, status="SUCCEEDED", legacy=False):
+def terminal(source, status="SUCCEEDED", legacy=False, names=None):
+    names = NAMES if names is None else names
     root = source[0]
-    bundle = seal_bundle(source, prepare(source))
+    bundle = seal_bundle(source, prepare(source, names=names))
     plan = state.read(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
     if legacy:
         plan.update(schema_version=2, operation=state.LEGACY_OPERATION)
@@ -37,7 +38,7 @@ def terminal(source, status="SUCCEEDED", legacy=False):
         if legacy:
             # Model an already started historical run; new execution rejects this operation.
             intent = {"schema_version": 1, "operation": state.LEGACY_OPERATION, "run_id": WIPE,
-                      "inspection_run_id": RUN, "node_names": sorted(NAMES),
+                      "inspection_run_id": RUN, "node_names": sorted(names),
                       "preparation_sha256": state.fingerprint(plan),
                       "prepared_sha256": state.digest(bundle / "prepared.yaml"),
                       "manifest_sha256": plan["manifest_sha256"], "status": "STARTED"}
@@ -48,12 +49,12 @@ def terminal(source, status="SUCCEEDED", legacy=False):
             state.begin(base, plan, state.digest(bundle / "prepared.yaml"))
     runtime = {"run_id": WIPE, "status": "removed", "cleanup_status": "complete",
                "runtime_retained": False, "lock_owned": False,
-               "uuids": {name: f"00000000-0000-4000-8000-{index + 1:012d}" for index, name in enumerate(NAMES)}}
+               "uuids": {name: f"00000000-0000-4000-8000-{index + 1:012d}" for index, name in enumerate(names)}}
     authority = {"action": "erase_devices_metadata", "scope": state.SCOPE, "run_id": WIPE,
-                 "node_names": sorted(NAMES), "preparation_sha256": state.fingerprint(plan),
+                 "node_names": sorted(names), "preparation_sha256": state.fingerprint(plan),
                  "node_uuids": runtime["uuids"]}
     if legacy:
-        runtime.update(agent_endpoints={name: f"http://192.0.2.{i+1}:9999" for i, name in enumerate(NAMES)},
+        runtime.update(agent_endpoints={name: f"http://192.0.2.{i+1}:9999" for i, name in enumerate(names)},
                        agent_metadata={"version": "11.6.fixture"}, native_extension={"source_sha256": {
                            k: "c" * 64 for k in ("rhvp_ironic_native_disk_clean.py", "fleet_native_disk_clean_scope.py", "runtime_diagnostics.py")}})
         authority.pop("scope")
@@ -63,7 +64,7 @@ def terminal(source, status="SUCCEEDED", legacy=False):
     outcomes = {}
     for target in plan["authorized_nodes"]:
         name = target["name"]
-        _, raw = results.fixture() if legacy else results.stock_fixture()
+        _, raw = results.fixture() if legacy else results.stock_fixture(plan["oem"])
         raw.update(name=name, uuid=runtime["uuids"][name])
         if legacy:
             binding = {"node": name, "uuid": raw["uuid"], "request_sha256": state.fingerprint(request),
@@ -85,7 +86,7 @@ def terminal(source, status="SUCCEEDED", legacy=False):
     summary = results.contract.fleet_native_disk_clean_receipt(plan, outcomes, runtime)
     state.write(folder / "summary.yaml", summary)
     state.write(folder / "runtime.yaml", runtime)
-    paths = ["summary.yaml", "runtime.yaml", "execution-intent.yaml"] + [name + "/outcome.yaml" for name in sorted(NAMES)]
+    paths = ["summary.yaml", "runtime.yaml", "execution-intent.yaml"] + [name + "/outcome.yaml" for name in sorted(names)]
     state.write(folder / "receipt.yaml", {**summary, "evidence_sha256": {p: state.digest(folder / p) for p in paths}})
     return base, folder, bundle
 
@@ -197,3 +198,24 @@ def test_begin_rejects_old_scope_even_under_site_lease(wipe_source):
     with state.Lease(base), pytest.raises(ValueError, match="fresh all-disk"):
         state.begin(base, plan, state.digest(bundle / "prepared.yaml"))
     assert not (base / "reports/wipe").exists()
+
+
+
+def test_single_node_receipt_without_abi_manifests_preserves_site_guards(wipe_source):
+    from tests.test_physical_inspection_handoff import make_physical_source
+    make_physical_source(wipe_source, NAMES[:1])
+    base, folder, _ = terminal(wipe_source, names=NAMES[:1])
+    state.check(base)
+    receipt = state.read(folder / "receipt.yaml")
+    assert receipt["node_names"] == NAMES[:1] and receipt["manifest_sha256"] == {}
+    assert receipt["native_completion_verified"] is True
+
+
+def test_failed_single_node_run_requires_its_exact_disposition(wipe_source):
+    base, _, _ = terminal(wipe_source, status="FAILED", names=NAMES[:1])
+    with pytest.raises(ValueError):
+        state.check(base)
+    with pytest.raises(ValueError):
+        state.disposition(base, WIPE, NAMES, "Wrong selection")
+    state.disposition(base, WIPE, NAMES[:1], "Operator accepts failed optional single-node cleaning")
+    state.check(base)

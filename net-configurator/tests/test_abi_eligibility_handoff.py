@@ -221,3 +221,15 @@ def test_real_iso_command_rejects_started_cleaning_without_wipe_id(eligible_run)
                             cwd=root, env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode != 0 and not capture.exists()
     assert not (site / "ocp-iso").exists()
+
+
+
+def test_physical_receipt_cannot_replace_abi_eligibility(eligible_run):
+    root, _, evidence = eligible_run
+    receipt = gate.read_yaml(evidence / "eligibility.yaml")
+    receipt.pop("manifest_sha256")
+    receipt["operation"] = "physical_node_inspection"
+    write(evidence / "physical-readiness.yaml", receipt)
+    (evidence / "eligibility.yaml").unlink()
+    with pytest.raises((ValueError, FileNotFoundError)):
+        gate.validate_handoff(root, "2-8-5-200", "test01", RUN)

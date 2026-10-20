@@ -356,3 +356,38 @@ def test_actual_adapter_guard_with_harmless_collection_entry(workspace, authoriz
     else:
         assert result.returncode != 0
         assert not marker.exists()
+
+
+@pytest.mark.parametrize("purpose", ["auto", "node-lifecycle"])
+def test_node_lifecycle_inspection_does_not_read_obsolete_abi_candidates(workspace, purpose):
+    root, collection = workspace
+    # A declared Day 2 worker remains a valid inspection target.
+    import openpyxl
+    workbook_path = root / "input/2-8-5-200/test01/2-8-5-200.xlsx"
+    workbook = openpyxl.load_workbook(workbook_path)
+    sheet = workbook["Nodes"]
+    headers = [cell.value for cell in sheet[1]]
+    for row in sheet.iter_rows(min_row=2):
+        if row[headers.index("Name")].value == NAMES[1]:
+            row[headers.index("Include in Initial ABI")].value = "No"
+    workbook.save(workbook_path)
+    workbook.close()
+    site_path = root / "output/2-8-5-200/test01/inventory/group_vars/all/main.yml"
+    site = adapter.read_yaml(site_path)
+    site["devices"][NAMES[1]]["include_in_initial_abi"] = "No"
+    site_path.write_text(yaml.safe_dump(site))
+    candidates = root / "output/2-8-5-200/test01/ocp"
+    candidates.mkdir()
+    path = candidates / "agent-config.yaml"
+    path.write_text("obsolete ABI input\n")
+    if purpose == "auto":
+        with pytest.raises((ValueError, KeyError)):
+            adapter.prepare(root, "2-8-5-200", "test01", NAMES[1:], RUN, collection, 1, purpose)
+    else:
+        bundle = adapter.prepare(root, "2-8-5-200", "test01", NAMES[1:], RUN, collection, 1, purpose)
+        document = adapter.read_yaml(bundle / "plan.yml")
+        assert document["inspect_fleet_plan"]["inspection_purpose"] == purpose
+        assert "abi_handoff" not in document["inspect_fleet_plan"]
+        assert str(path) not in document["fleet_adapter_source_sha256"]
+        assert [n["name"] for n in document["inspect_fleet_plan"]["authorized_nodes"]] == NAMES[1:]
+    assert path.read_text() == "obsolete ABI input\n"
