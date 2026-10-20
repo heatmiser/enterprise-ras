@@ -155,7 +155,7 @@ def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_so
 
 @pytest.mark.parametrize("case", ["changed_evidence", "changed_manifest", "changed_workbook",
                                  "failed_validation", "missing_host_serial",
-                                 "duplicate_disk", "missing_node", "duplicate_node", "extra_node",
+                                 "duplicate_disk", "empty_selection", "duplicate_node", "extra_node",
                                  "unsafe_run", "unsafe_site", "missing_plugin"])
 def test_invalid_preparation_creates_no_bundle(wipe_source, case):
     root, _, evidence, collection = wipe_source
@@ -182,8 +182,8 @@ def test_invalid_preparation_creates_no_bundle(wipe_source, case):
             raw["inventory"]["disks"].append(dict(raw["inventory"]["disks"][0]))
         path.write_text(json.dumps(raw))
         refresh_receipt(evidence)
-    elif case == "missing_node":
-        names = NAMES[:1]
+    elif case == "empty_selection":
+        names = []
     elif case == "duplicate_node":
         names = NAMES + [NAMES[0]]
     elif case == "extra_node":
@@ -337,3 +337,34 @@ def test_retired_make_command_cannot_silently_widen_scope(wipe_source):
     result = subprocess.run(["make", "wipe-fleet-install-disks"], cwd=root, capture_output=True, text=True, timeout=10)
     assert result.returncode != 0
     assert "fresh all-disk preparation" in result.stdout
+
+
+@pytest.mark.parametrize("physical_source", [False, True])
+def test_selected_node_preparation_and_authorization_are_exact(wipe_source, physical_source):
+    if physical_source:
+        from tests.test_physical_inspection_handoff import make_physical_source
+        make_physical_source(wipe_source, NAMES[1:])
+    bundle = seal_bundle(wipe_source, prepare(wipe_source, names=NAMES[1:]))
+    plan, runtime = wipe.verify(wipe_source[0], "2-8-5-200", "test01", bundle)
+    assert [n["name"] for n in plan["authorized_nodes"]] == NAMES[1:]
+    assert [n["name"] for n in runtime["authorized_nodes"]] == NAMES[1:]
+    assert sorted(p.stem for p in (bundle / "early-network").iterdir()) == NAMES[1:]
+    assert sorted(p.stem for p in (bundle / "nmstate").iterdir()) == NAMES[1:]
+    expected = "physical-readiness.yaml" if physical_source else "eligibility.yaml"
+    assert runtime["inspection_receipt_name"] == expected
+    if physical_source:
+        assert plan["manifest_sha256"] == {}
+    authority = wipe.authorize(wipe_source[0], "2-8-5-200", "test01", bundle, WIPE, NAMES[1:])
+    assert authority["fleet_wipe_authorization"]["node_names"] == NAMES[1:]
+    with pytest.raises(ValueError, match="Exact wipe run"):
+        wipe.authorize(wipe_source[0], "2-8-5-200", "test01", bundle, WIPE, NAMES)
+    assert not (wipe_source[0] / "output/2-8-5-200/test01/reports/wipe").exists()
+
+
+def test_selected_runtime_cannot_expand_after_preparation(wipe_source):
+    bundle = prepare(wipe_source, names=NAMES[:1])
+    value = gate.read_yaml(bundle / "runtime-plan.yml")
+    value["fleet_wipe_runtime_plan"]["authorized_nodes"] = gate.read_yaml(wipe_source[1] / "plan.yml")["inspect_fleet_plan"]["authorized_nodes"]
+    write(bundle / "runtime-plan.yml", value)
+    with pytest.raises(ValueError, match="Runtime node binding"):
+        wipe.verify_sources(wipe_source[0], "2-8-5-200", "test01", bundle)

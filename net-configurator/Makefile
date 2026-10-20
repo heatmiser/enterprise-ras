@@ -116,6 +116,7 @@ INSPECTION_CLEANUP_REPORT_PATH ?= $(patsubst %-inventory,%,$(basename $(INSPECTI
 
 # Explicit run/node selection. Preparation does not authorize physical execution.
 FLEET_CONCURRENCY ?= 2
+FLEET_INSPECTION_PURPOSE ?= auto
 FLEET_PREP_DIR = $(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/fleet/$(FLEET_RUN_ID)
 
 # Wipe preparation is render-only; its serial policy is fixed at concurrency 1.
@@ -714,6 +715,7 @@ prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared 
 	python3 scripts/prepare-fleet-inspection.py prepare \
 		--arch "$(ARCH)" --site "$(SITE)" --run-id "$(FLEET_RUN_ID)" \
 		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_CONCURRENCY)" \
+		--purpose "$(FLEET_INSPECTION_PURPOSE)" \
 		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
 	@VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \

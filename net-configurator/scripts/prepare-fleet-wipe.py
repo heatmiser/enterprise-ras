@@ -23,7 +23,7 @@ def load_module(path, name):
     return module
 
 
-gate = load_module(ROOT / "scripts/validate-abi-handoff.py", "wipe_inspection_gate")
+gate = load_module(ROOT / "scripts/validate-physical-inspection.py", "wipe_inspection_gate")
 state = load_module(ROOT / "scripts/fleet-cleaning-state.py", "wipe_state")
 
 
@@ -53,13 +53,13 @@ def declared_oem(root, arch, site):
 
 def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root):
     root = root.absolute()
-    # This existing gate checks immutable physical evidence, exact initial ABI
-    # membership, original source inputs, current manifests and terminal cleanup.
-    _, _, receipt = gate.validate_handoff(root, arch, site, inspection_run_id)
+    # Physical readiness is independent of initial ABI membership. Legacy ABI
+    # receipts remain valid sources under their original sealed input contract.
+    document, receipt, receipt_name = gate.validate_handoff(root, arch, site, inspection_run_id)
     adapter = load_module(ROOT / "scripts/prepare-fleet-inspection.py", "wipe_inspection_adapter")
     adapter.validate_run(wipe_run_id)
-    gate.require(sorted(names) == sorted(receipt["node_names"])
-                 and len(names) == len(set(names)), "Require exact inspected initial membership")
+    gate.require(names and len(names) == len(set(names))
+                 and set(names) <= set(receipt["node_names"]), "Require explicit unique inspected nodes")
     base = root / "output" / arch / site
     source = base / "reports/inspection" / inspection_run_id
     original = base / "ocp/inspection/fleet" / inspection_run_id
@@ -71,10 +71,10 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
     oem = declared_oem(root, arch, site)
     profile = builder.fleet_native_disk_clean_profile(oem)
     code_hashes = collection_hashes(collection_root.absolute())
-    document = gate.read_yaml(original / "plan.yml")
+    selected = [node for node in document["inspect_fleet_plan"]["authorized_nodes"] if node["name"] in names]
     gate.require(all(node["bmc"]["driver"] in ("idrac", "redfish") if oem == "dell"
                      else node["bmc"]["driver"] == "redfish"
-                     for node in document["inspect_fleet_plan"]["authorized_nodes"]),
+                     for node in selected),
                  "Reviewed BMC inputs do not match the OEM credential contract")
     provenance = gate.read_yaml(original / "preflight-vars.yaml")["inspection_preflight_provenance"]
     node_evidence = {}
@@ -85,19 +85,19 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
             "disk_validation": gate.read_yaml(source / name / "validation.yaml")["disk_validation"],
         }
     source_hashes = {
-        "inspection_receipt": gate.digest(source / "eligibility.yaml"),
+        "inspection_receipt": gate.digest(source / receipt_name),
         "inspection_prepared": gate.digest(original / "prepared.yaml"),
         "plan_builder": plugin_hash,
     }
     plan = builder.fleet_native_disk_clean_plan(inspection_run_id, wipe_run_id,
-        document["inspect_fleet_plan"]["authorized_nodes"], node_evidence, source_hashes, oem)
+        selected, node_evidence, source_hashes, oem)
     plan.update({"artifact_root": str(evidence_root), "inspection_artifact_root": str(source),
-                 "manifest_sha256": receipt["manifest_sha256"]})
+                 "manifest_sha256": receipt.get("manifest_sha256", {})})
     # Revalidate after projecting evidence so altered files cannot be sealed into
     # a plan during preparation. No credential-bearing candidate data is written.
-    _, _, current_receipt = gate.validate_handoff(root, arch, site, inspection_run_id)
-    gate.require(current_receipt == receipt and source_hashes == {
-        "inspection_receipt": gate.digest(source / "eligibility.yaml"),
+    current_document, current_receipt, current_name = gate.validate_handoff(root, arch, site, inspection_run_id)
+    gate.require(current_document == document and current_name == receipt_name and current_receipt == receipt and source_hashes == {
+        "inspection_receipt": gate.digest(source / receipt_name),
         "inspection_prepared": gate.digest(original / "prepared.yaml"),
         "plan_builder": gate.digest(plugin_path)}, "Preparation sources changed while reading")
     for path in (bundle, evidence_root):
@@ -106,7 +106,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.mkdir(mode=0o700)
     runtime = {"run_id": wipe_run_id, "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
-               "authorized_nodes": document["inspect_fleet_plan"]["authorized_nodes"],
+               "authorized_nodes": selected, "inspection_receipt_name": receipt_name,
                "collection_root": str(collection_root.absolute()), "collection_sha256": code_hashes,
                "source_sha256": document["fleet_adapter_source_sha256"],
                "cluster_vars": document["fleet_adapter_collection_vars"],
@@ -185,19 +185,22 @@ def verify_sources(root, arch, site, bundle):
     gate.require(plan.get("oem") == oem and runtime.get("oem") == oem
                  and plan.get("native_profile") == builder.fleet_native_disk_clean_profile(oem)
                  and runtime.get("native_profile") == plan["native_profile"], "Native OEM profile binding changed")
-    _, _, receipt = gate.validate_handoff(root, arch, site, plan["inspection_run_id"])
-    gate.require(plan["manifest_sha256"] == receipt["manifest_sha256"]
-                 and sorted(n["name"] for n in plan["authorized_nodes"]) == sorted(receipt["node_names"]), "Inspection binding changed")
+    document, receipt, receipt_name = gate.validate_handoff(root, arch, site, plan["inspection_run_id"])
+    names = [n["name"] for n in plan["authorized_nodes"]]
+    gate.require(names and len(names) == len(set(names)) and set(names) <= set(receipt["node_names"])
+                 and plan["manifest_sha256"] == receipt.get("manifest_sha256", {})
+                 and runtime.get("inspection_receipt_name", "eligibility.yaml") == receipt_name,
+                 "Inspection binding changed")
     original = root / "output" / arch / site / "ocp/inspection/fleet" / plan["inspection_run_id"]
     expected = {"inspection_receipt": gate.digest(root / "output" / arch / site / "reports/inspection" /
-                                                  plan["inspection_run_id"] / "eligibility.yaml"),
+                                                  plan["inspection_run_id"] / receipt_name),
                 "inspection_prepared": gate.digest(original / "prepared.yaml"),
                 "plan_builder": gate.digest(Path(runtime["collection_root"]) / "plugins/filter/fleet_native_disk_clean_plan.py")}
     gate.require(plan["source_sha256"] == expected, "Native preparation source changed")
     for filename, wanted in runtime["source_sha256"].items():
         gate.require(gate.digest(Path(filename)) == wanted, "Source changed after preparation")
     gate.require(collection_hashes(Path(runtime["collection_root"])) == runtime["collection_sha256"], "Executor changed")
-    original_nodes = gate.read_yaml(original / "plan.yml")["inspect_fleet_plan"]["authorized_nodes"]
+    original_nodes = [node for node in document["inspect_fleet_plan"]["authorized_nodes"] if node["name"] in names]
     gate.require(runtime["authorized_nodes"] == original_nodes and runtime["run_id"] == plan["run_id"]
                  and runtime["artifact_root"] == plan["artifact_root"], "Runtime node binding changed")
     return plan, runtime
@@ -283,7 +286,7 @@ def main():
                                       args.wipe_run_id, adapter.selection(args.nodes), start=True)))
     except (ValueError, KeyError, IndexError, OSError, TypeError, ImportError, yaml.YAMLError):
         parser.exit(1, "ERROR: Wipe preparation rejected; review physical eligibility, unchanged inputs, "
-                    "exact membership, all-disk scope, collection capability and fresh output paths.\n")
+                    "explicit inspected selection, all-disk scope, collection capability and fresh output paths.\n")
 
 
 if __name__ == "__main__":

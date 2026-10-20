@@ -138,9 +138,10 @@ def candidate_binding(base, settings, roles, site_vars, arch, endpoints, disks):
             "manifest_sha256": {path.name: fingerprint(path) for path in paths}}, paths
 
 
-def prepare(root, arch, site, names, run_id, collection_root, concurrency):
+def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpose="auto"):
     """Validate every selected node before creating a new run-specific preparation directory."""
     validate_run(run_id)
+    require(purpose in ("auto", "node-lifecycle"), "Invalid inspection purpose")
     require(all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) and value not in (".", "..")
                 for value in (arch, site)), "Invalid architecture/site")
     require(type(concurrency) is int and 0 < concurrency <= len(names), "Invalid selected-node concurrency")
@@ -237,7 +238,8 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
     require(len({(link["expected_switch"], link["expected_port"]) for link in links}) == len(links),
             "Duplicate desired host NIC switch attachment")
     base = root / "output" / arch / site
-    abi_handoff, candidate_paths = candidate_binding(base, settings, roles, site_vars, arch, endpoints, disks)
+    abi_handoff, candidate_paths = ({}, []) if purpose == "node-lifecycle" else candidate_binding(
+        base, settings, roles, site_vars, arch, endpoints, disks)
     source_files.extend(candidate_paths)
     evidence = base / "reports/inspection" / run_id
     require(not evidence.exists() and not evidence.is_symlink(), "Evidence run already exists")
@@ -255,6 +257,8 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency):
             "expected_node_count": len(nodes), "concurrency_limit": concurrency,
             "timeouts": {"manageable": 300, "inspection": 1200, "api_fetch": 30, "total_run": 3600},
             "wiremap": links, "switch_aliases": cluster.get("fleet_inspection_switch_aliases", {})}
+    if purpose == "node-lifecycle":
+        plan["inspection_purpose"] = purpose
     if abi_handoff:
         plan["abi_handoff"] = abi_handoff
     write_yaml(bundle / "plan.yml", {"inspect_fleet_plan": plan,
@@ -317,6 +321,7 @@ def main():
     for key in ("arch", "site", "nodes", "run-id", "collection-root"):
         prepare_parser.add_argument(f"--{key}", required=True)
     prepare_parser.add_argument("--concurrency", type=int, default=2)
+    prepare_parser.add_argument("--purpose", choices=("auto", "node-lifecycle"), default="auto")
     prepare_parser.add_argument("--root", type=Path, default=ROOT)
     seal_parser = commands.add_parser("seal")
     seal_parser.add_argument("--bundle", type=Path, required=True)
@@ -328,7 +333,7 @@ def main():
     try:
         if args.command == "prepare":
             print(prepare(args.root.resolve(), args.arch, args.site, selection(args.nodes), args.run_id,
-                          Path(args.collection_root).expanduser().resolve(), args.concurrency))
+                          Path(args.collection_root).expanduser().resolve(), args.concurrency, args.purpose))
         elif args.command == "seal":
             seal(args.bundle.resolve())
         else:
