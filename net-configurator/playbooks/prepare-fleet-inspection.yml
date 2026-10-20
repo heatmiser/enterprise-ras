@@ -44,6 +44,7 @@
 - name: Prepare shared release metadata using the existing single-candidate driver
   ansible.builtin.import_playbook: prepare-inspection-preflight.yml
   vars:
+    inspection_preflight_httpd_tuning: "{{ inspect_fleet_plan.httpd_tuning | default({}) }}"
     inspection_preflight_candidate: "{{ inspect_fleet_plan.authorized_nodes[0].name }}"
     inspection_preflight_expected_ocp_version: "{{ fleet_adapter_expected_version }}"
     inspection_preflight_collection_cluster_vars_path: "{{ fleet_adapter_collection_vars }}"

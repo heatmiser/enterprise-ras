@@ -54,6 +54,7 @@
       ansible.builtin.include_role:
         name: rhvp.baremetal_ocp.inspection_preflight_prepare
       vars:
+        inspection_preflight_prepare_httpd_tuning: "{{ fleet_wipe_runtime_plan.httpd_tuning | default({}) }}"
         ocp_ee_image: "{{ fleet_wipe_runtime_plan.original_provenance.ee_image }}"
         pull_secret_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets/pull-secret.json"
         inspection_preflight_prepare_candidate_name: "{{ fleet_wipe_runtime_plan.authorized_nodes[0].name }}"

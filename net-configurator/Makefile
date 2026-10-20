@@ -705,6 +705,7 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		-e "inspection_preflight_nmstate_dir=$$(dirname "$$NMSTATE")" \
 		-e "inspection_preflight_early_network_path=$$EARLY_NETWORK" \
 		-e "inspection_preflight_output_path=$$OUTPUT" \
+		-e "inspection_preflight_httpd_settings_path=$(CURDIR)/input/$(ARCH)/$(SITE)/ironic-httpd.yml" \
 		"$${VAULT_ARGS[@]}"
 
 prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared release preflight; no physical boot

@@ -170,3 +170,19 @@ waiter or observation claim prevents concurrent observation. Partial boot and
 interrupted shared teardown require reviewed recovery instead of automatic replay.
 Original auth remains private; installed nodes are never powered off by completion
 cleanup. Mixed-OEM fleets remain a follow-up.
+
+## HTTPD policy in ABI serving preparations
+
+ABI ISO serving reads `input/<arch>/<site>/ironic-httpd.yml` during preparation,
+using the same three inputs documented in [INSPECTION_PREFLIGHT.md](INSPECTION_PREFLIGHT.md#httpd-tuning-preparation-policy).
+The resolved values are sealed in `abi_install_plan.httpd_tuning`, displayed in
+`review.txt`, and passed explicitly to the Ironic deployment role. The Apache
+profile and privileged host sysctl management remain separate opt-ins.
+
+The serving entry point rejects conflicting execution inputs before starting the
+runtime. A missing policy or legacy plan defaults to disabled tuning. Changing the
+site file does not rewrite an already reviewed serving plan; prepare a fresh
+installation attempt to select different settings. Executor drift checks include
+the HTTPD tuning template. No existing ISO, installer state, credentials or boot
+authorization is changed by preparing this policy. Runtime image validation and
+host application remain separate operational steps.

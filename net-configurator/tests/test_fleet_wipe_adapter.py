@@ -282,6 +282,7 @@ def fresh_preflight(source, bundle):
             **original["inspection_preflight_provenance"],
             "callback_target_ip": candidate["devices"]["bond_ip"],
         },
+        **runtime.get("httpd_tuning", {}),
         "preflight_inspection_nodes": [candidate],
         "ironic_deploy_provisioning_ip": "192.0.2.10",
         "ironic_deploy_provisioning_interface": "eth-test",
@@ -412,3 +413,29 @@ def test_selected_preflight_rejects_wrong_callback_or_release(wipe_source, stage
     with pytest.raises(ValueError, match="Release provenance or selected callback"):
         operation(wipe_source[0], "2-8-5-200", "test01", bundle)
     assert not (wipe_source[0] / "output/2-8-5-200/test01/reports/wipe").exists()
+
+
+@pytest.mark.parametrize("manage", [False, True])
+def test_wipe_seals_new_httpd_policy_without_changing_inspection_source(wipe_source, manage):
+    root, original, _, collection = wipe_source
+    before = (original / "preflight-vars.yaml").read_bytes()
+    write(root / "input/2-8-5-200/test01/ironic-httpd.yml", {
+        "ironic_deploy_httpd_tuning": True, "ironic_deploy_httpd_manage_sysctl": manage,
+        "ironic_deploy_httpd_tuning_path": "/var/tmp/fixture-httpd"})
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    _, runtime = wipe.verify(root, "2-8-5-200", "test01", bundle)
+    assert runtime["httpd_tuning"]["ironic_deploy_httpd_manage_sysctl"] is manage
+    assert "HTTPD profile: True" in (bundle / "review.txt").read_text()
+    assert before == (original / "preflight-vars.yaml").read_bytes()
+    assert "roles/ironic_deploy/templates/ironic-tuning.conf.j2" in runtime["collection_sha256"]
+    assert "roles/ironic_deploy/tasks/prepare_httpd_tuning.yml" in runtime["collection_sha256"]
+
+
+def test_wipe_seal_rejects_httpd_policy_mismatch(wipe_source):
+    write(wipe_source[0] / "input/2-8-5-200/test01/ironic-httpd.yml", {"ironic_deploy_httpd_tuning": True})
+    bundle = prepare(wipe_source)
+    preflight = fresh_preflight(wipe_source, bundle)
+    preflight["ironic_deploy_httpd_tuning"] = False
+    write(bundle / "preflight-vars.yaml", preflight)
+    with pytest.raises(ValueError, match="HTTPD preflight settings differ"):
+        wipe.seal(wipe_source[0], "2-8-5-200", "test01", bundle)

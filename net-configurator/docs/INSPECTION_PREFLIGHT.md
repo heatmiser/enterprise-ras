@@ -331,3 +331,44 @@ API before enrollment or boot. Result validation and retained provenance use
 the same profile. Older preparations without this OEM binding require a fresh
 run ID and review. The pinned-image iDRAC contract check precedes another physical
 attempt; local mocked tests do not verify live OEM media behavior.
+
+### HTTPD tuning preparation policy
+
+Create `input/<arch>/<site>/ironic-httpd.yml` to select HTTP media tuning for new
+inspection, native cleaning and ABI ISO serving preparations. This separate input
+does not modify workbook-derived cluster settings or completed inspection evidence.
+The supported keys are:
+
+| Key | Default |
+| --- | --- |
+| `ironic_deploy_httpd_tuning` | `false` |
+| `ironic_deploy_httpd_tuning_path` | `/var/lib/ironic/httpd-tuning` |
+| `ironic_deploy_httpd_manage_sysctl` | `false` |
+
+Use YAML booleans. Set the profile to `true` to include all approved Apache tuning,
+including `EnableSendfile On`. The separately enabled sysctl option requires that
+profile and applies bastion-wide values with privilege during execution. Choose
+an absolute staging directory writable by the deployment user for rootless Podman.
+Unknown keys, string booleans and noncanonical mount paths are rejected.
+
+Preparation only reads this file. Missing file means disabled defaults; a present
+empty or malformed file is rejected. Fleet inspection records the policy under
+`inspect_fleet_plan.httpd_tuning`; cleaning records it under
+`fleet_wipe_runtime_plan.httpd_tuning`. Both render the resolved inputs into the
+sealed `preflight-vars.yaml`. Review the policy in `review.txt` and the plan before
+execution. Standalone preflight preparation receives the explicit site policy path
+from its Make target and emits the same role inputs.
+
+Execution uses the sealed snapshot. Subsequent site policy edits affect future
+preparations only; conflicting execution overrides are rejected, including attempts
+to inject enablement into legacy preparations. Legacy artifacts missing tuning
+fields default to disabled; existing source/executor drift checks still apply.
+Fresh tuning preparation can reuse valid inspection evidence without modifying its
+original release provenance. Cleaning and ABI executor hashes cover the Apache
+template, and cleaning also covers the HTTPD preparation task.
+
+This capability requires the corresponding HTTPD collection update. Source tests
+do not apply sysctls, start HTTPD or boot hardware. Validate the pinned image's
+Apache configuration/MPM and concurrent Range byte integrity before rollout.
+Record prior live/persistent sysctl values before an approved host application;
+disabling the option does not restore those values.
