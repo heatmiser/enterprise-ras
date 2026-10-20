@@ -206,10 +206,20 @@ def verify_sources(root, arch, site, bundle):
     return plan, runtime
 
 
+def validate_preflight_provenance(preflight, runtime):
+    """Retain the inspected release while binding fresh preflight to the selection."""
+    expected = {
+        **runtime["original_provenance"],
+        "callback_target_ip": runtime["authorized_nodes"][0]["devices"]["bond_ip"],
+    }
+    gate.require(preflight["inspection_preflight_provenance"] == expected,
+                 "Release provenance or selected callback changed")
+
+
 def seal(root, arch, site, bundle):
     plan, runtime = verify_sources(root, arch, site, bundle)
     preflight = gate.read_yaml(bundle / "preflight-vars.yaml")
-    gate.require(preflight["inspection_preflight_provenance"] == runtime["original_provenance"], "Release/network provenance changed")
+    validate_preflight_provenance(preflight, runtime)
     routes = gate.read_yaml(bundle / "callback-routes.yaml")
     names = sorted(n["name"] for n in plan["authorized_nodes"])
     gate.require(sorted(routes["nodes"]) == names and len(routes.get("routes", [])) == len(names),
@@ -240,8 +250,7 @@ def verify(root, arch, site, bundle):
                  and prepared.get("runtime_sealed") is True and prepared.get("execution_ready") is False
                  and prepared["run_id"] == plan["run_id"] and prepared["inspection_run_id"] == plan["inspection_run_id"]
                  and prepared["sha256"] == bundle_hashes(bundle), "Incomplete or altered preparation")
-    gate.require(gate.read_yaml(bundle / "preflight-vars.yaml")["inspection_preflight_provenance"]
-                 == runtime["original_provenance"], "Wrong runtime provenance")
+    validate_preflight_provenance(gate.read_yaml(bundle / "preflight-vars.yaml"), runtime)
     return plan, runtime
 
 

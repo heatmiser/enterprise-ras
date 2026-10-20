@@ -271,15 +271,30 @@ def test_previous_preparation_is_preserved_when_fresh_native_plan_is_created(wip
     assert bundle != previous and marker.read_bytes() == before
 
 
-def seal_bundle(source, bundle):
+def fresh_preflight(source, bundle):
+    """Model the role's selected candidate and callback, retaining release provenance."""
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
     original = gate.read_yaml(source[1] / "preflight-vars.yaml")
-    preflight = {**original, "ironic_deploy_provisioning_ip": "192.0.2.10",
-                 "ironic_deploy_provisioning_interface": "eth-test"}
+    candidate = runtime["authorized_nodes"][0]
+    preflight = {
+        **original,
+        "inspection_preflight_provenance": {
+            **original["inspection_preflight_provenance"],
+            "callback_target_ip": candidate["devices"]["bond_ip"],
+        },
+        "preflight_inspection_nodes": [candidate],
+        "ironic_deploy_provisioning_ip": "192.0.2.10",
+        "ironic_deploy_provisioning_interface": "eth-test",
+    }
     write(bundle / "preflight-vars.yaml", preflight)
     write(bundle / "callback-routes.yaml", {"nodes": [n["name"] for n in runtime["authorized_nodes"]],
         "routes": [{"item": n, "stdout": json.dumps([{"dst": n["devices"]["bond_ip"],
             "dev": "eth-test", "prefsrc": "192.0.2.10"}])} for n in runtime["authorized_nodes"]]})
+    return preflight
+
+
+def seal_bundle(source, bundle):
+    fresh_preflight(source, bundle)
     wipe.seal(source[0], "2-8-5-200", "test01", bundle)
     return bundle
 
@@ -346,6 +361,14 @@ def test_selected_node_preparation_and_authorization_are_exact(wipe_source, phys
         make_physical_source(wipe_source, NAMES[1:])
     bundle = seal_bundle(wipe_source, prepare(wipe_source, names=NAMES[1:]))
     plan, runtime = wipe.verify(wipe_source[0], "2-8-5-200", "test01", bundle)
+    preflight = gate.read_yaml(bundle / "preflight-vars.yaml")
+    selected_callback = runtime["authorized_nodes"][0]["devices"]["bond_ip"]
+    assert preflight["inspection_preflight_provenance"] == {
+        **runtime["original_provenance"], "callback_target_ip": selected_callback}
+    assert preflight["preflight_inspection_nodes"][0]["name"] == NAMES[1]
+    if not physical_source:
+        assert selected_callback != runtime["original_provenance"]["callback_target_ip"]
+    assert runtime["original_provenance"] == gate.read_yaml(wipe_source[1] / "preflight-vars.yaml")["inspection_preflight_provenance"]
     assert [n["name"] for n in plan["authorized_nodes"]] == NAMES[1:]
     assert [n["name"] for n in runtime["authorized_nodes"]] == NAMES[1:]
     assert sorted(p.stem for p in (bundle / "early-network").iterdir()) == NAMES[1:]
@@ -368,3 +391,24 @@ def test_selected_runtime_cannot_expand_after_preparation(wipe_source):
     write(bundle / "runtime-plan.yml", value)
     with pytest.raises(ValueError, match="Runtime node binding"):
         wipe.verify_sources(wipe_source[0], "2-8-5-200", "test01", bundle)
+
+
+@pytest.mark.parametrize("stage", ["seal", "verify"])
+@pytest.mark.parametrize("field", ["callback_target_ip", "release_image", "ee_image", "installer_version",
+                                    "installer_architecture", "stream_sha256", "architecture"])
+def test_selected_preflight_rejects_wrong_callback_or_release(wipe_source, stage, field):
+    bundle = prepare(wipe_source, names=NAMES[1:])
+    preflight = fresh_preflight(wipe_source, bundle)
+    if stage == "verify":
+        wipe.seal(wipe_source[0], "2-8-5-200", "test01", bundle)
+    preflight["inspection_preflight_provenance"][field] = "unexpected-value"
+    write(bundle / "preflight-vars.yaml", preflight)
+    if stage == "verify":
+        # Exercise semantic validation independently of the file checksum guard.
+        prepared = gate.read_yaml(bundle / "prepared.yaml")
+        prepared["sha256"] = wipe.bundle_hashes(bundle)
+        write(bundle / "prepared.yaml", prepared)
+    operation = wipe.seal if stage == "seal" else wipe.verify
+    with pytest.raises(ValueError, match="Release provenance or selected callback"):
+        operation(wipe_source[0], "2-8-5-200", "test01", bundle)
+    assert not (wipe_source[0] / "output/2-8-5-200/test01/reports/wipe").exists()
