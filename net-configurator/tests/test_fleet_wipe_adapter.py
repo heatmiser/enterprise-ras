@@ -439,3 +439,41 @@ def test_wipe_seal_rejects_httpd_policy_mismatch(wipe_source):
     write(bundle / "preflight-vars.yaml", preflight)
     with pytest.raises(ValueError, match="HTTPD preflight settings differ"):
         wipe.seal(wipe_source[0], "2-8-5-200", "test01", bundle)
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_concurrency_is_sealed_and_reviewed(wipe_source, limit):
+    bundle = wipe.prepare(wipe_source[0], "2-8-5-200", "test01", RUN, WIPE, NAMES, wipe_source[3], limit)
+    plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
+    runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
+    assert plan["concurrency_limit"] == runtime["concurrency_limit"] == limit
+    assert f"Concurrency: {limit}; bounded batches" in (bundle / "review.txt").read_text()
+    runtime["concurrency_limit"] = 2 if limit == 1 else 1
+    write(bundle / "runtime-plan.yml", {"fleet_wipe_runtime_plan": runtime})
+    with pytest.raises(ValueError, match="Native concurrency binding"):
+        wipe.verify_sources(wipe_source[0], "2-8-5-200", "test01", bundle)
+
+
+@pytest.mark.parametrize("limit", [0, -1, 3, True, "2"])
+def test_invalid_concurrency_cannot_create_preparation(wipe_source, limit):
+    with pytest.raises(ValueError, match="Concurrency"):
+        wipe.prepare(wipe_source[0], "2-8-5-200", "test01", RUN, WIPE, NAMES, wipe_source[3], limit)
+    assert not (wipe_source[0] / "output/2-8-5-200/test01/ocp/wipe/fleet" / WIPE).exists()
+
+
+def test_parallel_task_files_are_in_executor_seal(wipe_source):
+    hashes = wipe.collection_hashes(wipe_source[3])
+    for task in ("clean_batch", "manage_node", "submit_clean", "observe_clean"):
+        assert f"roles/fleet_native_disk_clean_driver/tasks/{task}.yml" in hashes
+    (wipe_source[3] / "roles/fleet_native_disk_clean_driver/tasks/submit_clean.yml").unlink()
+    with pytest.raises(ValueError, match="incomplete"):
+        wipe.collection_hashes(wipe_source[3])
+
+
+def test_cli_execution_cannot_override_concurrency(tmp_path):
+    result = subprocess.run(["python3", str(ROOT / "scripts/prepare-fleet-wipe.py"), "begin",
+                             "--arch", "2-8-5-200", "--site", "test01", "--root", str(tmp_path),
+                             "--bundle", str(tmp_path / "bundle"), "--concurrency", "7"],
+                            capture_output=True, text=True, check=False)
+    assert result.returncode != 0
+    assert not (tmp_path / "output").exists()

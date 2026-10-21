@@ -30,7 +30,13 @@ HTTPD = load_module(ROOT / "scripts/ironic-httpd-settings.py", "wipe_httpd")
 
 def collection_hashes(collection):
     paths = list((collection / "roles/fleet_native_disk_clean_driver").rglob("*.yml"))
-    gate.require(len(paths) == 12, "Native fleet executor is incomplete")
+    required = {"defaults/main.yml", "meta/argument_specs.yml", "meta/main.yml"} | {
+        "tasks/" + name + ".yml" for name in (
+            "main", "validate", "runtime", "prepare_node", "enroll", "clean_node", "clean_batch",
+            "manage_node", "submit_clean", "observe_clean", "cleanup_node", "cleanup_runtime", "finalize")}
+    role = collection / "roles/fleet_native_disk_clean_driver"
+    gate.require(required <= {str(path.relative_to(role)) for path in paths},
+                 "Native fleet executor is incomplete")
     paths += [collection / relative for relative in (
         "playbooks/wipe_fleet_install_disks.yml", "plugins/filter/fleet_native_disk_clean_result.py",
         "plugins/filter/fleet_native_disk_clean_plan.py",
@@ -54,7 +60,7 @@ def declared_oem(root, arch, site):
     return oem.strip().lower()
 
 
-def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root):
+def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root, concurrency_limit=1):
     root = root.absolute()
     httpd = HTTPD.site(root, arch, site)
     # Physical readiness is independent of initial ABI membership. Legacy ABI
@@ -94,7 +100,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         "plan_builder": plugin_hash,
     }
     plan = builder.fleet_native_disk_clean_plan(inspection_run_id, wipe_run_id,
-        selected, node_evidence, source_hashes, oem)
+        selected, node_evidence, source_hashes, oem, concurrency_limit)
     plan.update({"artifact_root": str(evidence_root), "inspection_artifact_root": str(source),
                  "manifest_sha256": receipt.get("manifest_sha256", {})})
     # Revalidate after projecting evidence so altered files cannot be sealed into
@@ -109,7 +115,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         gate.require(not path.exists(), "Wipe preparation or evidence run already exists")
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.mkdir(mode=0o700)
-    runtime = {"httpd_tuning": httpd, "run_id": wipe_run_id, "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
+    runtime = {"concurrency_limit": plan["concurrency_limit"], "httpd_tuning": httpd, "run_id": wipe_run_id, "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
                "authorized_nodes": selected, "inspection_receipt_name": receipt_name,
                "collection_root": str(collection_root.absolute()), "collection_sha256": code_hashes,
                "source_sha256": document["fleet_adapter_source_sha256"],
@@ -139,7 +145,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
               f"power: {profile['power_interface']}",
               "Credentials: native redfish_* driver_info; configured system IDs preserved",
               "Completion: accepted native request, return to manageable, durable outcome, verified cleanup",
-              "Concurrency: 1; stop subsequent nodes after failure", ""]
+              f"Concurrency: {plan['concurrency_limit']}; bounded batches; stop queued nodes after failure; observe in-flight nodes", ""]
     review.append(HTTPD.review(httpd))
     for node in plan["authorized_nodes"]:
         review.extend([node["name"], f"  Chassis serial: {node['host_identity']['serial_number']}",
@@ -186,6 +192,10 @@ def verify_sources(root, arch, site, bundle):
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
     builder = load_module(Path(runtime["collection_root"]) / "plugins/filter/fleet_native_disk_clean_plan.py",
                           "wipe_profile_verifier")
+    limit = plan.get("concurrency_limit")
+    gate.require(type(limit) is int and 1 <= limit <= len(plan["authorized_nodes"])
+                 and runtime.get("concurrency_limit", 1) == limit,
+                 "Native concurrency binding changed")
     oem = declared_oem(root, arch, site)
     gate.require(plan.get("oem") == oem and runtime.get("oem") == oem
                  and plan.get("native_profile") == builder.fleet_native_disk_clean_profile(oem)
@@ -279,17 +289,20 @@ def main():
         parser.add_argument("--" + name, required=True)
     for name in ("inspection-run-id", "wipe-run-id", "nodes"):
         parser.add_argument("--" + name, default="")
+    parser.add_argument("--concurrency", type=int)
     parser.add_argument("--collection-root", type=Path)
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
     try:
         gate.require(args.collection_root is not None if args.command == "prepare" else args.bundle is not None,
                      "Missing collection root or preparation bundle")
+        gate.require(args.command == "prepare" or args.concurrency is None,
+                     "Concurrency may only be selected during preparation")
         adapter = load_module(ROOT / "scripts/prepare-fleet-inspection.py", "wipe_cli_adapter")
         if args.command == "prepare":
             names = adapter.selection(args.nodes)
             bundle = prepare(args.root, args.arch, args.site, args.inspection_run_id, args.wipe_run_id,
-                             names, args.collection_root)
+                             names, args.collection_root, 1 if args.concurrency is None else args.concurrency)
             print(f"Wipe preparation seeded: {bundle}; no physical authority")
         elif args.command == "seal":
             seal(args.root.absolute(), args.arch, args.site, args.bundle.absolute())

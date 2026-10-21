@@ -372,3 +372,17 @@ do not apply sysctls, start HTTPD or boot hardware. Validate the pinned image's
 Apache configuration/MPM and concurrent Range byte integrity before rollout.
 Record prior live/persistent sysctl values before an approved host application;
 disabling the option does not restore those values.
+
+
+### Reviewed wipe concurrency
+
+`make prepare-fleet-wipe` accepts `FLEET_WIPE_CONCURRENCY` (default `1`). Set it
+between one and the explicitly selected node count; for seven selected nodes,
+`FLEET_WIPE_CONCURRENCY=7` permits a seven-node native-cleaning batch. This is
+separate from inspection's `FLEET_CONCURRENCY`.
+
+Preparation seals the limit into the plan and review. It cannot be increased at
+execution without a fresh preparation and authorization. Batch failures stop queued
+work while already submitted operations remain observed. Each selected node must
+have native completion and verified cleanup before the fleet is successful. No
+concurrent Make invocations or shared-runtime teardown are used for parallelism.
