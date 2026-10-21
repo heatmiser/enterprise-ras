@@ -32,6 +32,7 @@ def load(path, name):
 gate = load(ROOT / "scripts/validate-abi-handoff.py", "install_gate")
 state = gate.cleaning_state
 require = gate.require
+HTTPD = load(ROOT / "scripts/ironic-httpd-settings.py", "install_httpd")
 
 
 def digest(path):
@@ -51,6 +52,7 @@ def collection_hashes(collection):
         require(directory.is_dir(), f"Missing collection role: {role}")
         paths.extend(sorted(directory.rglob("*.yml")))
     paths.append(collection / "plugins/filter/runtime_diagnostics.py")
+    paths.append(collection / "roles/ironic_deploy/templates/ironic-tuning.conf.j2")
     return {str(path.relative_to(collection)): digest(path) for path in paths}
 
 
@@ -168,6 +170,7 @@ def prepare_repeat(root, arch, site, run_id, collection, lock=None):
 
 
 def prepare(root, arch, site, run_id, collection, attempt_id=""):
+    httpd = HTTPD.site(root, arch, site)
     base, iso, hashes, ee, release, nodes, rendezvous = inputs(root, arch, site, run_id)
     state.check(base)
     selected, routes, bmc_sources = network(nodes)
@@ -179,7 +182,7 @@ def prepare(root, arch, site, run_id, collection, attempt_id=""):
     bundle, reports = installation_paths(base, run_id, attempt_id)
     require(not bundle.exists(), "Installation preparation exists; use verify/serve instead of overwriting it")
     require(not reports.exists(), "Installation reports already exist; require a fresh attempt")
-    plan = {"schema_version": 1, "inspection_run_id": run_id, "operation": "serve_existing_abi_iso",
+    plan = {"httpd_tuning": httpd, "schema_version": 1, "inspection_run_id": run_id, "operation": "serve_existing_abi_iso",
             "iso_path": str(iso), "iso_sha256": hashes["agent.x86_64.iso"], "iso_size": iso.stat().st_size,
             "source_sha256": hashes, "installer_ee": ee, "release_image": release,
             "rendezvous_ip": rendezvous, "node_names": sorted(node["name"] for node in nodes),
@@ -204,6 +207,7 @@ def prepare(root, arch, site, run_id, collection, attempt_id=""):
               f"Release: {release}", f"Installer EE: {ee}",
               "Scope: start Ironic/HTTPD and publish the existing ISO; NO node enrollment, boot or cleaning.",
               "Only the ISO enters the serving directory; original installer state/auth remain private."]
+    review.append(HTTPD.review(httpd))
     (bundle / "review.txt").write_text("\n".join(review) + "\n")
     (bundle / "review.txt").chmod(0o600)
     return bundle
@@ -214,6 +218,7 @@ def verify(root, arch, site, run_id, collection):
     state.check(base)
     bundle, attempt_id = selected_installation(base, run_id)
     plan = gate.read_yaml(bundle / "plan.yml")["abi_install_plan"]
+    HTTPD.normalize(plan.get("httpd_tuning", {}))
     require(gate.read_yaml(bundle / "prepared.yaml")["plan_sha256"] == state.fingerprint(plan), "Prepared plan changed")
     _, reports = installation_paths(base, run_id, attempt_id)
     require(plan["inspection_run_id"] == run_id and plan.get("installation_attempt_id", run_id) == (attempt_id or run_id)

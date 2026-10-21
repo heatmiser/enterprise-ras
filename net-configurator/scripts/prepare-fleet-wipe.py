@@ -25,6 +25,7 @@ def load_module(path, name):
 
 gate = load_module(ROOT / "scripts/validate-physical-inspection.py", "wipe_inspection_gate")
 state = load_module(ROOT / "scripts/fleet-cleaning-state.py", "wipe_state")
+HTTPD = load_module(ROOT / "scripts/ironic-httpd-settings.py", "wipe_httpd")
 
 
 def collection_hashes(collection):
@@ -35,7 +36,9 @@ def collection_hashes(collection):
         "plugins/filter/fleet_native_disk_clean_plan.py",
         "plugins/filter/runtime_diagnostics.py",
         "roles/ironic_deploy/tasks/main.yml", "roles/ironic_deploy/tasks/deploy_ephemeral.yml",
-        "roles/ironic_deploy/defaults/main.yml")]
+        "roles/ironic_deploy/defaults/main.yml",
+        "roles/ironic_deploy/tasks/prepare_httpd_tuning.yml",
+        "roles/ironic_deploy/templates/ironic-tuning.conf.j2")]
     return {str(p.relative_to(collection)): gate.digest(p) for p in sorted(paths)}
 
 
@@ -53,6 +56,7 @@ def declared_oem(root, arch, site):
 
 def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root):
     root = root.absolute()
+    httpd = HTTPD.site(root, arch, site)
     # Physical readiness is independent of initial ABI membership. Legacy ABI
     # receipts remain valid sources under their original sealed input contract.
     document, receipt, receipt_name = gate.validate_handoff(root, arch, site, inspection_run_id)
@@ -105,7 +109,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         gate.require(not path.exists(), "Wipe preparation or evidence run already exists")
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.mkdir(mode=0o700)
-    runtime = {"run_id": wipe_run_id, "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
+    runtime = {"httpd_tuning": httpd, "run_id": wipe_run_id, "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
                "authorized_nodes": selected, "inspection_receipt_name": receipt_name,
                "collection_root": str(collection_root.absolute()), "collection_sha256": code_hashes,
                "source_sha256": document["fleet_adapter_source_sha256"],
@@ -136,6 +140,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
               "Credentials: native redfish_* driver_info; configured system IDs preserved",
               "Completion: accepted native request, return to manageable, durable outcome, verified cleanup",
               "Concurrency: 1; stop subsequent nodes after failure", ""]
+    review.append(HTTPD.review(httpd))
     for node in plan["authorized_nodes"]:
         review.extend([node["name"], f"  Chassis serial: {node['host_identity']['serial_number']}",
                        "  Previously inspected disks (review information; native discovery selects at execution):"])
@@ -207,6 +212,7 @@ def verify_sources(root, arch, site, bundle):
 
 
 def validate_preflight_provenance(preflight, runtime):
+    HTTPD.verify_preflight(preflight, runtime.get("httpd_tuning", {}))
     """Retain the inspected release while binding fresh preflight to the selection."""
     expected = {
         **runtime["original_provenance"],

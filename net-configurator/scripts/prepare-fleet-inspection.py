@@ -31,6 +31,7 @@ def load_module(filename):
 
 OCP = load_module("generate-ocp-inventory.py")
 SETTINGS = load_module("init-ocp-settings.py")
+HTTPD = load_module("ironic-httpd-settings.py")
 
 
 def require(condition, message):
@@ -145,6 +146,7 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpo
     require(all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) and value not in (".", "..")
                 for value in (arch, site)), "Invalid architecture/site")
     require(type(concurrency) is int and 0 < concurrency <= len(names), "Invalid selected-node concurrency")
+    httpd = HTTPD.site(root, arch, site)
     workbook = root / "input" / arch / site / f"{arch}.xlsx"
     settings_path = workbook.parent / "ocp-settings.yml"
     inventory = root / "output" / arch / site / "inventory"
@@ -253,7 +255,7 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpo
     for name, (nmstate, early) in network_inputs.items():
         write_yaml(bundle / "nmstate" / f"{name}.yaml", nmstate)
         write_yaml(bundle / "early-network" / f"{name}.yaml", early)
-    plan = {"run_id": run_id, "artifact_root": str(evidence), "authorized_nodes": nodes,
+    plan = {"httpd_tuning": httpd, "run_id": run_id, "artifact_root": str(evidence), "authorized_nodes": nodes,
             "expected_node_count": len(nodes), "concurrency_limit": concurrency,
             "timeouts": {"manageable": 300, "inspection": 1200, "api_fetch": 30, "total_run": 3600},
             "wiremap": links, "switch_aliases": cluster.get("fleet_inspection_switch_aliases", {})}
@@ -269,6 +271,8 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpo
                "fleet_inspection_driver_early_network_dir": str(bundle / "early-network")})
     write_yaml(bundle / "hosts.yml", {"all": {"children": {"bootstrap": {"hosts": {
         "localhost": {"ansible_connection": "local"}}}}}})
+    (bundle / "review.txt").write_text(HTTPD.review(httpd) + "\n")
+    (bundle / "review.txt").chmod(0o640)
     return bundle
 
 
@@ -286,6 +290,7 @@ def seal(bundle):
     document = read_yaml(bundle / "plan.yml")
     runtime = read_yaml(bundle / "preflight-vars.yaml")
     plan = document["inspect_fleet_plan"]
+    HTTPD.verify_preflight(runtime, plan.get("httpd_tuning", {}))
     provenance = runtime.get("inspection_preflight_provenance", {})
     require(provenance.get("installer_version") == document["fleet_adapter_expected_version"], "Preflight version mismatch")
     require(provenance.get("callback_target_ip") == plan["authorized_nodes"][0]["devices"]["bond_ip"],
@@ -306,6 +311,7 @@ def authorize(bundle, run_id, names):
     require(sorted(names) == sorted(node["name"] for node in plan["authorized_nodes"])
             == sorted(receipt["node_names"]), "Authorization node mismatch")
     require(receipt["sha256"] == handoff_files(bundle, document), "Prepared handoff changed; review a new run")
+    HTTPD.verify_preflight(read_yaml(bundle / "preflight-vars.yaml"), plan.get("httpd_tuning", {}))
     evidence = Path(plan["artifact_root"])
     require(not evidence.exists() and not any(parent.is_symlink() for parent in (evidence, *evidence.parents)),
             "Evidence path already exists or has symlink parents")

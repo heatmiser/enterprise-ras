@@ -473,3 +473,26 @@ def test_resealed_boot_plan_cannot_change_attempt_or_private_asset_paths(served_
     install.state.write(target / 'prepared.yaml', {'plan_sha256': install.state.fingerprint(document['abi_boot_plan'])})
     with pytest.raises(ValueError, match='Boot installation attempt identity or paths changed'):
         install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+
+
+@pytest.mark.parametrize("manage", [False, True])
+def test_abi_serving_seals_httpd_policy_and_uses_snapshot(staged_install, manage):
+    root, _, _ = staged_install
+    path = root / "input/2-8-5-200/test01/ironic-httpd.yml"
+    path.write_text(yaml.safe_dump({"ironic_deploy_httpd_tuning": True,
+        "ironic_deploy_httpd_manage_sysctl": manage}))
+    bundle = prepare(staged_install)
+    path.unlink()
+    _, plan = verify(staged_install)
+    assert plan["httpd_tuning"]["ironic_deploy_httpd_tuning"] is True
+    assert plan["httpd_tuning"]["ironic_deploy_httpd_manage_sysctl"] is manage
+    assert "HTTPD profile: True" in (bundle / "review.txt").read_text()
+    assert "roles/ironic_deploy/templates/ironic-tuning.conf.j2" in plan["collection_sha256"]
+
+
+def test_abi_serving_rejects_httpd_template_drift(staged_install):
+    prepare(staged_install)
+    path = staged_install[1] / "roles/ironic_deploy/templates/ironic-tuning.conf.j2"
+    path.write_text(path.read_text() + "# changed\n")
+    with pytest.raises(ValueError, match="Collection serving implementation changed"):
+        verify(staged_install)

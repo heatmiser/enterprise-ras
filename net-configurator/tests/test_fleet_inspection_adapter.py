@@ -103,7 +103,8 @@ def seal(bundle):
         "ironic_preprovisioning_media_probe_node": node["name"],
         "ironic_preprovisioning_media_early_network_path": str(
             bundle / "early-network" / f"{node['name']}.yaml"),
-        "ironic_preprovisioning_media_artifacts": {"fixture": "no services"}})
+        "ironic_preprovisioning_media_artifacts": {"fixture": "no services"},
+        **document["inspect_fleet_plan"].get("httpd_tuning", {})})
     adapter.write_yaml(bundle / "callback-routes.yaml", {"fixture": "No real route queries executed"})
     adapter.seal(bundle)
 
@@ -391,3 +392,37 @@ def test_node_lifecycle_inspection_does_not_read_obsolete_abi_candidates(workspa
         assert str(path) not in document["fleet_adapter_source_sha256"]
         assert [n["name"] for n in document["inspect_fleet_plan"]["authorized_nodes"]] == NAMES[1:]
     assert path.read_text() == "obsolete ABI input\n"
+
+
+def test_httpd_snapshot_is_sealed_and_site_changes_apply_only_to_future_preparations(workspace):
+    root, _ = workspace
+    policy_path = root / "input/2-8-5-200/test01/ironic-httpd.yml"
+    policy_path.write_text(yaml.safe_dump({"ironic_deploy_httpd_tuning": True}))
+    bundle = prepare(workspace)
+    plan = adapter.read_yaml(bundle / "plan.yml")["inspect_fleet_plan"]
+    assert plan["httpd_tuning"]["ironic_deploy_httpd_tuning"] is True
+    assert plan["httpd_tuning"]["ironic_deploy_httpd_manage_sysctl"] is False
+    assert "HTTPD profile: True" in (bundle / "review.txt").read_text()
+    seal(bundle)
+    policy_path.write_text("ironic_deploy_httpd_tuning: false\n")
+    adapter.authorize(bundle, RUN, NAMES)
+    preflight = adapter.read_yaml(bundle / "preflight-vars.yaml")
+    preflight["ironic_deploy_httpd_manage_sysctl"] = True
+    (bundle / "preflight-vars.yaml").write_text(yaml.safe_dump(preflight))
+    with pytest.raises(ValueError, match="Prepared handoff changed"):
+        adapter.authorize(bundle, RUN, NAMES)
+
+
+def test_inspection_seal_rejects_policy_different_from_reviewed_snapshot(workspace, monkeypatch):
+    root, _ = workspace
+    (root / "input/2-8-5-200/test01/ironic-httpd.yml").write_text("ironic_deploy_httpd_tuning: true\n")
+    bundle = prepare(workspace)
+    monkeypatch.setattr(adapter, "seal", lambda bundle: None)
+    seal(bundle)
+    preflight = adapter.read_yaml(bundle / "preflight-vars.yaml")
+    preflight["ironic_deploy_httpd_tuning"] = False
+    (bundle / "preflight-vars.yaml").write_text(yaml.safe_dump(preflight))
+    # Restore the actual seal function before checking its input contract.
+    monkeypatch.undo()
+    with pytest.raises(ValueError, match="HTTPD preflight settings differ"):
+        adapter.seal(bundle)

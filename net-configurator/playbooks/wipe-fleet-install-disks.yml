@@ -4,50 +4,64 @@
   connection: local
   gather_facts: false
   tasks:
-  - name: Recheck immutable preparation immediately before runtime work
-    ansible.builtin.command:
-      argv:
-      - '{{ ansible_playbook_python }}'
-      - '{{ playbook_dir }}/../scripts/prepare-fleet-wipe.py'
-      - verify
-      - --arch
-      - '{{ fleet_wipe_arch }}'
-      - --site
-      - '{{ fleet_wipe_site }}'
-      - --bundle
-      - '{{ fleet_wipe_bundle }}'
-    changed_when: false
-  - name: Load the sealed release and networking inputs
-    ansible.builtin.include_vars:
-      file: '{{ fleet_wipe_bundle }}/preflight-vars.yaml'
-  - name: Require effective execution variables match the sealed files
-    ansible.builtin.assert:
-      that:
-      - fleet_native_disk_clean_plan == (lookup('ansible.builtin.file', fleet_wipe_bundle ~ '/plan.yml') | from_yaml).fleet_native_disk_clean_plan
-      - fleet_wipe_runtime_plan == (lookup('ansible.builtin.file', fleet_wipe_bundle ~ '/runtime-plan.yml') | from_yaml).fleet_wipe_runtime_plan
-      - vars[item.key] == item.value
-    loop: '{{ (lookup(''ansible.builtin.file'', fleet_wipe_bundle ~ ''/preflight-vars.yaml'') | from_yaml) | dict2items }}'
-    no_log: true
-  - name: Initialize the selected native cleaning inputs
-    ansible.builtin.set_fact:
-      fleet_native_disk_clean_driver_plan: '{{ fleet_native_disk_clean_plan }}'
-      fleet_native_disk_clean_driver_runtime_plan: '{{ fleet_wipe_runtime_plan }}'
-      fleet_native_disk_clean_driver_authorization: '{{ fleet_wipe_authorization }}'
-      fleet_native_disk_clean_driver_credentials: {}
-    no_log: true
-  - name: Require credentials for exactly the selected nodes
-    ansible.builtin.assert:
-      that:
-      - bmc_credentials[item.name].username | default('') | length > 0
-      - bmc_credentials[item.name].password | default('') | length > 0
-    loop: '{{ fleet_wipe_runtime_plan.authorized_nodes }}'
-    no_log: true
-  - name: Adapt only the selected vaulted credentials
-    ansible.builtin.set_fact:
-      fleet_native_disk_clean_driver_credentials: '{{ fleet_native_disk_clean_driver_credentials | combine({item.name: bmc_credentials[item.name]})
-        }}'
-    loop: '{{ fleet_wipe_runtime_plan.authorized_nodes }}'
-    no_log: true
+    - name: Recheck immutable preparation immediately before runtime work
+      ansible.builtin.command:
+        argv:
+          - '{{ ansible_playbook_python }}'
+          - '{{ playbook_dir }}/../scripts/prepare-fleet-wipe.py'
+          - verify
+          - --arch
+          - '{{ fleet_wipe_arch }}'
+          - --site
+          - '{{ fleet_wipe_site }}'
+          - --bundle
+          - '{{ fleet_wipe_bundle }}'
+      changed_when: false
+    - name: Load the sealed release and networking inputs
+      ansible.builtin.include_vars:
+        file: '{{ fleet_wipe_bundle }}/preflight-vars.yaml'
+    - name: Require effective execution variables match the sealed files
+      ansible.builtin.assert:
+        that:
+          - fleet_native_disk_clean_plan == (lookup('ansible.builtin.file', fleet_wipe_bundle ~ '/plan.yml') | from_yaml).fleet_native_disk_clean_plan
+          - fleet_wipe_runtime_plan == (lookup('ansible.builtin.file', fleet_wipe_bundle ~ '/runtime-plan.yml') | from_yaml).fleet_wipe_runtime_plan
+          - vars[item.key] == item.value
+      loop: '{{ (lookup(''ansible.builtin.file'', fleet_wipe_bundle ~ ''/preflight-vars.yaml'') | from_yaml) | dict2items }}'
+      no_log: true
+    - name: Require effective HTTPD settings match the sealed preparation
+      ansible.builtin.assert:
+        that:
+          - vars[item.key] | default(item.value) == item.value
+          - (vars[item.key] | default(item.value) | type_debug) == (item.value | type_debug)
+        fail_msg: HTTPD settings changed after preparation; prepare and review a fresh run.
+      loop: "{{ __sealed_httpd | dict2items }}"
+      vars:
+        __sealed_httpd: >-
+          {{ {'ironic_deploy_httpd_tuning': false,
+               'ironic_deploy_httpd_tuning_path': '/var/lib/ironic/httpd-tuning',
+               'ironic_deploy_httpd_manage_sysctl': false}
+             | combine(fleet_wipe_runtime_plan.httpd_tuning | default({})) }}
+
+    - name: Initialize the selected native cleaning inputs
+      ansible.builtin.set_fact:
+        fleet_native_disk_clean_driver_plan: '{{ fleet_native_disk_clean_plan }}'
+        fleet_native_disk_clean_driver_runtime_plan: '{{ fleet_wipe_runtime_plan }}'
+        fleet_native_disk_clean_driver_authorization: '{{ fleet_wipe_authorization }}'
+        fleet_native_disk_clean_driver_credentials: {}
+      no_log: true
+    - name: Require credentials for exactly the selected nodes
+      ansible.builtin.assert:
+        that:
+          - bmc_credentials[item.name].username | default('') | length > 0
+          - bmc_credentials[item.name].password | default('') | length > 0
+      loop: '{{ fleet_wipe_runtime_plan.authorized_nodes }}'
+      no_log: true
+    - name: Adapt only the selected vaulted credentials
+      ansible.builtin.set_fact:
+        fleet_native_disk_clean_driver_credentials: '{{ fleet_native_disk_clean_driver_credentials | combine({item.name: bmc_credentials[item.name]})
+          }}'
+      loop: '{{ fleet_wipe_runtime_plan.authorized_nodes }}'
+      no_log: true
 - name: Run only the authorized native collection lifecycle
   ansible.builtin.import_playbook: rhvp.baremetal_ocp.wipe_fleet_install_disks
 ...

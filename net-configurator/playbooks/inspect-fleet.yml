@@ -56,6 +56,20 @@
         __sealed_plan: "{{ lookup('ansible.builtin.file', fleet_adapter_bundle ~ '/plan.yml') | from_yaml }}"
         __sealed_runtime: "{{ lookup('ansible.builtin.file', fleet_adapter_bundle ~ '/preflight-vars.yaml') | from_yaml }}"
 
+    - name: Require effective HTTPD settings match the sealed preparation
+      ansible.builtin.assert:
+        that:
+          - vars[item.key] | default(item.value) == item.value
+          - (vars[item.key] | default(item.value) | type_debug) == (item.value | type_debug)
+        fail_msg: HTTPD settings changed after preparation; prepare and review a fresh run.
+      loop: "{{ __sealed_httpd | dict2items }}"
+      vars:
+        __sealed_httpd: >-
+          {{ {'ironic_deploy_httpd_tuning': false,
+               'ironic_deploy_httpd_tuning_path': '/var/lib/ironic/httpd-tuning',
+               'ironic_deploy_httpd_manage_sysctl': false}
+             | combine(inspect_fleet_plan.httpd_tuning | default({})) }}
+
     - name: Require separate vaulted credentials for every selected node
       ansible.builtin.assert:
         that:
@@ -80,3 +94,4 @@
 
 - name: Run the authorized collection fleet lifecycle
   ansible.builtin.import_playbook: rhvp.baremetal_ocp.inspect_fleet
+...

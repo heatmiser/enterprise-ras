@@ -19,6 +19,8 @@
     inspection_preflight_early_network_path: ""
     inspection_preflight_output_path: ""
     inspection_preflight_architecture: x86_64
+    inspection_preflight_httpd_settings_path: ""
+    inspection_preflight_httpd_tuning: {}
     inspection_preflight_default_pull_secret_path: >-
       {{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets/pull-secret.json
 
@@ -40,6 +42,18 @@
           Supply one inspection candidate, its workbook-derived exact OCP
           version, and absolute paths for collection site variables, generated
           NMState directory, MAC-pinned early-network input, and output artifact.
+
+    # Fleet callers provide their snapshot; standalone preparation reads the explicit site path.
+    - name: Read standalone HTTPD preparation settings
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/../scripts/ironic-httpd-settings.py"
+          - --path
+          - "{{ inspection_preflight_httpd_settings_path }}"
+      changed_when: false
+      register: __inspection_preflight_httpd_settings
+      when: inspection_preflight_httpd_settings_path | length > 0
 
     - name: Load shared Air vault
       ansible.builtin.include_vars:
@@ -169,6 +183,10 @@
       ansible.builtin.include_role:
         name: rhvp.baremetal_ocp.inspection_preflight_prepare
       vars:
+        inspection_preflight_prepare_httpd_tuning: >-
+          {{ (__inspection_preflight_httpd_settings.stdout | from_json)
+             if inspection_preflight_httpd_settings_path | length > 0
+             else inspection_preflight_httpd_tuning }}
         inspection_preflight_prepare_candidate_name: "{{ inspection_preflight_candidate }}"
         inspection_preflight_prepare_nmstate_dir: "{{ inspection_preflight_nmstate_dir }}"
         inspection_preflight_prepare_early_network_path: >-

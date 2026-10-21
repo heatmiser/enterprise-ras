@@ -277,3 +277,14 @@ def test_adapter_artifact_guard_before_collection_entry(case):
                             "cleanup_exists": cleanup}[case]
                 assert existing.read_text() == "retained evidence"
                 assert "Inspection destination already exists" in result.stdout
+
+
+def test_standalone_and_fleet_preparation_use_explicit_httpd_sources():
+    driver = yaml.safe_load((NET_CONFIGURATOR / "playbooks/prepare-inspection-preflight.yml").read_text())[0]
+    read = next(t for t in driver["tasks"] if t["name"] == "Read standalone HTTPD preparation settings")
+    assert read["ansible.builtin.command"]["argv"][-1] == "{{ inspection_preflight_httpd_settings_path }}"
+    assert read["changed_when"] is False
+    assert "inspection_preflight_httpd_settings_path=$(CURDIR)/input/$(ARCH)/$(SITE)/ironic-httpd.yml" in (
+        NET_CONFIGURATOR / "Makefile").read_text()
+    fleet = yaml.safe_load((NET_CONFIGURATOR / "playbooks/prepare-fleet-inspection.yml").read_text())
+    assert fleet[1]["vars"]["inspection_preflight_httpd_tuning"] == "{{ inspect_fleet_plan.httpd_tuning | default({}) }}"
