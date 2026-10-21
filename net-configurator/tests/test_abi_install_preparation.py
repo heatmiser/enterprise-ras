@@ -496,3 +496,19 @@ def test_abi_serving_rejects_httpd_template_drift(staged_install):
     path.write_text(path.read_text() + "# changed\n")
     with pytest.raises(ValueError, match="Collection serving implementation changed"):
         verify(staged_install)
+
+
+@pytest.mark.parametrize("healthy", [False, True])
+def test_verified_retirement_unblocks_repeat_without_rewriting_installation(tmp_path, healthy):
+    from tests.test_abi_retirement_preparation import build_history, prepare, make_completed, retirement, ATTEMPT, RUN
+    h = build_history(tmp_path, healthy=healthy)
+    prepare(h)
+    before = (h[3] / 'boot/runtime.yaml').read_bytes()
+    make_completed(h)
+    install.require_previous_cleanup(h[1], RUN, h[5])
+    assert (h[3] / 'boot/runtime.yaml').read_bytes() == before
+    receipt = retirement.state.read(h[3] / 'retirement/receipt.yaml')
+    receipt['installation_attempt_id'] = 'wrong'
+    (h[3] / 'retirement/receipt.yaml').write_text(yaml.safe_dump(receipt))
+    with pytest.raises(ValueError, match='retirement receipt'):
+        install.require_previous_cleanup(h[1], RUN, h[5])

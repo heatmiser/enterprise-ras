@@ -136,12 +136,22 @@ def require_previous_cleanup(base, run_id, lock):
     require(not state.safe_path(lock).exists(), "Serving runtime is retained; resolve it before preparing another attempt")
     _, reports = installation_paths(base, run_id)
     completed = set()
+    retirement = load(ROOT / "scripts/prepare-abi-retirement.py", "install_retirement")
+    histories = [(run_id, reports)]
+    histories.extend((path.name, path) for path in reports.glob("attempts/*") if path.is_dir())
+    retired = set()
+    for attempt_id, _ in histories:
+        receipt = retirement.completed(base, run_id, attempt_id)
+        if receipt is not None:
+            retired.add(receipt["serving_attempt"])
+    completed.update(retired)
     # A successful boot cleanup consumes its serving owner without rewriting the
     # original SERVING receipt. Match that exact owner instead of treating every
     # historical SERVING receipt as a still-active service.
     for boot_dir in list(reports.glob("boot")) + list(reports.glob("attempts/*/boot")):
         previous = state.read(boot_dir / "runtime.yaml")
-        require(previous.get("runtime_retained") is False and previous.get("cleanup_status") == "complete",
+        require(previous.get("serving_attempt") in retired or
+                (previous.get("runtime_retained") is False and previous.get("cleanup_status") == "complete"),
                 "Previous boot runtime cleanup is unresolved")
         owner = state.safe_path(Path(previous["serving_attempt"]))
         require(owner.parent == boot_dir.parent / "serving" and owner.name.startswith("attempt-"),

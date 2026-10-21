@@ -1,0 +1,4 @@
+---
+- name: Retire the reviewed runtime through the collection entry point
+  ansible.builtin.import_playbook: rhvp.baremetal_ocp.retire_abi_runtime
+...
