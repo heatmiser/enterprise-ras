@@ -119,7 +119,8 @@ FLEET_CONCURRENCY ?= 2
 FLEET_INSPECTION_PURPOSE ?= auto
 FLEET_PREP_DIR = $(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/fleet/$(FLEET_RUN_ID)
 
-# Wipe preparation is render-only; its serial policy is fixed at concurrency 1.
+# Wipe concurrency is sealed at preparation; physical execution requires exact authorization.
+FLEET_WIPE_CONCURRENCY ?= 1
 FLEET_WIPE_PREP_DIR = $(CURDIR)/output/$(ARCH)/$(SITE)/ocp/wipe/fleet/$(FLEET_WIPE_RUN_ID)
 
 # Auto-detect LDAP: explicit LDAP=1 on command line takes priority,
@@ -733,7 +734,8 @@ prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks o
 	python3 scripts/prepare-fleet-wipe.py \
 		--arch "$(ARCH)" --site "$(SITE)" \
 		--inspection-run-id "$(FLEET_RUN_ID)" --wipe-run-id "$(FLEET_WIPE_RUN_ID)" \
-		--nodes "$(FLEET_NODES)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_WIPE_CONCURRENCY)" \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
 	@VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
