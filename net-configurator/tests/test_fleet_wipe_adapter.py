@@ -22,7 +22,7 @@ spec = importlib.util.spec_from_file_location("wipe_adapter", ROOT / "scripts/pr
 wipe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(wipe)
 WIPE = "20000101T130000Z"
-COLLECTION = ROOT.parents[1] / "rhvp.baremetal_ocp"
+COLLECTION = Path(os.environ.get("RHV_BAREMETAL_OCP_ROOT", ROOT.parents[1] / "rhvp.baremetal_ocp")).resolve()
 
 
 @pytest.fixture
@@ -447,7 +447,7 @@ def test_concurrency_is_sealed_and_reviewed(wipe_source, limit):
     plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
     assert plan["concurrency_limit"] == runtime["concurrency_limit"] == limit
-    assert f"Concurrency: {limit}; bounded batches" in (bundle / "review.txt").read_text()
+    assert f"Concurrency: {limit}; independent node lifecycles" in (bundle / "review.txt").read_text()
     runtime["concurrency_limit"] = 2 if limit == 1 else 1
     write(bundle / "runtime-plan.yml", {"fleet_wipe_runtime_plan": runtime})
     with pytest.raises(ValueError, match="Native concurrency binding"):
@@ -477,3 +477,101 @@ def test_cli_execution_cannot_override_concurrency(tmp_path):
                             capture_output=True, text=True, check=False)
     assert result.returncode != 0
     assert not (tmp_path / "output").exists()
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_wipe_seals_redfish_settings_without_changing_inspection(wipe_source, enabled):
+    root, original, _, collection = wipe_source
+    before = (original / "preflight-vars.yaml").read_bytes()
+    policy = wipe.REDFISH.policy_module(collection).validate_policy()
+    policy.update(max_attempts=7, budget_seconds=240)
+    write(root / "input/2-8-5-200/test01/ironic-redfish.yml", {
+        wipe.REDFISH.ENABLED: enabled, wipe.REDFISH.POLICY: policy})
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    plan, runtime = wipe.verify(root, "2-8-5-200", "test01", bundle)
+    selected = runtime["redfish_retry"]
+    assert selected == plan["redfish_retry"]
+    assert selected[wipe.REDFISH.ENABLED] is enabled
+    assert selected[wipe.REDFISH.POLICY] == policy
+    assert selected[wipe.REDFISH.STAGING] == str(Path(runtime["artifact_root"]) / "redfish-retry")
+    assert f"Redfish adaptive reads: {enabled}" in (bundle / "review.txt").read_text()
+    assert before == (original / "preflight-vars.yaml").read_bytes()
+    assert "roles/ironic_deploy/tasks/prepare_redfish_retry.yml" in runtime["collection_sha256"]
+    assert "plugins/module_utils/redfish_retry.py" in runtime["collection_sha256"]
+
+
+def test_fresh_wipes_enable_reviewed_retries_by_default(wipe_source):
+    bundle = prepare(wipe_source)
+    runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
+    assert runtime["redfish_retry"][wipe.REDFISH.ENABLED] is True
+    assert runtime["redfish_retry"][wipe.REDFISH.POLICY]["max_attempts"] == 11
+
+
+@pytest.mark.parametrize("value", [None, [], {"unknown": True},
+    {"ironic_deploy_redfish_retry_enabled": "true"},
+    {"ironic_deploy_redfish_retry_path": "/tmp/../unsafe"},
+    {"ironic_deploy_redfish_retry_policy": {"max_attempts": 11}},
+    {"ironic_deploy_redfish_retry_policy": {"max_attempts": True, "budget_seconds": 300,
+        "initial_delay_seconds": 5, "max_delay_seconds": 60, "jitter_fraction": 0.1}},
+    {"ironic_deploy_redfish_retry_policy": {"max_attempts": 11, "budget_seconds": float("inf"),
+        "initial_delay_seconds": 5, "max_delay_seconds": 60, "jitter_fraction": 0.1}}])
+def test_invalid_retry_settings_create_no_preparation(wipe_source, value):
+    root = wipe_source[0]
+    write(root / "input/2-8-5-200/test01/ironic-redfish.yml", value)
+    with pytest.raises(ValueError):
+        prepare(wipe_source)
+    assert not (root / "output/2-8-5-200/test01/ocp/wipe").exists()
+
+
+@pytest.mark.parametrize("field", ["policy", "enabled", "path"])
+def test_retry_binding_is_checked_independently_of_bundle_checksum(wipe_source, field):
+    bundle = prepare(wipe_source)
+    path = bundle / "runtime-plan.yml"
+    document = gate.read_yaml(path)
+    settings = document["fleet_wipe_runtime_plan"]["redfish_retry"]
+    if field == "policy":
+        settings[wipe.REDFISH.POLICY]["max_attempts"] = 1
+    elif field == "enabled":
+        settings[wipe.REDFISH.ENABLED] = False
+    else:
+        settings[wipe.REDFISH.STAGING] = "/tmp/foreign"
+    write(path, document)
+    with pytest.raises(ValueError, match="Redfish retry policy binding"):
+        wipe.verify_sources(wipe_source[0], "2-8-5-200", "test01", bundle)
+
+
+@pytest.mark.parametrize("asset", ["plugins/module_utils/redfish_retry.py",
+    "plugins/module_utils/redfish_deadline.py", "plugins/modules/fleet_native_disk_clean_deadline.py",
+    "roles/ironic_deploy/files/redfish_retry/rhvp_ironic_retry_launcher.py",
+    "roles/ironic_deploy/files/native_disk_clean/rhvp_redfish_retry.py",
+    "roles/ironic_deploy/meta/argument_specs.yml",
+    "plugins/action/fleet_native_disk_clean_coordinator.py",
+    "plugins/module_utils/fleet_native_disk_clean_scheduler.py",
+    "playbooks/_fleet_native_disk_clean_worker.yml", "plugins/modules/redfish_read.py",
+    "roles/ironic_node_power_off/tasks/main.yml", "roles/ironic_vmedia_detach/tasks/main.yml"])
+def test_retry_executor_assets_are_bound(wipe_source, asset):
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    path = wipe_source[3] / asset
+    path.write_text(path.read_text() + "\n# changed\n")
+    with pytest.raises(ValueError, match="Executor changed"):
+        wipe.verify(wipe_source[0], "2-8-5-200", "test01", bundle)
+
+
+def test_conductor_deadlines_are_sealed_to_exact_bmc_selection(wipe_source):
+    bundle = prepare(wipe_source)
+    plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
+    runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
+    assert runtime["redfish_deadlines"] == plan["redfish_deadlines"]
+    assert set(plan["redfish_deadlines"]["nodes"]) == set(NAMES)
+    assert all(len(value) == 64 for value in plan["redfish_deadlines"]["nodes"].values())
+    runtime["redfish_deadlines"]["nodes"][NAMES[0]] = "0" * 64
+    write(bundle / "runtime-plan.yml", {"fleet_wipe_runtime_plan": runtime})
+    with pytest.raises(ValueError, match="deadline selection binding"):
+        wipe.verify_sources(wipe_source[0], "2-8-5-200", "test01", bundle)
+
+
+def test_disabled_adaptive_reads_do_not_publish_conductor_deadlines(wipe_source):
+    write(wipe_source[0] / "input/2-8-5-200/test01/ironic-redfish.yml", {"ironic_deploy_redfish_retry_enabled": False})
+    bundle = prepare(wipe_source)
+    plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
+    assert plan["redfish_deadlines"] == {}

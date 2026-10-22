@@ -378,11 +378,67 @@ disabling the option does not restore those values.
 
 `make prepare-fleet-wipe` accepts `FLEET_WIPE_CONCURRENCY` (default `1`). Set it
 between one and the explicitly selected node count; for seven selected nodes,
-`FLEET_WIPE_CONCURRENCY=7` permits a seven-node native-cleaning batch. This is
-separate from inspection's `FLEET_CONCURRENCY`.
+`FLEET_WIPE_CONCURRENCY=7` permits seven concurrent node lifecycles. Each slot spans
+management through verified cleanup and reopens after safe completion, allowing
+rolling admission while peers continue progressing. This is separate from
+inspection's `FLEET_CONCURRENCY`.
 
 Preparation seals the limit into the plan and review. It cannot be increased at
-execution without a fresh preparation and authorization. Batch failures stop queued
-work while already submitted operations remain observed. Each selected node must
+execution without a fresh preparation and authorization. Failure or uncertainty
+stops queued admissions while admitted workers continue safe observation. Each selected node must
 have native completion and verified cleanup before the fleet is successful. No
 concurrent Make invocations or shared-runtime teardown are used for parallelism.
+
+
+### Wipe-only adaptive Redfish reads
+
+New wipe preparations enable bounded adaptive reads in the stock ephemeral Ironic
+runtime. General Ironic deployments default to disabled. This transport setting
+neither enables private cleaning interfaces nor grants authority to repeat a clean
+request. ABI and inspection workflows retain their existing transport behavior.
+
+Optionally create `input/<arch>/<site>/ironic-redfish.yml` with
+`ironic_deploy_redfish_retry_enabled`, `ironic_deploy_redfish_retry_path` and/or
+`ironic_deploy_redfish_retry_policy`. The policy, when supplied, requires all five
+fields: `max_attempts` (11), `budget_seconds` (300), `initial_delay_seconds` (5),
+`max_delay_seconds` (60) and `jitter_fraction` (0.1). The default staging directory
+is `reports/wipe/<run-id>/redfish-retry`. Review the resolved policy in `review.txt`.
+Settings are copied into both plan and runtime contracts; later site-file edits
+apply only to new preparations. Execution overrides are rejected.
+
+Ordinary synchronous GETs honor valid HTTP Retry-After values and structured
+Redfish ServiceTemporarilyUnavailable retry minima. Exponential backoff and positive
+jitter apply within a monotonic per-read budget; server minima are never shortened
+to the fallback cap. Permanent errors and uncertain mutations are not replayed by
+the adapter. The managed runtime sets Ironic Redfish connection attempts to one to
+avoid multiplying the adapter budget. Native mutation and asynchronous task handling
+remain in place. Each admitted node has an independent lifecycle. Direct cleanup GETs use the same
+policy within the remaining cleanup/run budget. The native conductor connector
+clamps its per-GET budget to the sealed worker phase/run deadline contract.
+
+Before service creation, an isolated cached-image process verifies the installed
+entrypoint, source manifest, policy and effective connection setting. Startup keeps
+`/bin/runironic` and uses a read-only launcher mount at `/usr/bin/ironic`; it checks
+compatibility provenance again before invoking native main. Unsupported images fail
+before services start. No installed packages are modified and no runtime pip install
+is performed. Preserve the staging manifest/provenance with private run evidence.
+
+
+A wipe concurrency slot now spans management through verified power/media cleanup.
+Each admitted node progresses in an isolated local Ansible worker; slow peers do
+not block other nodes from cleaning or shutting down. Queued admissions stop after
+failure or uncertainty. Safe node/phase progress appears in the coordinator console;
+private worker logs and one-time claims remain in the per-node evidence directory.
+No standalone worker invocation creates physical authority. Interruption retains
+shared runtime for review and never authorizes another erase request.
+
+
+Managed fleet wipe preparation also seals conductor phase-deadline bindings to the
+selected BMC endpoint digests. Shared endpoints are rejected when adaptive reads are
+enabled. At execution, private records carry the preparation identity, enrolled node
+UUID and phase/run deadlines through the existing read-only retry staging mount.
+Native GET retry scheduling uses the earliest policy, phase and run deadline; server
+retry minima are preserved. Expiry grants no shutdown, detach or erase-replay authority.
+Standalone retry activation and other deployment workflows retain their existing
+behavior without this contract. Old preparations must be regenerated, not relabeled;
+original wipe evidence and receipts remain untouched.
