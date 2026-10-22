@@ -26,19 +26,40 @@ def load_module(path, name):
 gate = load_module(ROOT / "scripts/validate-physical-inspection.py", "wipe_inspection_gate")
 state = load_module(ROOT / "scripts/fleet-cleaning-state.py", "wipe_state")
 HTTPD = load_module(ROOT / "scripts/ironic-httpd-settings.py", "wipe_httpd")
+REDFISH = load_module(ROOT / "scripts/ironic-redfish-settings.py", "wipe_redfish")
 
 
 def collection_hashes(collection):
     paths = list((collection / "roles/fleet_native_disk_clean_driver").rglob("*.yml"))
-    gate.require(len(paths) == 12, "Native fleet executor is incomplete")
+    required = {"defaults/main.yml", "meta/argument_specs.yml", "meta/main.yml"} | {
+        "tasks/" + name + ".yml" for name in (
+            "main", "validate", "runtime", "prepare_node", "enroll", "clean_node", "clean_batch",
+            "manage_node", "submit_clean", "observe_clean", "cleanup_node", "cleanup_runtime", "finalize", "worker")}
+    role = collection / "roles/fleet_native_disk_clean_driver"
+    gate.require(required <= {str(path.relative_to(role)) for path in paths},
+                 "Native fleet executor is incomplete")
     paths += [collection / relative for relative in (
-        "playbooks/wipe_fleet_install_disks.yml", "plugins/filter/fleet_native_disk_clean_result.py",
+        "playbooks/wipe_fleet_install_disks.yml", "playbooks/_fleet_native_disk_clean_worker.yml",
+        "plugins/action/fleet_native_disk_clean_coordinator.py",
+        "plugins/modules/fleet_native_disk_clean_coordinator.py",
+        "plugins/modules/redfish_read.py",
+        "plugins/module_utils/fleet_native_disk_clean_scheduler.py", "plugins/filter/fleet_native_disk_clean_result.py",
         "plugins/filter/fleet_native_disk_clean_plan.py",
         "plugins/filter/runtime_diagnostics.py",
         "roles/ironic_deploy/tasks/main.yml", "roles/ironic_deploy/tasks/deploy_ephemeral.yml",
-        "roles/ironic_deploy/defaults/main.yml",
+        "roles/ironic_deploy/defaults/main.yml", "roles/ironic_deploy/meta/argument_specs.yml",
+        "plugins/module_utils/redfish_retry.py", "plugins/module_utils/redfish_deadline.py",
+        "plugins/modules/fleet_native_disk_clean_deadline.py",
+        "roles/ironic_deploy/tasks/prepare_redfish_retry.yml",
+        "roles/ironic_deploy/files/redfish_retry/rhvp_ironic_retry_launcher.py",
+        "roles/ironic_deploy/files/native_disk_clean/rhvp_redfish_retry.py",
         "roles/ironic_deploy/tasks/prepare_httpd_tuning.yml",
         "roles/ironic_deploy/templates/ironic-tuning.conf.j2")]
+    for name in ("ironic_node_power_off", "ironic_vmedia_detach"):
+        paths += list((collection / "roles" / name).rglob("*.yml"))
+        gate.require((collection / "roles" / name / "tasks/main.yml") in paths
+                     and (collection / "roles" / name / "meta/argument_specs.yml") in paths,
+                     "Native cleanup executor is incomplete")
     return {str(p.relative_to(collection)): gate.digest(p) for p in sorted(paths)}
 
 
@@ -54,7 +75,7 @@ def declared_oem(root, arch, site):
     return oem.strip().lower()
 
 
-def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root):
+def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root, concurrency_limit=1):
     root = root.absolute()
     httpd = HTTPD.site(root, arch, site)
     # Physical readiness is independent of initial ABI membership. Legacy ABI
@@ -69,6 +90,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
     original = base / "ocp/inspection/fleet" / inspection_run_id
     bundle = base / "ocp/wipe/fleet" / wipe_run_id
     evidence_root = base / "reports/wipe" / wipe_run_id
+    redfish = REDFISH.site(root, arch, site, collection_root.absolute(), evidence_root / "redfish-retry")
     plugin_path = collection_root.absolute() / "plugins/filter/fleet_native_disk_clean_plan.py"
     plugin_hash = gate.digest(plugin_path)
     builder = load_module(plugin_path, "wipe_plan_builder")
@@ -80,6 +102,8 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
                      else node["bmc"]["driver"] == "redfish"
                      for node in selected),
                  "Reviewed BMC inputs do not match the OEM credential contract")
+    deadline_builder = load_module(collection_root.absolute() / "plugins/module_utils/redfish_deadline.py", "wipe_deadlines")
+    deadline_contract = deadline_builder.contract(selected, redfish[REDFISH.ENABLED])
     provenance = gate.read_yaml(original / "preflight-vars.yaml")["inspection_preflight_provenance"]
     node_evidence = {}
     for name in names:
@@ -94,9 +118,9 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         "plan_builder": plugin_hash,
     }
     plan = builder.fleet_native_disk_clean_plan(inspection_run_id, wipe_run_id,
-        selected, node_evidence, source_hashes, oem)
+        selected, node_evidence, source_hashes, oem, concurrency_limit)
     plan.update({"artifact_root": str(evidence_root), "inspection_artifact_root": str(source),
-                 "manifest_sha256": receipt.get("manifest_sha256", {})})
+                 "manifest_sha256": receipt.get("manifest_sha256", {}), "redfish_retry": redfish, "redfish_deadlines": deadline_contract})
     # Revalidate after projecting evidence so altered files cannot be sealed into
     # a plan during preparation. No credential-bearing candidate data is written.
     current_document, current_receipt, current_name = gate.validate_handoff(root, arch, site, inspection_run_id)
@@ -109,7 +133,11 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         gate.require(not path.exists(), "Wipe preparation or evidence run already exists")
     bundle.parent.mkdir(parents=True, exist_ok=True)
     bundle.mkdir(mode=0o700)
-    runtime = {"httpd_tuning": httpd, "run_id": wipe_run_id, "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
+    runtime = {"redfish_retry": redfish, "redfish_deadlines": deadline_contract,
+               "preparation_code_sha256": {str(path): gate.digest(path) for path in (
+                   ROOT / "scripts/prepare-fleet-wipe.py", ROOT / "scripts/ironic-redfish-settings.py")},
+               "concurrency_limit": plan["concurrency_limit"], "httpd_tuning": httpd, "run_id": wipe_run_id,
+               "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
                "authorized_nodes": selected, "inspection_receipt_name": receipt_name,
                "collection_root": str(collection_root.absolute()), "collection_sha256": code_hashes,
                "source_sha256": document["fleet_adapter_source_sha256"],
@@ -139,8 +167,10 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
               f"power: {profile['power_interface']}",
               "Credentials: native redfish_* driver_info; configured system IDs preserved",
               "Completion: accepted native request, return to manageable, durable outcome, verified cleanup",
-              "Concurrency: 1; stop subsequent nodes after failure", ""]
+              f"Concurrency: {plan['concurrency_limit']}; independent node lifecycles; stop queued nodes after failure; observe in-flight nodes", ""]
     review.append(HTTPD.review(httpd))
+    review.append(REDFISH.review(redfish))
+    review.append("Conductor read deadlines: phase/run bounded when adaptive reads are enabled; expiry grants no cleanup authority")
     for node in plan["authorized_nodes"]:
         review.extend([node["name"], f"  Chassis serial: {node['host_identity']['serial_number']}",
                        "  Previously inspected disks (review information; native discovery selects at execution):"])
@@ -184,8 +214,20 @@ def verify_sources(root, arch, site, bundle):
                  and plan.get("clean_steps") == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}],
                  "Require fresh all-disk native preparation; installation-volume plans cannot execute")
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
+    gate.require(runtime.get("redfish_retry") == plan.get("redfish_retry")
+                 and isinstance(runtime.get("redfish_retry"), dict)
+                 and REDFISH.normalize(runtime["redfish_retry"], Path(runtime["collection_root"]),
+                                       runtime["redfish_retry"].get(REDFISH.STAGING)) == runtime["redfish_retry"],
+                 "Redfish retry policy binding changed")
+    preparation_paths = (ROOT / "scripts/prepare-fleet-wipe.py", ROOT / "scripts/ironic-redfish-settings.py")
+    gate.require(runtime.get("preparation_code_sha256") == {str(path): gate.digest(path) for path in preparation_paths},
+                 "Retry preparation code changed")
     builder = load_module(Path(runtime["collection_root"]) / "plugins/filter/fleet_native_disk_clean_plan.py",
                           "wipe_profile_verifier")
+    limit = plan.get("concurrency_limit")
+    gate.require(type(limit) is int and 1 <= limit <= len(plan["authorized_nodes"])
+                 and runtime.get("concurrency_limit", 1) == limit,
+                 "Native concurrency binding changed")
     oem = declared_oem(root, arch, site)
     gate.require(plan.get("oem") == oem and runtime.get("oem") == oem
                  and plan.get("native_profile") == builder.fleet_native_disk_clean_profile(oem)
@@ -208,6 +250,10 @@ def verify_sources(root, arch, site, bundle):
     original_nodes = [node for node in document["inspect_fleet_plan"]["authorized_nodes"] if node["name"] in names]
     gate.require(runtime["authorized_nodes"] == original_nodes and runtime["run_id"] == plan["run_id"]
                  and runtime["artifact_root"] == plan["artifact_root"], "Runtime node binding changed")
+    deadlines = load_module(Path(runtime["collection_root"]) / "plugins/module_utils/redfish_deadline.py", "verify_wipe_deadlines")
+    gate.require(runtime.get("redfish_deadlines") == plan.get("redfish_deadlines")
+                 == deadlines.contract(runtime["authorized_nodes"], runtime["redfish_retry"][REDFISH.ENABLED]),
+                 "Redfish deadline selection binding changed")
     return plan, runtime
 
 
@@ -279,17 +325,20 @@ def main():
         parser.add_argument("--" + name, required=True)
     for name in ("inspection-run-id", "wipe-run-id", "nodes"):
         parser.add_argument("--" + name, default="")
+    parser.add_argument("--concurrency", type=int)
     parser.add_argument("--collection-root", type=Path)
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
     try:
         gate.require(args.collection_root is not None if args.command == "prepare" else args.bundle is not None,
                      "Missing collection root or preparation bundle")
+        gate.require(args.command == "prepare" or args.concurrency is None,
+                     "Concurrency may only be selected during preparation")
         adapter = load_module(ROOT / "scripts/prepare-fleet-inspection.py", "wipe_cli_adapter")
         if args.command == "prepare":
             names = adapter.selection(args.nodes)
             bundle = prepare(args.root, args.arch, args.site, args.inspection_run_id, args.wipe_run_id,
-                             names, args.collection_root)
+                             names, args.collection_root, 1 if args.concurrency is None else args.concurrency)
             print(f"Wipe preparation seeded: {bundle}; no physical authority")
         elif args.command == "seal":
             seal(args.root.absolute(), args.arch, args.site, args.bundle.absolute())
