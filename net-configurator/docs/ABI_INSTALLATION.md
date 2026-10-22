@@ -186,3 +186,61 @@ installation attempt to select different settings. Executor drift checks include
 the HTTPD tuning template. No existing ISO, installer state, credentials or boot
 authorization is changed by preparing this policy. Runtime image validation and
 host application remain separate operational steps.
+
+
+## Planned replacement and runtime retirement
+
+A healthy operating cluster may be voluntarily replaced at the same OpenShift
+version or by a fresh installation of an explicitly selected earlier/later version.
+A failed installation uses the same runtime-retirement process. Preserve the
+actual historical outcome; never mark an installation failed to permit replacement.
+
+Use the standard targets from net-configurator:
+
+1. Select `ARCH`, `SITE`, `FLEET_RUN_ID` (inspection lineage), and the explicit
+   `ABI_RETIREMENT_ATTEMPT` (installation attempt ID; original layouts use the
+   inspection run ID). Supply `ABI_RETIREMENT_REASON` and
+   `ABI_RETIREMENT_TARGET_RELEASE` as an immutable release pullspec with digest.
+2. Run `make prepare-ocp-retirement` with those values. Preparation writes only
+   the sealed review under the selected preparation's `retirement/` directory.
+   Read `review.txt`, including owner, nodes, prior outcome and intended release.
+3. Run `make retire-ocp-runtime` with the same selection and
+   `FLEET_AUTHORIZE_RETIREMENT_RUN` matching the exact installation attempt.
+   Existing passwordless sudo works for owned runtime firewall removal; the
+   workflow does not load BMC credentials or request new registry authentication.
+4. Require `reports/installation/<inspection>/attempts/<attempt>/retirement/receipt.yaml`
+   to report `RETIRED`, `cleanup_verified: true`, and `node_mutations: false`.
+   Original-layout reports omit the `attempts/<attempt>/` component.
+5. Separately prepare/review/authorize the selected fleet wipe and fresh installation.
+   Retirement does not wipe or change membership. Confirm the intended selected nodes
+   explicitly; an excluded Day 2 node remains untouched.
+
+Retirement archives complete private timestamped Ironic/HTTPD logs and checksums,
+checks the exact owner and concrete resource IDs, refuses active monitors or enrolled
+Ironic nodes, and removes only the recorded services, volume, secrets and owned
+runtime firewall rules. Nodes keep their current power and media state. Persistent
+HTTPD/sysctl settings, original ISO, auth, installer state and installation receipts
+remain unchanged. `prepare-ocp-reinstall` recognizes a matching verified retirement
+receipt without rewriting the earlier installation as successful.
+
+If an installation already completed normal cleanup, retirement verifies that owned
+resources are absent and the previous complete service archive is intact; it does
+not require an Ironic API. Missing/foreign ownership or unverifiable partial state
+is rejected with diagnostics. No force-reset option is provided.
+
+If retirement is interrupted, retain its reports and repeat the same authorized
+command after resolving the reported cause. The durable identity record supports
+already-removed resources; replacement objects with the same names are rejected.
+An active monitor claim requires investigation; do not remove claims by age or
+silently stop an installer. Failed evidence archival prevents teardown.
+
+`resume-ocp-install` continues observation of an existing attempt and performs normal
+completion cleanup only when the full fleet is Ready. Runtime retirement deliberately
+ends that serving lifecycle for replacement while preserving its actual outcome.
+Neither action automatically reboots or reinstalls nodes.
+
+The target release recorded during retirement is intent only. Current
+`prepare-ocp-reinstall` reuses the existing validated ISO. A different target release
+requires a fresh release-matched installer build, media and provenance; this retirement
+phase does not implement cross-release media preparation or reuse old sealed assets
+under a new version. Same-version reuse also requires unchanged validated inputs.

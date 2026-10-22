@@ -18,7 +18,7 @@ SHELL := /bin/bash
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
         inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
         wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso \
-        prepare-ocp-install prepare-ocp-reinstall serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install
+        prepare-ocp-install prepare-ocp-reinstall prepare-ocp-retirement retire-ocp-runtime serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -828,6 +828,23 @@ inspect-controlled-candidate:  ## Run one separately authorized Gate-6 physical 
 		-e "controlled_inspection_cleanup_report_path=$$CLEANUP_REPORT" \
 		-e "controlled_inspection_collection_playbook=$$COLLECTION_PLAYBOOK" \
 		"$${VAULT_ARGS[@]}"
+
+export ABI_RETIREMENT_REASON
+export ABI_RETIREMENT_TARGET_RELEASE
+
+prepare-ocp-retirement:  ## Prepare exact ABI runtime retirement; no cleanup or node changes
+	$(call check_arch,$@)
+	python3 scripts/prepare-abi-retirement.py prepare --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --attempt "$(ABI_RETIREMENT_ATTEMPT)" \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+
+retire-ocp-runtime:  ## Retire reviewed owned ABI services; no node power, media or disk operations
+	$(call check_arch,$@)
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
+		python3 scripts/prepare-abi-retirement.py execute --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --attempt "$(ABI_RETIREMENT_ATTEMPT)" \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
+		--authorize-run "$(FLEET_AUTHORIZE_RETIREMENT_RUN)"
 
 prepare-ocp-install:  ## Bind an existing ABI ISO and inspected fleet for review; no services or boot
 	$(call check_arch,$@)
