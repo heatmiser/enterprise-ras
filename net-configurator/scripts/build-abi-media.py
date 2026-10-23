@@ -91,7 +91,7 @@ def build(root, arch, site, run_id, build_id="", ee_image="", installer="", run=
         shared = verifier(collection_root)
         validation = shared.verify_media(stage, policy["mode"], image,
             base_url=policy["boot_artifacts_base_url"], coreos_image=coreos_image,
-            lsinitrd=lsinitrd, expected_release=provenance["release_image"], execute=run)
+            lsinitrd=lsinitrd, expected_release=provenance["release_image"], execute=run, agent_config=derived)
         kargs = validation["kernel_arguments"]
     artifacts = [{"name": iso.name, "source": iso.name, "sha256": digest(iso), "size": iso.stat().st_size}]
     if policy["mode"] == "minimal":

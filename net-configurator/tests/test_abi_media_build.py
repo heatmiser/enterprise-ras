@@ -78,6 +78,15 @@ def test_build_isolated_variants_preserve_sources_and_bind_exact_artifacts(eligi
     receipt = install.media_build(stage, RUN, 'variant-a', image, release, candidates)
     assert len(receipt['artifacts']) == (2 if mode == 'minimal' else 1)
     assert receipt['policy']['mode'] == ('full' if mode == 'manual' else mode)
+    if mode == 'minimal':
+        validation = json.loads((stage / 'media-validation/validation.json').read_text())
+        early = validation['early_network']
+        assert early['status'] == 'VERIFIED' and not early['runtime_networking_verified']
+        assert early['rendered_agent_config_sha256'] == receipt['derived_agent_sha256']
+        assert early['customized_iso_sha256'] == receipt['artifacts'][0]['sha256']
+        expected = yaml.safe_load((stage / 'media-agent-config.yaml').read_text())
+        assert [host['hostname'] for host in early['hosts']] == sorted(host['hostname'] for host in expected['hosts'])
+        assert not (stage / 'agent-config.yaml').exists()
     if mode == 'full-ram':
         assert any('--append' in c and 'coreos.liveiso.fromram=1' in c for c in calls)
     with pytest.raises(ValueError, match='destination exists'):
@@ -166,3 +175,31 @@ def test_preparation_rejects_obsolete_or_modified_validation(eligible_run, chang
     path.write_text(yaml.safe_dump(build))
     with pytest.raises(ValueError):
         install.media_build(stage, RUN, 'ram-a', image, release, candidates)
+
+
+@pytest.mark.parametrize('changed', ['missing', 'status', 'hosts', 'offset', 'payload'])
+def test_minimal_preparation_requires_sealed_early_network(eligible_run, changed):
+    root, bundle, _ = eligible_run
+    policy(root, 'minimal')
+    stage = builder.build(root, '2-8-5-200', 'test01', RUN, 'minimal-early', run=native(root, 'minimal', []))
+    image, candidates, _ = builder.gate.validate_handoff(root, '2-8-5-200', 'test01', RUN)
+    release = builder.gate.read_yaml(bundle / 'preflight-vars.yaml')['inspection_preflight_provenance']['release_image']
+    build_path = stage / 'media-build.yaml'
+    build = yaml.safe_load(build_path.read_text())
+    evidence = stage / build['validation']['source']
+    record = json.loads(evidence.read_text())
+    if changed == 'missing':
+        record.pop('early_network')
+    elif changed == 'status':
+        record['early_network']['status'] = 'CAPTURED'
+    elif changed == 'hosts':
+        record['early_network']['hosts'] = []
+    elif changed == 'offset':
+        record['early_network']['offset'] += 2048
+    else:
+        (stage / record['early_network']['payload']['path']).write_bytes(b'changed')
+    evidence.write_text(json.dumps(record))
+    build['validation']['sha256'] = builder.digest(evidence)
+    build_path.write_text(yaml.safe_dump(build))
+    with pytest.raises(ValueError):
+        install.media_build(stage, RUN, 'minimal-early', image, release, candidates)
