@@ -32,6 +32,7 @@ def load(path, name):
 gate = load(ROOT / "scripts/validate-abi-handoff.py", "install_gate")
 state = gate.cleaning_state
 require = gate.require
+MEDIA = load(ROOT / "scripts/abi-media-settings.py", "install_media")
 HTTPD = load(ROOT / "scripts/ironic-httpd-settings.py", "install_httpd")
 
 
@@ -81,14 +82,14 @@ def network(nodes):
     return selected, routes, sorted(sources)
 
 
-def inputs(root, arch, site, run_id):
+def inputs(root, arch, site, run_id, build_id="", collection=None):
     state.site_root(root, arch, site)
-    image, _, receipt = gate.validate_handoff(root, arch, site, run_id)
+    image, candidates, receipt = gate.validate_handoff(root, arch, site, run_id)
     base = root / "output" / arch / site
     original = base / "ocp/inspection/fleet" / run_id
     inspection = gate.read_yaml(original / "plan.yml")["inspect_fleet_plan"]
     provenance = gate.read_yaml(original / "preflight-vars.yaml")["inspection_preflight_provenance"]
-    stage = base / "ocp-iso" / run_id
+    stage = MEDIA.build_path(base, run_id, build_id)
     require(gate.read_yaml(stage / "eligibility.yaml") == receipt, "ISO staging eligibility differs from inspection")
     iso = stage / "agent.x86_64.iso"
     source_hashes = {name: digest(stage / name) for name in (
@@ -101,7 +102,71 @@ def inputs(root, arch, site, run_id):
                           if node["role"] == "master"}, "Rendezvous is not an inspected control-plane node")
     release = provenance["release_image"]
     require(bool(re.fullmatch(r"[^\s]+@sha256:[a-f0-9]{64}", release)), "Release must be immutable")
+    if build_id or (stage / "media-build.yaml").exists():
+        build = media_build(stage, run_id, build_id, image, release, candidates, collection)
+        source_hashes["media-build.yaml"] = digest(stage / "media-build.yaml")
+        source_hashes["media-agent-config.yaml"] = digest(stage / "media-agent-config.yaml")
+        if build.get("schema_version") == 2:
+            validation = json.loads((stage / build["validation"]["source"]).read_text())
+            source_hashes[build["validation"]["source"]] = build["validation"]["sha256"]
+            for evidence in validation["evidence"]:
+                source_hashes[evidence["path"]] = evidence["sha256"]
+        for artifact in build["artifacts"]:
+            source_hashes[artifact["source"]] = artifact["sha256"]
     return base, iso, source_hashes, image, release, inspection["authorized_nodes"], rendezvous
+
+
+def media_build(stage, run_id, build_id, image, release, candidates, collection=None):
+    build = state.read(stage / "media-build.yaml")
+    require(build.get("schema_version") in (1, 2) and build["inspection_run_id"] == run_id
+            and build["build_id"] == build_id and build["installer_ee"] == image
+            and build["release_image"] == release, "Media build identity/provenance changed")
+    policy = MEDIA.normalize(build["policy"])
+    require(build["source_manifest_sha256"] == {
+        name: hashlib.sha256(content).hexdigest() for name, content in candidates.items()},
+        "Media source manifest binding changed")
+    require(digest(stage / "media-agent-config.yaml") == build["derived_agent_sha256"]
+            and state.read(stage / "media-agent-config.yaml") == MEDIA.derive(
+                yaml.safe_load(candidates["agent-config.yaml"]), policy), "Derived media configuration changed")
+    expected = [("agent.x86_64.iso", "agent.x86_64.iso")]
+    if policy["mode"] == "minimal":
+        expected.append(("agent.x86_64-rootfs.img", "boot-artifacts/agent.x86_64-rootfs.img"))
+    require([(item["name"], item["source"]) for item in build["artifacts"]] == expected,
+            "Media artifact membership differs from selected mode")
+    for artifact in build["artifacts"]:
+        path = stage / artifact["source"]
+        require(type(artifact["size"]) is int and artifact["size"] > 0
+                and digest(path) == artifact["sha256"] and path.stat().st_size == artifact["size"],
+                "Media artifact identity changed")
+    if policy["mode"] in ("full-ram", "minimal"):
+        require(build.get("schema_version") == 2, "Obsolete variant validation; generate a fresh build")
+        builder = load(ROOT / "scripts/build-abi-media.py", "install_media_builder")
+        shared = builder.verifier(collection if collection is not None else builder.DEFAULT_COLLECTION)
+        require(build.get("verifier_sha256") == shared.verifier_digest(), "Media verifier identity changed")
+        reference = build["validation"]
+        require(reference["source"] == "media-validation/validation.json", "Validation evidence reference changed")
+        path = stage / reference["source"]
+        require(digest(path) == reference["sha256"], "Validation receipt changed")
+        record = json.loads(path.read_text())
+        shared.validate_record(stage, record, policy["mode"], image, release,
+                               build["kernel_arguments"], policy["boot_artifacts_base_url"])
+    return build
+
+
+def media_contract(iso, build_id=""):
+    if not (iso.parent / "media-build.yaml").exists():
+        require(not build_id, "Missing variant build receipt")
+        return {"mode": "full", "build_id": "", "boot_artifacts_base_url": "", "artifacts": [
+            {"name": iso.name, "source": iso.name, "sha256": digest(iso), "size": iso.stat().st_size}]}
+    build = state.read(iso.parent / "media-build.yaml")
+    return {**build["policy"], "build_id": build_id, "artifacts": build["artifacts"]}
+
+
+def firewall_sources(contract, bmc_sources, nodes):
+    sources = set(bmc_sources)
+    if contract["mode"] == "minimal":
+        sources.update(node["callback_ip"] for node in nodes)
+    return [{"source": source, "port": 6180} for source in sorted(sources)]
 
 
 def installation_paths(base, run_id, attempt_id=""):
@@ -181,9 +246,17 @@ def prepare_repeat(root, arch, site, run_id, collection, lock=None):
 
 def prepare(root, arch, site, run_id, collection, attempt_id=""):
     httpd = HTTPD.site(root, arch, site)
-    base, iso, hashes, ee, release, nodes, rendezvous = inputs(root, arch, site, run_id)
+    build_id = os.environ.get("ABI_MEDIA_BUILD_ID", "")
+    base, iso, hashes, ee, release, nodes, rendezvous = inputs(root, arch, site, run_id, build_id, collection)
     state.check(base)
+    contract = media_contract(iso, build_id)
+    policy = MEDIA.site(root, arch, site)
+    require(MEDIA.content(policy) == {key: contract[key] for key in MEDIA.DEFAULTS},
+            "Site media policy differs from selected build; generate/select matching media")
     selected, routes, bmc_sources = network(nodes)
+    if contract["mode"] == "minimal":
+        require(contract["boot_artifacts_base_url"] == f"http://{routes[0]['source']}:6180/redfish",
+                "Minimal rootfs base URL differs from the reviewed serving endpoint")
     reader = load(ROOT / "scripts/init-ocp-settings.py", "install_settings")
     workbook_oem = reader.read_ocp_settings(root / "input" / arch / site / f"{arch}.xlsx").get("ocp_oem", "")
     oem = gate.read_yaml(root / "input" / arch / site / "ocp-settings.yml").get("oem", "")
@@ -192,7 +265,8 @@ def prepare(root, arch, site, run_id, collection, attempt_id=""):
     bundle, reports = installation_paths(base, run_id, attempt_id)
     require(not bundle.exists(), "Installation preparation exists; use verify/serve instead of overwriting it")
     require(not reports.exists(), "Installation reports already exist; require a fresh attempt")
-    plan = {"httpd_tuning": httpd, "schema_version": 1, "inspection_run_id": run_id, "operation": "serve_existing_abi_iso",
+    plan = {"boot_method": "manual" if policy["mode"] == "manual" else "automatic",
+            "media": contract, "httpd_tuning": httpd, "schema_version": 1, "inspection_run_id": run_id, "operation": "serve_existing_abi_iso",
             "iso_path": str(iso), "iso_sha256": hashes["agent.x86_64.iso"], "iso_size": iso.stat().st_size,
             "source_sha256": hashes, "installer_ee": ee, "release_image": release,
             "rendezvous_ip": rendezvous, "node_names": sorted(node["name"] for node in nodes),
@@ -200,14 +274,14 @@ def prepare(root, arch, site, run_id, collection, attempt_id=""):
             "publisher_driver": "idrac" if oem.lower() == "dell" else "redfish",
             "provisioning_ip": routes[0]["source"], "provisioning_interface": routes[0]["interface"],
             "http_port": 6180, "api_port": 6385, "firewall_zone": "public",
-            "firewall_rules": [{"source": source, "port": 6180} for source in bmc_sources],
+            "firewall_rules": firewall_sources(contract, bmc_sources, selected),
             "bundle": str(bundle), "media_dir": str(bundle / "media"),
             "reports_dir": str(reports / "serving"),
             "collection_root": str(collection), "collection_sha256": collection_hashes(collection),
             "physical_authority": False}
     if attempt_id:
         plan["installation_attempt_id"] = attempt_id
-    require(hashes == inputs(root, arch, site, run_id)[2], "ISO inputs changed during preparation")
+    require(hashes == inputs(root, arch, site, run_id, build_id, collection)[2], "ISO inputs changed during preparation")
     bundle.mkdir(parents=True, mode=0o700)
     state.write(bundle / "plan.yml", {"abi_install_plan": plan})
     state.write(bundle / "prepared.yaml", {"plan_sha256": state.fingerprint(plan)})
@@ -216,7 +290,8 @@ def prepare(root, arch, site, run_id, collection, attempt_id=""):
               f"Rendezvous: {rendezvous}", "Selected initial nodes: " + ", ".join(plan["node_names"]),
               f"Release: {release}", f"Installer EE: {ee}",
               "Scope: start Ironic/HTTPD and publish the existing ISO; NO node enrollment, boot or cleaning.",
-              "Only the ISO enters the serving directory; original installer state/auth remain private."]
+              f"Media mode: {contract['mode']}; build: {build_id or 'legacy'}; boot: {plan['boot_method']}",
+              "Only sealed boot artifacts enter the serving directory; installer state/auth remain private."]
     review.append(HTTPD.review(httpd))
     (bundle / "review.txt").write_text("\n".join(review) + "\n")
     (bundle / "review.txt").chmod(0o600)
@@ -224,10 +299,17 @@ def prepare(root, arch, site, run_id, collection, attempt_id=""):
 
 
 def verify(root, arch, site, run_id, collection):
-    base, _, hashes, ee, release, nodes, rendezvous = inputs(root, arch, site, run_id)
+    base = state.site_root(root, arch, site)
     state.check(base)
     bundle, attempt_id = selected_installation(base, run_id)
     plan = gate.read_yaml(bundle / "plan.yml")["abi_install_plan"]
+    build_id = plan.get("media", {}).get("build_id", "")
+    _, iso, hashes, ee, release, nodes, rendezvous = inputs(root, arch, site, run_id, build_id, collection)
+    contract = media_contract(iso, build_id)
+    require(plan.get("media", contract) == contract, "Prepared media contract changed")
+    require(plan.get("boot_method", "automatic") in ("automatic", "manual")
+            and (plan.get("boot_method") != "manual" or contract["mode"] == "full"),
+            "Invalid media boot method")
     HTTPD.normalize(plan.get("httpd_tuning", {}))
     require(gate.read_yaml(bundle / "prepared.yaml")["plan_sha256"] == state.fingerprint(plan), "Prepared plan changed")
     _, reports = installation_paths(base, run_id, attempt_id)
@@ -242,7 +324,7 @@ def verify(root, arch, site, run_id, collection):
             "Collection serving implementation changed; review a fresh preparation")
     selected, routes, sources = network(nodes)
     require(plan["nodes"] == selected and plan["routes"] == routes
-            and plan["firewall_rules"] == [{"source": source, "port": 6180} for source in sources],
+            and plan["firewall_rules"] == firewall_sources(contract, sources, selected),
             "Routes or BMC identities changed")
     return bundle, plan
 
@@ -276,7 +358,11 @@ OEM_BOOT_PROFILES = {
 def boot_hashes(collection):
     paths = [collection / "playbooks/install_abi.yml"]
     paths.extend(sorted((collection / "roles/abi_install_driver").rglob("*.yml")))
-    require(len(paths) == 9, "Incomplete ABI installation driver packaging")
+    required = {"main.yml", "adopt.yml", "boot.yml", "monitor.yml", "complete.yml", "manual_handoff.yml"}
+    require(required <= {path.name for path in (collection / "roles/abi_install_driver/tasks").glob("*.yml")}
+            and (collection / "roles/abi_install_driver/defaults/main.yml").is_file()
+            and (collection / "roles/abi_install_driver/meta/argument_specs.yml").is_file()
+            and paths[0].is_file(), "Incomplete ABI installation driver packaging")
     return {str(path.relative_to(collection)): digest(path) for path in paths}
 
 
@@ -298,6 +384,8 @@ def serving_handoff(plan, lock):
             and receipt["runtime_retained"] is True and receipt["ownership_confirmed"] is True
             and receipt["lock_owned"] is True and receipt["physical_execution"] is False,
             "Serving receipt is not eligible for adoption")
+    if "media" in plan:
+        require(receipt.get("media") == plan["media"], "Serving media manifest changed")
     require(receipt["url"] == f"http://{plan['provisioning_ip']}:{plan['http_port']}/redfish/agent.x86_64.iso",
             "Unexpected served ISO URL")
     require(bool(re.fullmatch(r"[^\s]+@sha256:[a-f0-9]{64}", receipt["ironic_image"])),
@@ -307,11 +395,15 @@ def serving_handoff(plan, lock):
 
 def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
     bundle, serving = verify(root, arch, site, run_id, collection)
-    require(serving["oem"] in OEM_BOOT_PROFILES, "ABI boot implementation unavailable for workbook OEM")
+    manual = serving.get("boot_method") == "manual"
+    require(manual or serving["oem"] in OEM_BOOT_PROFILES, "ABI boot implementation unavailable for workbook OEM")
     attempt, receipt = serving_handoff(serving, lock)
-    _, _, _, _, _, inspected, _ = inputs(root, arch, site, run_id)
+    _, _, _, _, _, inspected, _ = inputs(root, arch, site, run_id, serving.get("media", {}).get("build_id", ""), collection)
     nodes = []
     for node in inspected:
+        if manual:
+            nodes.append({"name": node["name"]})
+            continue
         bmc = node["bmc"]
         system_id = bmc.get("system_id") or ("System.Embedded.1" if serving["oem"] == "dell" else "1")
         system_id = system_id.removeprefix("/redfish/v1/Systems/").rstrip("/")
@@ -319,7 +411,7 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
         require(system_id == "System.Embedded.1", "Dell OpenManage virtual media requires System.Embedded.1")
         nodes.append({"name": node["name"], "bmc_host": bmc["host"], "system_id": system_id,
                       "verify_ca": bool(bmc.get("verify_ca", False))})
-    profile = dict(OEM_BOOT_PROFILES[serving["oem"]])
+    profile = {"method": "operator_manual", "media_owner": "operator"} if manual else dict(OEM_BOOT_PROFILES[serving["oem"]])
     expected_nodes = expected_cluster_nodes(serving)
     plan = {"schema_version": 1, "operation": "boot_existing_abi_iso", "inspection_run_id": run_id,
             "serving_plan": serving, "serving_attempt": str(attempt), "serving_receipt": receipt,
@@ -342,7 +434,9 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
               f"Serving owner: {attempt}", f"ISO URL: {receipt['url']}",
               f"ISO SHA256: {serving['iso_sha256']}", "Nodes: " + ", ".join(plan["node_names"]),
               "Workbook OEM: " + serving["oem"], "Boot profile: " + json.dumps(profile, sort_keys=True),
-              "Virtual media boot ONCE before power-on; persistent BIOS boot order is unchanged.",
+              ("Operator inserts reviewed media and boots selected nodes; interactive Continue is required. "
+               "Operator media is never ejected by automation." if manual else
+               "Virtual media boot ONCE before power-on; persistent BIOS boot order is unchanged."),
               "No Ironic enrollment, provisioning transitions, inspection or cleaning.",
               "Boot authority: none. No hardware was contacted by preparation.",
               "Expected Ready Kubernetes nodes: " + ", ".join(expected_nodes),
@@ -381,7 +475,9 @@ def verify_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
             and plan["artifact_root"] == str(Path(serving["reports_dir"]).parent / "boot"),
             "Boot installation attempt identity or paths changed")
     require(plan["collection_sha256"] == boot_hashes(collection), "Boot implementation changed")
-    require(plan["profile"] == OEM_BOOT_PROFILES.get(serving["oem"]), "Workbook OEM boot profile changed")
+    profile = ({"method": "operator_manual", "media_owner": "operator"} if serving.get("boot_method") == "manual"
+               else OEM_BOOT_PROFILES.get(serving["oem"]))
+    require(plan["profile"] == profile, "Workbook OEM boot profile changed")
     require(plan["node_names"] == serving["node_names"]
             and [node["name"] for node in plan["nodes"]] == plan["node_names"]
             and plan["automated_clean"] is False and plan["physical_authority"] is False,
@@ -391,31 +487,83 @@ def verify_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
     return bundle / "boot", plan
 
 
-def boot(root, arch, site, run_id, collection, lease, authorize_run, resume=False):
+def manual_binding(plan):
+    return {"schema_version": 1, "operation": "operator_manual_boot_attestation",
+            "installation_attempt_id": plan.get("installation_attempt_id", plan["inspection_run_id"]),
+            "plan_sha256": state.fingerprint(plan), "node_names": plan["node_names"],
+            "iso_sha256": plan["serving_plan"]["iso_sha256"], "iso_url": plan["serving_receipt"]["url"]}
+
+
+def manual_handoff(plan, continuing=False):
+    """A durable operator attestation; never a claim of BMC or OS observation."""
+    artifact = state.safe_path(Path(plan["artifact_root"]))
+    path = artifact / "operator-handoff.yaml"
+    binding = manual_binding(plan)
+    if path.exists():
+        record = state.read(path)
+        require({key: record.get(key) for key in binding} == binding, "Manual handoff binding changed")
+        require(record.get("status") in ("WAITING_FOR_OPERATOR", "OPERATOR_CONFIRMED"), "Invalid manual handoff state")
+        if record["status"] == "OPERATOR_CONFIRMED":
+            require(isinstance(record.get("confirmed_at"), str), "Missing manual confirmation time")
+            confirmed = datetime.fromisoformat(record["confirmed_at"])
+            require(confirmed.tzinfo is not None and confirmed <= datetime.now(timezone.utc), "Invalid manual confirmation time")
+            return
+        require(continuing, "Manual handoff is waiting; use continue-ocp-install")
+    else:
+        require(not continuing, "No manual gate to continue; run boot-ocp-nodes first")
+        state.write(path, {**binding, "status": "WAITING_FOR_OPERATOR"})
+    print("WAITING_FOR_OPERATOR: insert the reviewed media and boot every selected node.", flush=True)
+    print("ISO: " + binding["iso_url"] + "\nSHA256: " + binding["iso_sha256"], flush=True)
+    print("Nodes: " + ", ".join(binding["node_names"]), flush=True)
+    require(sys.stdin.isatty(), "Manual Continue requires an interactive terminal; waiting record retained")
+    try:
+        response = input("Press Enter to attest that media was inserted and selected nodes were booted; Ctrl-C to leave waiting: ")
+    except (EOFError, KeyboardInterrupt) as error:
+        raise ValueError("Manual handoff remains waiting; use continue-ocp-install") from error
+    require(response == "", "Continue requires Enter only; waiting record retained")
+    state.write(path, {**binding, "status": "OPERATOR_CONFIRMED",
+                       "confirmed_at": datetime.now(timezone.utc).isoformat()})
+
+
+def boot(root, arch, site, run_id, collection, lease, authorize_run, resume=False, continuing=False):
     bundle, plan = verify_boot(root, arch, site, run_id, collection)
     require(authorize_run == plan.get("installation_attempt_id", run_id),
             "Explicit FLEET_AUTHORIZE_BOOT_RUN must match the reviewed installation attempt")
     require(plan["workflow_ready"] is True,
             "Boot execution disabled until installer monitoring and completion cleanup are implemented")
+    manual = plan["profile"]["method"] == "operator_manual"
+    require(not continuing or manual, "Continue is only available for a manual boot handoff")
     secrets = state.safe_path(collection / "inventories" / site / "secrets.yaml")
-    require(secrets.is_file(), "Missing selected site BMC vault")
+    if not manual:
+        require(secrets.is_file(), "Missing selected site BMC vault")
     artifact = state.safe_path(Path(plan["artifact_root"]))
-    if resume:
-        previous = state.read(artifact / "runtime.yaml")
-        require(previous.get("boot_complete") is True and previous.get("runtime_retained") is True
-                and not previous.get("cleanup_started", False),
-                "Resume requires completed boot and retained runtime before shared cleanup")
+    if resume or continuing:
         require(state.read(artifact / "plan.yml") == {"abi_boot_plan": plan}, "Executed boot plan changed")
     else:
         require(not artifact.exists(), "Boot already attempted; use resume-ocp-install for observation")
         artifact.mkdir(parents=True, mode=0o700)
         state.write(artifact / "plan.yml", {"abi_boot_plan": plan})
+    if manual:
+        if resume:
+            require(state.read(artifact / "operator-handoff.yaml").get("status") == "OPERATOR_CONFIRMED",
+                    "Manual handoff is waiting; use continue-ocp-install")
+        manual_handoff(plan, continuing=continuing)
+        # A confirmed handoff may have been interrupted before Ansible started.
+        resume = (artifact / "runtime.yaml").exists()
+        require(resume or not (artifact / "execution.claim").exists(), "Incomplete execution claim; retain evidence for recovery")
+    if resume:
+        previous = state.read(artifact / "runtime.yaml")
+        require((manual or previous.get("boot_complete") is True)
+                and previous.get("runtime_retained") is True and not previous.get("cleanup_started", False),
+                "Resume requires completed boot and retained runtime before shared cleanup")
     command = ["ansible-playbook", str(ROOT / "playbooks/install-ocp.yml"), "-i", "localhost,",
-               "-e", "@" + str(bundle / "plan.yml"), "-e", "@" + str(secrets),
+               "-e", "@" + str(bundle / "plan.yml"),
                "-e", "abi_install_driver_authorize_run=" + authorize_run,
                "-e", "abi_install_driver_action=" + ("resume" if resume else "install")]
-    vault = root / ".era-secrets/vault-pass"
-    command += ["--vault-password-file", str(vault)] if vault.is_file() else ["--ask-vault-pass"]
+    if not manual:
+        command += ["-e", "@" + str(secrets)]
+        vault = root / ".era-secrets/vault-pass"
+        command += ["--vault-password-file", str(vault)] if vault.is_file() else ["--ask-vault-pass"]
     print(f"Boot evidence: {artifact}", flush=True)
     result = subprocess.run(command, cwd=root, pass_fds=(lease.fd,))
     require(result.returncode == 0, f"Boot incomplete; retain runtime and review {artifact}/runtime.yaml")
@@ -424,7 +572,7 @@ def boot(root, arch, site, run_id, collection, lease, authorize_run, resume=Fals
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "prepare-repeat", "verify", "serve", "prepare-boot", "verify-boot", "boot", "resume"))
+    parser.add_argument("action", choices=("prepare", "prepare-repeat", "verify", "serve", "prepare-boot", "verify-boot", "boot", "resume", "continue"))
     parser.add_argument("--root", type=Path, default=ROOT)
     for name in ("arch", "site", "run-id"):
         parser.add_argument("--" + name, required=True)
@@ -455,7 +603,7 @@ def main():
                 print("ABI boot preparation verified; no boot authorized.")
             else:
                 boot(root, args.arch, args.site, args.run_id, collection, lease, args.authorize_run,
-                     resume=args.action == "resume")
+                     resume=args.action == "resume", continuing=args.action == "continue")
     except (ValueError, KeyError, TypeError, IndexError, OSError, yaml.YAMLError, subprocess.SubprocessError) as error:
         # Errors describe paths/checks, never credential-bearing candidate data.
         reason = str(error) if isinstance(error, ValueError) else type(error).__name__

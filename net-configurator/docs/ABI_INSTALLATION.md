@@ -244,3 +244,26 @@ The target release recorded during retirement is intent only. Current
 requires a fresh release-matched installer build, media and provenance; this retirement
 phase does not implement cross-release media preparation or reuse old sealed assets
 under a new version. Same-version reuse also requires unchanged validated inputs.
+
+## Named live-media variants
+
+See [ABI media modes](ABI_MEDIA_MODES.md) for `full` (default), `full-ram`,
+`minimal` and `manual`, isolated build identities, sealed rootfs publication and pinned-image
+verification requirements. Generation, serving and boot authorization remain
+separate steps. Existing attempts retain their original full-media interpretation.
+
+
+## Operator-owned manual boot
+
+With a fresh attempt prepared under `mode: manual`, the boot review seals an
+operator-manual profile. `boot-ocp-nodes` waits for interactive Enter after media
+insertion and boot; `continue-ocp-install` returns to an interrupted gate using
+the same exact attempt authorization. Confirmation is durable and bound to the
+reviewed plan, media and membership. No BMC credentials or calls are made.
+
+After confirmation the usual native waits and exact fleet Ready gate run.
+`resume-ocp-install` resumes confirmed observation without repeating the prompt.
+Completion removes the owned server only; operator media and boot settings are
+left untouched and remain the operator's cleanup responsibility. Receipts retain
+`boot_complete: false`, per-node `boot_request_accepted: false`, and a separate
+operator attestation. See the media-mode guide for evidence paths and gate states.

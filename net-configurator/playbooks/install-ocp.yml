@@ -10,6 +10,7 @@
           - bmc_credentials[item].username | default('') | length > 0
           - bmc_credentials[item].password | default('') | length > 0
       loop: "{{ abi_boot_plan.node_names }}"
+      when: abi_boot_plan.profile.method != 'operator_manual'
       no_log: true
 
     - name: Initialize private boot credentials
@@ -22,6 +23,7 @@
         abi_install_driver_credentials: >-
           {{ abi_install_driver_credentials | combine({item: bmc_credentials[item]}) }}
       loop: "{{ abi_boot_plan.node_names }}"
+      when: abi_boot_plan.profile.method != 'operator_manual'
       no_log: true
 
     - name: Bind the reviewed boot handoff

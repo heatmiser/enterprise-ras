@@ -18,7 +18,7 @@ SHELL := /bin/bash
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
         inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
         wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso \
-        prepare-ocp-install prepare-ocp-reinstall prepare-ocp-retirement retire-ocp-runtime serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install
+        prepare-ocp-install prepare-ocp-reinstall prepare-ocp-retirement retire-ocp-runtime serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install continue-ocp-install
 
 # ============================================================================
 # Architecture + Site Configuration
@@ -867,10 +867,17 @@ prepare-ocp-boot:  ## Bind the running ISO server and initial fleet for boot rev
 	python3 scripts/prepare-abi-install.py prepare-boot --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
 
-boot-ocp-nodes:  ## Authorized Dell boot, installation monitoring and completion-only cleanup
+boot-ocp-nodes:  ## Authorized automatic boot or interactive manual handoff, then installation monitoring
 	$(call check_arch,$@)
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
 		python3 scripts/prepare-abi-install.py boot --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
+		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
+
+continue-ocp-install:  ## Return to an interrupted manual media handoff, then observe installation
+	$(call check_arch,$@)
+	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
+		python3 scripts/prepare-abi-install.py continue --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
 		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
 
@@ -881,56 +888,18 @@ resume-ocp-install:  ## Resume installer observation and completion cleanup with
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
 		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
 
-generate-ocp-iso:  ## Generate ABI ISO from an eligible physical inspection - requires ARCH, SITE, FLEET_RUN_ID
-	$(call check_arch,$@)
-	python3 scripts/fleet-cleaning-state.py lease --root "$(CURDIR)" --arch "$(ARCH)" --site "$(SITE)" -- \
-		$(MAKE) --no-print-directory _generate-ocp-iso
+ABI_COREOS_INSTALLER_IMAGE ?= quay.io/coreos/coreos-installer@sha256:db8c1dc7aa5955613243c5cd73d2be58ae7b839873563dc44e0bf0a15e7fed71
+ABI_LSINITRD ?= /usr/bin/lsinitrd
+export ABI_MEDIA_BUILD_ID
 
-_generate-ocp-iso:
-	@if [ -z "$$RHV_NATIVE_OPERATION_LOCK_FD" ]; then echo "ERROR: ISO generation requires the site lease"; exit 1; fi
-	@if [ -z "$(FLEET_RUN_ID)" ]; then \
-		echo "ERROR: FLEET_RUN_ID of a successful eligible physical inspection is required"; \
-		exit 1; \
-	fi; \
-	ABS_STAGE="$(CURDIR)/output/$(ARCH)/$(SITE)/ocp-iso/$(FLEET_RUN_ID)"; \
-	EE_IMAGE="$$(python3 scripts/validate-abi-handoff.py \
-		--arch "$(ARCH)" --site "$(SITE)" --run-id "$(FLEET_RUN_ID)" \
-		--stage-dir "$$ABS_STAGE" --ee-image "$(OCP_EE_IMAGE)" --installer "$(OPENSHIFT_INSTALL)")" || exit 1; \
-	if [ -z "$(OPENSHIFT_INSTALL)" ]; then \
-		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
-		echo "  Generating OCP ABI ISO  arch=$(ARCH)  site=$(SITE)"; \
-		echo "  Staging dir: $$ABS_STAGE"; \
-		echo "  openshift-install: $$EE_IMAGE (prepared immutable container)"; \
-		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
-		podman run --rm \
-			--userns=keep-id \
-			-v "$$ABS_STAGE:$$ABS_STAGE:Z" \
-			"$$EE_IMAGE" \
-			openshift-install --dir "$$ABS_STAGE" agent create image || exit 1; \
-	else \
-		OCP_BIN="$(OPENSHIFT_INSTALL)"; \
-		if ! command -v "$$OCP_BIN" >/dev/null 2>&1; then \
-			echo "❌ ERROR: openshift-install not found. Provide one of:"; \
-			echo "   make generate-ocp-iso ARCH=$(ARCH) SITE=$(SITE) OCP_EE_IMAGE=quay.io/s4v0/dcm-ocp-ee-4.22"; \
-			echo "   make generate-ocp-iso ARCH=$(ARCH) SITE=$(SITE) OPENSHIFT_INSTALL=/path/to/openshift-install"; \
-			exit 1; \
-		fi; \
-		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
-		echo "  Generating OCP ABI ISO  arch=$(ARCH)  site=$(SITE)"; \
-		echo "  Staging dir: $$ABS_STAGE"; \
-		echo "  openshift-install: $$OCP_BIN ($$($$OCP_BIN version 2>/dev/null | head -1))"; \
-		echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"; \
-		"$$OCP_BIN" --dir "$$ABS_STAGE" agent create image; \
-	fi; \
-	ISO_PATH="$$ABS_STAGE/agent.x86_64.iso"; \
-	if [ ! -f "$$ISO_PATH" ]; then \
-		echo "❌ openshift-install exited but $$ISO_PATH was not created"; \
-		exit 1; \
-	fi; \
-	echo "" && \
-	echo "✅ ABI ISO generated: $$ISO_PATH" && \
-	echo "   Size: $$(du -sh "$$ISO_PATH" | cut -f1)" && \
-	echo "   Boot this ISO on all cluster nodes to begin the OCP installation."
+generate-ocp-iso:  ## Build isolated ABI media from a successful eligible physical inspection
+	$(call check_arch,$@)
+	python3 scripts/build-abi-media.py --arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(FLEET_RUN_ID)" --build-id "$(ABI_MEDIA_BUILD_ID)" \
+		--ee-image "$(OCP_EE_IMAGE)" --installer "$(OPENSHIFT_INSTALL)" \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
+		--coreos-installer-image "$(ABI_COREOS_INSTALLER_IMAGE)" --lsinitrd "$(ABI_LSINITRD)"
+
 
 init-ocp-settings:  ## Bootstrap ocp-settings.yml from ERA inventory - requires ARCH, optional SITE FORCE=1
 	$(call check_arch,$@)
