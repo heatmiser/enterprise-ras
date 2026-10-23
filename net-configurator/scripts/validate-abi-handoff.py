@@ -77,11 +77,19 @@ def validate_handoff(root, arch, site, run_id, ee_image="", installer=""):
     return image, candidates, receipt
 
 
+def staging_path(base, run_id, build_id=""):
+    spec = importlib.util.spec_from_file_location("abi_handoff_media", ROOT / "scripts/abi-media-settings.py")
+    media = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(media)
+    return media.build_path(base, run_id, build_id)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     for key in ("arch", "site", "run-id", "stage-dir"):
         parser.add_argument(f"--{key}", required=True)
+    parser.add_argument("--build-id", default="")
     parser.add_argument("--ee-image", default="")
     parser.add_argument("--installer", default="")
     args = parser.parse_args()
@@ -93,7 +101,7 @@ def main():
             image, candidates, receipt = validate_handoff(root, args.arch, args.site, args.run_id,
                                                            args.ee_image, args.installer)
             stage = Path(args.stage_dir).absolute()
-            require(stage == base / "ocp-iso" / args.run_id, "Require site/run-specific ISO staging path")
+            require(stage == staging_path(base, args.run_id, args.build_id), "Require site/run-specific ISO staging path")
             require(not any(p.is_symlink() for p in (stage, *stage.parents)), "Symlink ISO staging path")
             stage.mkdir(parents=True, exist_ok=False, mode=0o700)
             for filename, content in candidates.items():

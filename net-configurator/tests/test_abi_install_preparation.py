@@ -143,7 +143,7 @@ def served_install(staged_install):
     (attempt / 'plan.yml').write_text(yaml.safe_dump({'abi_install_plan': plan}))
     receipt = {'schema_version': 1, 'status': 'SERVING', 'attempt': str(attempt),
                'inspection_run_id': RUN, 'node_names': plan['node_names'],
-               'iso_sha256': plan['iso_sha256'], 'runtime_retained': True, 'lock_owned': True,
+               'media': plan['media'], 'iso_sha256': plan['iso_sha256'], 'runtime_retained': True, 'lock_owned': True,
                'ownership_confirmed': True, 'physical_execution': False,
                'url': 'http://192.0.2.10:6180/redfish/agent.x86_64.iso',
                'ironic_image': 'registry.example.test/ironic@sha256:' + 'd' * 64}
@@ -260,10 +260,11 @@ def test_monitoring_implementation_drift_blocks_execution(served_install):
 ])
 def test_resume_cannot_replay_boot_or_interrupt_shared_cleanup(served_install, monkeypatch, receipt):
     root, collection, _, _, lock = served_install
-    install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    target = install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
     _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
     artifact = Path(plan['artifact_root'])
     artifact.mkdir(parents=True)
+    (artifact / 'plan.yml').write_bytes((target / 'plan.yml').read_bytes())
     (artifact / 'runtime.yaml').write_text(yaml.safe_dump(receipt))
     secrets = collection / 'inventories/test01/secrets.yaml'
     secrets.write_text('fixture: vaulted')
@@ -512,3 +513,32 @@ def test_verified_retirement_unblocks_repeat_without_rewriting_installation(tmp_
     (h[3] / 'retirement/receipt.yaml').write_text(yaml.safe_dump(receipt))
     with pytest.raises(ValueError, match='retirement receipt'):
         install.require_previous_cleanup(h[1], RUN, h[5])
+
+
+def test_legacy_full_plan_without_media_field_still_verifies(staged_install):
+    bundle = prepare(staged_install)
+    document = install.state.read(bundle / 'plan.yml')
+    document['abi_install_plan'].pop('media')
+    install.state.write(bundle / 'plan.yml', document)
+    install.state.write(bundle / 'prepared.yaml', {'plan_sha256': install.state.fingerprint(document['abi_install_plan'])})
+    verify(staged_install)
+
+
+def test_prepared_media_manifest_cannot_be_changed(staged_install):
+    bundle = prepare(staged_install)
+    document = install.state.read(bundle / 'plan.yml')
+    document['abi_install_plan']['media']['mode'] = 'minimal'
+    install.state.write(bundle / 'plan.yml', document)
+    with pytest.raises(ValueError):
+        verify(staged_install)
+
+
+def test_manual_site_seals_boot_method_while_reusing_full_artifacts(staged_install):
+    root, _, _ = staged_install
+    policy = root / 'input/2-8-5-200/test01/abi-media.yml'
+    policy.write_text('mode: manual\n')
+    prepare(staged_install)
+    policy.unlink()
+    _, plan = verify(staged_install)
+    assert plan['boot_method'] == 'manual'
+    assert plan['media']['mode'] == 'full'

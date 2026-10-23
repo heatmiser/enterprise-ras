@@ -184,3 +184,22 @@ def test_incomplete_or_foreign_receipt_cannot_authorize_replacement(tmp_path, fi
     write(h[3] / 'retirement/receipt.yaml', receipt)
     with pytest.raises(ValueError, match='retirement receipt'):
         retirement.completed(h[1], RUN, ATTEMPT)
+
+
+def test_minimal_media_history_remains_retirable_without_modifying_outcome(tmp_path):
+    root, base, bundle, reports, owner, lock = build_history(tmp_path)
+    document = retirement.state.read(bundle / 'plan.yml')
+    serving = document['abi_install_plan']
+    serving['media'] = {'mode': 'minimal', 'build_id': 'minimal-a',
+                        'boot_artifacts_base_url': 'http://192.0.2.10:6180/redfish',
+                        'artifacts': [{'name': 'agent.x86_64.iso'}, {'name': 'agent.x86_64-rootfs.img'}]}
+    retirement.state.write(bundle / 'plan.yml', document)
+    retirement.state.write(bundle / 'prepared.yaml', {'plan_sha256': retirement.state.fingerprint(serving)})
+    retirement.state.write(owner / 'plan.yml', document)
+    receipt = retirement.state.read(owner / 'runtime.yaml')
+    receipt['media'] = serving['media']
+    retirement.state.write(owner / 'runtime.yaml', receipt)
+    before = (reports / 'boot/runtime.yaml').read_bytes()
+    plan = retirement.historical(root / 'output/2-8-5-200/test01', RUN, ATTEMPT, lock)
+    assert plan is not None
+    assert (reports / 'boot/runtime.yaml').read_bytes() == before
