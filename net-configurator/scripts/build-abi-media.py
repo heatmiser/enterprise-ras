@@ -48,6 +48,8 @@ def verifier(collection):
 
 def command(image, stage, tool, *args):
     return ["podman", "run", "--rm", "--userns=keep-id", "-v", f"{stage}:{stage}:Z",
+            "--env", f"HOME={stage / 'installer-home'}",
+            "--env", f"XDG_CACHE_HOME={stage / 'installer-cache'}",
             "--entrypoint", tool, image, *map(str, args)]
 
 
@@ -76,6 +78,9 @@ def build(root, arch, site, run_id, build_id="", ee_image="", installer="", run=
     derived_hash = digest(stage / "media-agent-config.yaml")
     state.write(stage / "eligibility.yaml", eligibility)
     provenance = gate.read_yaml(base / "ocp/inspection/fleet" / run_id / "preflight-vars.yaml")["inspection_preflight_provenance"]
+    if not installer:
+        for name in ("installer-home", "installer-cache"):
+            (stage / name).mkdir(mode=0o700)
     create = ([installer, "--dir", str(stage), "agent", "create", "image"] if installer
               else command(image, stage, "openshift-install", "--dir", stage, "agent", "create", "image"))
     run(create, check=True, capture_output=True, timeout=1800)

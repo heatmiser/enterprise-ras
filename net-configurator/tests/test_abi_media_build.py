@@ -32,6 +32,15 @@ def native(root, mode, calls, fault=''):
     mock = fixtures.FakeNative(mode=mode, image=image, release=release, fault=fault)
     def run(argv, **kwargs):
         calls.append(argv)
+        if '--dir' in argv:
+            stage = Path(argv[argv.index('--dir') + 1])
+            assert '--userns=keep-id' in argv
+            environment = [argv[index + 1] for index, token in enumerate(argv) if token == '--env']
+            for variable, name in (('HOME', 'installer-home'), ('XDG_CACHE_HOME', 'installer-cache')):
+                directory = stage / name
+                assert variable + '=' + str(directory) in environment
+                assert directory.is_dir() and directory.stat().st_mode & 0o777 == 0o700
+                (directory / 'installer-initialized').write_text('writable fixture cache')
         return mock(argv, **kwargs)
     return run
 
