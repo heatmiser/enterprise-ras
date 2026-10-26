@@ -118,6 +118,7 @@ INSPECTION_CLEANUP_REPORT_PATH ?= $(patsubst %-inventory,%,$(basename $(INSPECTI
 FLEET_CONCURRENCY ?= 2
 FLEET_INSPECTION_PURPOSE ?= auto
 FLEET_PREP_DIR = $(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/fleet/$(FLEET_RUN_ID)
+FLEET_WIPE_CLEAN_UEFI_NVRAM ?= 1
 
 # Wipe concurrency is sealed at preparation; physical execution requires exact authorization.
 FLEET_WIPE_CONCURRENCY ?= 1
@@ -735,7 +736,8 @@ prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks o
 		--arch "$(ARCH)" --site "$(SITE)" \
 		--inspection-run-id "$(FLEET_RUN_ID)" --wipe-run-id "$(FLEET_WIPE_RUN_ID)" \
 		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_WIPE_CONCURRENCY)" \
-		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
+		$(if $(filter 1,$(FLEET_WIPE_CLEAN_UEFI_NVRAM)),--clean-uefi-nvram,--no-clean-uefi-nvram)
 	@VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \

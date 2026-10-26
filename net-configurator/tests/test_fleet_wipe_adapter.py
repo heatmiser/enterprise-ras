@@ -80,8 +80,9 @@ def wipe_source(eligible_run):
     return root, bundle, evidence, collection
 
 
-def prepare(source, names=NAMES, run=WIPE):
-    return wipe.prepare(source[0], "2-8-5-200", "test01", RUN, run, names, source[3])
+def prepare(source, names=NAMES, run=WIPE, clean_uefi_nvram=True):
+    return wipe.prepare(source[0], "2-8-5-200", "test01", RUN, run, names, source[3], 1, clean_uefi_nvram)
+
 
 
 @pytest.mark.parametrize("workspace", [(None, "dell"), ("dell", "redfish")], indirect=True)
@@ -126,7 +127,7 @@ def test_sealed_plan_matches_identities_without_credentials_or_authority(wipe_so
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
     assert runtime["native_profile"] == plan["native_profile"] and runtime["oem"] == "dell"
     assert "Workbook OEM: dell; native hardware type: idrac" in (bundle / "review.txt").read_text()
-    assert plan["clean_steps"] == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}]
+    assert plan["clean_steps"] in ([{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}], [{"interface": "deploy", "step": "clean_uefi_nvram", "args": {}}, {"interface": "deploy", "step": "erase_devices_metadata", "args": {}}])
     assert plan["policy"]["optional"] is True
     assert "require_post_reset_readback" not in plan["policy"]
     assert plan["schema_version"] == 3 and plan["scope"] == "all_native_eligible_disks"
@@ -195,7 +196,7 @@ def test_invalid_preparation_creates_no_bundle(wipe_source, case):
     else:
         (collection / "plugins/filter/fleet_native_disk_clean_plan.py").unlink()
     with pytest.raises((ValueError, FileNotFoundError)):
-        wipe.prepare(root, "2-8-5-200", site, RUN, run, names, collection)
+        wipe.prepare(root, "2-8-5-200", site, RUN, run, names, collection, 1, True)
     assert not (root / "output/2-8-5-200/test01/ocp/wipe").exists()
 
 
@@ -443,7 +444,7 @@ def test_wipe_seal_rejects_httpd_policy_mismatch(wipe_source):
 
 @pytest.mark.parametrize("limit", [1, 2])
 def test_concurrency_is_sealed_and_reviewed(wipe_source, limit):
-    bundle = wipe.prepare(wipe_source[0], "2-8-5-200", "test01", RUN, WIPE, NAMES, wipe_source[3], limit)
+    bundle = wipe.prepare(wipe_source[0], "2-8-5-200", "test01", RUN, WIPE, NAMES, wipe_source[3], limit, True)
     plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
     assert plan["concurrency_limit"] == runtime["concurrency_limit"] == limit
@@ -457,7 +458,7 @@ def test_concurrency_is_sealed_and_reviewed(wipe_source, limit):
 @pytest.mark.parametrize("limit", [0, -1, 3, True, "2"])
 def test_invalid_concurrency_cannot_create_preparation(wipe_source, limit):
     with pytest.raises(ValueError, match="Concurrency"):
-        wipe.prepare(wipe_source[0], "2-8-5-200", "test01", RUN, WIPE, NAMES, wipe_source[3], limit)
+        wipe.prepare(wipe_source[0], "2-8-5-200", "test01", RUN, WIPE, NAMES, wipe_source[3], limit, True)
     assert not (wipe_source[0] / "output/2-8-5-200/test01/ocp/wipe/fleet" / WIPE).exists()
 
 

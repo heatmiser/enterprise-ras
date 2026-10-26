@@ -184,7 +184,7 @@ def validate_receipt(base, run, intent):
         require(plan.get("schema_version") == 3 and plan.get("scope") == SCOPE
                 and intent.get("scope") == receipt.get("scope") == SCOPE
                 and plan.get("policy", {}).get("operator_disk_exclusions") == []
-                and plan.get("clean_steps") == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}],
+                and plan.get("clean_steps") in ([{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}], [{"interface": "deploy", "step": "clean_uefi_nvram", "args": {}}, {"interface": "deploy", "step": "erase_devices_metadata", "args": {}}]),
                 "Wrong all-disk cleaning scope")
         expected_request = {"preparation": plan, "authorization": {
             "action": "erase_devices_metadata", "scope": SCOPE, "run_id": run, "node_names": names,
@@ -255,7 +255,7 @@ def validate_receipt(base, run, intent):
                             and command.get("preparation_sha256") == intent["preparation_sha256"]
                             and command.get("terminal_confirmed") is True and command.get("dispatch_count") == 1
                             and command.get("command_id") == node.get("command_outcome", {}).get("id")
-                            and node.get("command_outcome", {}).get("clean_step") == plan["clean_steps"][0],
+                            and node.get("command_outcome", {}).get("clean_step") == plan["clean_steps"][-1],
                             "Missing terminal scoped native command")
             success = node.get("status") == "SUCCEEDED" and node.get("native_success") is True
             if success:
