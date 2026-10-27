@@ -16,7 +16,7 @@ SHELL := /bin/bash
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
-        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
+        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe restart-fleet-wipe \
         wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso \
         prepare-ocp-install prepare-ocp-reinstall prepare-ocp-retirement retire-ocp-runtime serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install continue-ocp-install
 
@@ -726,6 +726,15 @@ prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared 
 		playbooks/prepare-fleet-inspection.yml \
 		-i "$(FLEET_PREP_DIR)/hosts.yml" -e "@$(FLEET_PREP_DIR)/plan.yml" \
 		"$${VAULT_ARGS[@]}"
+
+# Keep operator values literal when exporting them to the validated CLI.
+override export FROM_RUN := $(value FROM_RUN)
+override export CONCURRENCY := $(value CONCURRENCY)
+restart-fleet-wipe:  ## Prepare a fresh wipe from recorded nodes: FROM_RUN=<old-run> CONCURRENCY=<limit>; no boot
+	$(call check_arch,$@)
+	python3 scripts/restart-fleet-wipe.py --arch "$(ARCH)" --site "$(SITE)" \
+		--from-run "$${FROM_RUN}" --concurrency "$${CONCURRENCY}" \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" --collections-path "$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)"
 
 prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks on selected nodes; no boot or writes
 	$(call check_arch,$@)
