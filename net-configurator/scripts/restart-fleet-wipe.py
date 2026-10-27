@@ -42,9 +42,11 @@ def inspect_site(base):
     for run, entry in sorted(registry["runs"].items()):
         folder = state.evidence_root(base, run)
         intent = state.read(folder / "execution-intent.yaml")
-        state.require(state.digest(folder / "execution-intent.yaml") == entry.get("intent_sha256")
-                      and intent.get("run_id") == run and intent.get("operation") == state.OPERATION,
-                      "Require registered all-disk cleaning intent")
+        state.require(state.digest(folder / "execution-intent.yaml") == entry.get("intent_sha256"),
+                      f"Registered cleaning intent hash differs for {run}")
+        state.require(intent.get("run_id") == run
+                      and intent.get("operation") in (state.OPERATION, state.LEGACY_OPERATION),
+                      f"Unsupported registered cleaning intent for {run}")
         receipt = state.validate_receipt(base, run, intent)
         attempts[run] = (intent, receipt)
         disposition = folder / "disposition.yaml"
@@ -153,6 +155,7 @@ def restart(root, arch, site, source_run, concurrency, collection, collections, 
         attempts, pending = inspect_site(base)
         state.require(source_run in attempts, "Source run is not registered in the selected architecture/site")
         intent, _ = attempts[source_run]
+        state.require(intent["operation"] == state.OPERATION, "Restart source must be an all-disk cleaning run")
         source_plan = state.read(base / "ocp/wipe/fleet" / source_run / "plan.yml")["fleet_native_disk_clean_plan"]
         source = {"inspection_run_id": intent["inspection_run_id"], "node_names": intent["node_names"],
                   "clean_steps": source_plan["clean_steps"]}

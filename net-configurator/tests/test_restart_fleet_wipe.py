@@ -213,6 +213,85 @@ def test_later_failed_subset_uses_its_own_disposition_and_preserves_source_fleet
     assert_history(operation)
 
 
+def legacy_history(operation, monkeypatch, status="SUCCEEDED"):
+    """Combine independently sealed historical fixtures without changing their receipts."""
+    import tests.test_fleet_cleaning_state as fixtures
+
+    base = operation[1]
+    registry = restart.state.registry(base)
+    legacy = "20000101T123000Z"
+    original_prepare = fixtures.prepare
+    with monkeypatch.context() as patch:
+        patch.setattr(fixtures, "WIPE", legacy)
+        patch.setattr(fixtures, "prepare", lambda source, names: original_prepare(source, names=names, run=legacy))
+        _, folder, bundle = fixtures.terminal(operation[0], status, legacy=True)
+    # The standalone legacy fixture models its original registration. Merge its
+    # entry into the synthetic site's newer registry, retaining each intent hash.
+    historical = restart.state.registry(base)
+    assert not (set(historical["runs"]) & set(registry["runs"]))
+    historical["runs"].update(registry["runs"])
+    restart.state.write(base / "ocp/cleaning-registry.yaml", historical)
+    snapshot = {path: path.read_bytes() for parent in (folder, bundle)
+                for path in parent.rglob("*") if path.is_file()}
+    return legacy, folder, snapshot
+
+
+@pytest.mark.parametrize("status", ["SUCCEEDED", "FAILED"])
+def test_mixed_history_preserves_legacy_results_and_prepares_only_all_disk_scope(operation, monkeypatch, status):
+    legacy, folder, snapshot = legacy_history(operation, monkeypatch, status)
+    bundle = invoke(operation)
+    plan, _ = restart.wipe.verify(operation[0][0], "2-8-5-200", "test01", bundle)
+    assert plan["operation"] == restart.state.OPERATION
+    assert plan["scope"] == restart.state.SCOPE
+    assert plan["concurrency_limit"] == 2
+    assert sorted(node["name"] for node in plan["authorized_nodes"]) == sorted(NAMES)
+    assert restart.state.read(folder / "receipt.yaml")["operation"] == restart.state.LEGACY_OPERATION
+    assert snapshot == {path: path.read_bytes() for path in snapshot}
+    assert not (operation[1] / "reports/wipe" / NEW).exists()
+    if status == "FAILED":
+        disposition = restart.state.read(folder / "disposition.yaml")
+        assert disposition["run_id"] == legacy
+        assert disposition["receipt_sha256"] == restart.state.digest(folder / "receipt.yaml")
+    restart.state.check(operation[1])
+    assert_history(operation)
+
+
+def test_legacy_history_cannot_be_selected_as_restart_source(operation, monkeypatch):
+    legacy, folder, snapshot = legacy_history(operation, monkeypatch)
+    with pytest.raises(ValueError, match="source must be an all-disk"):
+        invoke(operation, source=legacy)
+    assert operation[-1] == []
+    assert not (operation[1] / "ocp/wipe/restarts").exists()
+    assert not (operation[2] / "disposition.yaml").exists()
+    assert snapshot == {path: path.read_bytes() for path in snapshot}
+    assert_history(operation)
+
+
+@pytest.mark.parametrize("case", ["intent_hash", "unknown_operation", "receipt"])
+def test_invalid_legacy_history_is_still_rejected_before_preparation(operation, monkeypatch, case):
+    legacy, folder, _ = legacy_history(operation, monkeypatch)
+    path = folder / "execution-intent.yaml"
+    if case == "intent_hash":
+        path.write_bytes(path.read_bytes() + b"\n# changed intent\n")
+    elif case == "unknown_operation":
+        intent = restart.state.read(path)
+        intent["operation"] = "unsupported_cleaning_operation"
+        restart.state.write(path, intent)
+        registry = restart.state.registry(operation[1])
+        registry["runs"][legacy]["intent_sha256"] = restart.state.digest(path)
+        restart.state.write(operation[1] / "ocp/cleaning-registry.yaml", registry)
+    else:
+        receipt = restart.state.read(folder / "receipt.yaml")
+        receipt["inspection_run_id"] = "20000101T000000Z"
+        restart.state.write(folder / "receipt.yaml", receipt)
+    with pytest.raises(ValueError):
+        invoke(operation)
+    assert operation[-1] == []
+    assert not (operation[1] / "ocp/wipe/restarts").exists()
+    assert not (operation[2] / "disposition.yaml").exists()
+    assert_history(operation)
+
+
 def test_wrong_site_does_not_search_other_sites(operation):
     source_data = operation[0]
     with pytest.raises(ValueError, match="not registered"):
