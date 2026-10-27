@@ -75,7 +75,7 @@ def declared_oem(root, arch, site):
     return oem.strip().lower()
 
 
-def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root, concurrency_limit=1):
+def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root, concurrency_limit=1, clean_uefi_nvram=True):
     root = root.absolute()
     httpd = HTTPD.site(root, arch, site)
     # Physical readiness is independent of initial ABI membership. Legacy ABI
@@ -118,7 +118,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
         "plan_builder": plugin_hash,
     }
     plan = builder.fleet_native_disk_clean_plan(inspection_run_id, wipe_run_id,
-        selected, node_evidence, source_hashes, oem, concurrency_limit)
+        selected, node_evidence, source_hashes, oem, concurrency_limit, clean_uefi_nvram)
     plan.update({"artifact_root": str(evidence_root), "inspection_artifact_root": str(source),
                  "manifest_sha256": receipt.get("manifest_sha256", {}), "redfish_retry": redfish, "redfish_deadlines": deadline_contract})
     # Revalidate after projecting evidence so altered files cannot be sealed into
@@ -211,7 +211,7 @@ def verify_sources(root, arch, site, bundle):
     gate.require(plan.get("schema_version") == 3 and plan.get("operation") == state.OPERATION
                  and plan.get("scope") == state.SCOPE
                  and plan.get("policy", {}).get("operator_disk_exclusions") == []
-                 and plan.get("clean_steps") == [{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}],
+                 and plan.get("clean_steps") in ([{"interface": "deploy", "step": "erase_devices_metadata", "args": {}}], [{"interface": "deploy", "step": "clean_uefi_nvram", "args": {}}, {"interface": "deploy", "step": "erase_devices_metadata", "args": {}}]),
                  "Require fresh all-disk native preparation; installation-volume plans cannot execute")
     runtime = gate.read_yaml(bundle / "runtime-plan.yml")["fleet_wipe_runtime_plan"]
     gate.require(runtime.get("redfish_retry") == plan.get("redfish_retry")
@@ -326,6 +326,8 @@ def main():
     for name in ("inspection-run-id", "wipe-run-id", "nodes"):
         parser.add_argument("--" + name, default="")
     parser.add_argument("--concurrency", type=int)
+    parser.add_argument("--clean-uefi-nvram", action="store_true", default=True)
+    parser.add_argument("--no-clean-uefi-nvram", dest="clean_uefi_nvram", action="store_false")
     parser.add_argument("--collection-root", type=Path)
     parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()

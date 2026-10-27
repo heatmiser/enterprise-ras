@@ -16,7 +16,7 @@ SHELL := /bin/bash
         inventory status test-coverage test-fast push-switch-configs \
         deploy validate-all deploy-kvm validate-kvm init-ocp-settings teardown-kvm validate-air-fabric \
         rhcos-image-prep generate-ocp-iso generate-inspection-nmstate prepare-inspection-preflight \
-        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe \
+        inspect-controlled-candidate prepare-fleet-inspection inspect-fleet prepare-fleet-wipe restart-fleet-wipe \
         wipe-fleet-disks wipe-fleet-install-disks record-fleet-wipe-disposition _wipe-fleet-disks _generate-ocp-iso \
         prepare-ocp-install prepare-ocp-reinstall prepare-ocp-retirement retire-ocp-runtime serve-ocp-iso prepare-ocp-boot boot-ocp-nodes resume-ocp-install continue-ocp-install
 
@@ -118,6 +118,7 @@ INSPECTION_CLEANUP_REPORT_PATH ?= $(patsubst %-inventory,%,$(basename $(INSPECTI
 FLEET_CONCURRENCY ?= 2
 FLEET_INSPECTION_PURPOSE ?= auto
 FLEET_PREP_DIR = $(CURDIR)/output/$(ARCH)/$(SITE)/ocp/inspection/fleet/$(FLEET_RUN_ID)
+FLEET_WIPE_CLEAN_UEFI_NVRAM ?= 1
 
 # Wipe concurrency is sealed at preparation; physical execution requires exact authorization.
 FLEET_WIPE_CONCURRENCY ?= 1
@@ -726,6 +727,15 @@ prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared 
 		-i "$(FLEET_PREP_DIR)/hosts.yml" -e "@$(FLEET_PREP_DIR)/plan.yml" \
 		"$${VAULT_ARGS[@]}"
 
+# Keep operator values literal when exporting them to the validated CLI.
+override export FROM_RUN := $(value FROM_RUN)
+override export CONCURRENCY := $(value CONCURRENCY)
+restart-fleet-wipe:  ## Prepare a fresh wipe from recorded nodes: FROM_RUN=<old-run> CONCURRENCY=<limit>; no boot
+	$(call check_arch,$@)
+	python3 scripts/restart-fleet-wipe.py --arch "$(ARCH)" --site "$(SITE)" \
+		--from-run "$${FROM_RUN}" --concurrency "$${CONCURRENCY}" \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" --collections-path "$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)"
+
 prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks on selected nodes; no boot or writes
 	$(call check_arch,$@)
 	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_WIPE_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
@@ -735,7 +745,8 @@ prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks o
 		--arch "$(ARCH)" --site "$(SITE)" \
 		--inspection-run-id "$(FLEET_RUN_ID)" --wipe-run-id "$(FLEET_WIPE_RUN_ID)" \
 		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_WIPE_CONCURRENCY)" \
-		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
+		$(if $(filter 1,$(FLEET_WIPE_CLEAN_UEFI_NVRAM)),--clean-uefi-nvram,--no-clean-uefi-nvram)
 	@VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
