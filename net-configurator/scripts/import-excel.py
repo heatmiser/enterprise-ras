@@ -9,6 +9,7 @@ then creates input/<arch>/<site>/ and copies the Excel there.
 
 Also writes .era-context so subsequent make commands pick up the new
 arch/site automatically.
+Reimporting the same architecture/site preserves its validated server_os value.
 
 Usage:
   python3 scripts/import-excel.py /path/to/your-config.xlsx
@@ -18,7 +19,9 @@ Usage:
 import argparse
 import datetime
 import re
+import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -87,6 +90,23 @@ def _archive_existing_template(dest_file: Path, arch: str, site: str):
     return backup
 
 
+def _existing_server_os(arch: str, site: str) -> str | None:
+    """Reuse the shared validator; never carry OS context into another deployment."""
+    if not (BASE_DIR / '.era-context').exists():
+        return None
+    result = subprocess.run(
+        [sys.executable, str(SCRIPT_DIR / '_era_context.py')],
+        cwd=BASE_DIR, capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        print('⚠️  Existing context is invalid; server_os will not be preserved.')
+        return None
+    context = dict(token.split('=', 1) for token in shlex.split(result.stdout))
+    if (context.get('_ARCH'), context.get('_SITE')) != (arch, site):
+        return None
+    return context.get('_SERVER_OS')
+
+
 def import_excel(xlsx_path: Path, site_override: str | None = None,
                   auto_confirm: bool = False) -> None:
     xlsx_path = xlsx_path.resolve()
@@ -148,6 +168,7 @@ def import_excel(xlsx_path: Path, site_override: str | None = None,
                 print("Aborted.")
                 sys.exit(1)
 
+    server_os = _existing_server_os(arch, site)
     dest_dir = INPUT_DIR / arch / site
     dest_file = dest_dir / f"{arch}.xlsx"
 
@@ -182,6 +203,7 @@ def import_excel(xlsx_path: Path, site_override: str | None = None,
         "\n"
         f"arch: {arch}\n"
         f"site: {site}\n"
+        + (f"server_os: {server_os}\n" if server_os else '')
     )
     print(f"✓ Context set: arch={arch}  site={site}")
     print()

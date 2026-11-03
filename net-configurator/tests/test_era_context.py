@@ -16,11 +16,14 @@ locked in here:
   validator treats the line as absent.
 - Site defaults to ``default`` when omitted.
 """
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from openpyxl import Workbook
 
 
 SCRIPT = Path(__file__).parent.parent / "scripts" / "_era_context.py"
@@ -212,3 +215,144 @@ def test_output_is_evaluable_by_shell(ctx_dir):
     )
     assert shell_check.returncode == 0
     assert shell_check.stdout.strip() == "2-8-5-200|customer-a"
+
+
+@pytest.fixture
+def make_import_workspace(tmp_path):
+    """Exercise real Make/import/context code with controlled validator outcomes."""
+    root = SCRIPT.resolve().parent.parent
+    shutil.copyfile(root / 'Makefile', tmp_path / 'Makefile')
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    for name in ['_era_context.py', 'import-excel.py', 'excel_parser.py',
+                 'utils.py', 'oob_reserved.py']:
+        shutil.copyfile(root / 'scripts' / name, scripts / name)
+    (scripts / 'validate_excel.py').write_text(
+        'import os,sys\nfrom pathlib import Path\n'
+        'Path("validated-path.txt").write_text(sys.argv[1])\n'
+        'sys.exit(int(os.environ.get("VALIDATOR_EXIT", "0")))\n'
+    )
+    return tmp_path
+
+
+def _workbook(path, site='customer-a'):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = 'Settings'
+    sheet.append(['architecture', '2-8-5-200'])
+    sheet.append(['site_name', site])
+    workbook.save(path)
+    workbook.close()
+    return path
+
+
+def _make_import(root, *arguments, **overrides):
+    env = {key: value for key, value in os.environ.items()
+           if key not in {'ARCH', 'SITE', 'SERVER_OS', 'EXCEL', 'MAKEFLAGS',
+                          'MFLAGS', 'MAKEOVERRIDES', 'IMPORT_SKIP_VALIDATE',
+                          'IMPORT_SITE', 'VALIDATOR_EXIT'}}
+    env.update(overrides)
+    return subprocess.run(['make', '--no-print-directory', *arguments],
+                          cwd=root, env=env, capture_output=True, text=True, timeout=15)
+
+
+def test_make_import_uses_context_and_preserves_rhcos(make_import_workspace):
+    root = make_import_workspace
+    _write_ctx(root, 'arch: 2-8-5-200\nsite: customer-a\nserver_os: rhcos\n')
+    workbook = _workbook(root / 'input/2-8-5-200/customer-a/2-8-5-200.xlsx')
+    before = workbook.read_bytes()
+
+    result = _make_import(root, 'import')
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (root / 'validated-path.txt').read_text() == 'input/2-8-5-200/customer-a/2-8-5-200.xlsx'
+    assert 'Already at:' in result.stdout
+    assert 'server_os: rhcos\n' in (root / '.era-context').read_text()
+    assert workbook.read_bytes() == before
+
+
+@pytest.mark.parametrize('origin', ['command-line', 'environment'])
+def test_make_explicit_workbook_overrides_context(make_import_workspace, origin):
+    root = make_import_workspace
+    _write_ctx(root, 'arch: 2-8-5-200\nsite: customer-a\nserver_os: rhcos\n')
+    workbook = _workbook(root / 'downloads/selected.xlsx', site='customer-b')
+    args = ['import']
+    env = {}
+    if origin == 'command-line':
+        args.append(f'EXCEL={workbook}')
+    else:
+        env['EXCEL'] = str(workbook)
+
+    result = _make_import(root, *args, **env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (root / 'validated-path.txt').read_text() == str(workbook)
+    assert (root / 'input/2-8-5-200/customer-b/2-8-5-200.xlsx').read_bytes() == workbook.read_bytes()
+    assert (root / '.era-context').read_text().endswith('arch: 2-8-5-200\nsite: customer-b\n')
+
+
+def test_make_explicit_workbook_without_context(make_import_workspace):
+    root = make_import_workspace
+    workbook = _workbook(root / 'downloads/selected.xlsx')
+
+    result = _make_import(root, 'import', f'EXCEL={workbook}')
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (root / 'input/2-8-5-200/customer-a/2-8-5-200.xlsx').exists()
+
+
+@pytest.mark.parametrize('context', [None, 'arch: invalid\nsite: customer-a\n'])
+def test_make_import_requires_usable_context_or_source(make_import_workspace, context):
+    root = make_import_workspace
+    if context is not None:
+        _write_ctx(root, context)
+
+    result = _make_import(root, 'import')
+
+    assert result.returncode != 0
+    assert 'no workbook selected' in result.stdout
+    assert not (root / 'validated-path.txt').exists()
+    if context is not None:
+        assert (root / '.era-context').read_text() == context
+    else:
+        assert not (root / '.era-context').exists()
+
+
+def test_make_import_missing_canonical_workbook_preserves_context(make_import_workspace):
+    root = make_import_workspace
+    context = 'arch: 2-8-5-200\nsite: customer-a\nserver_os: rhcos\n'
+    _write_ctx(root, context)
+
+    result = _make_import(root, 'import')
+
+    assert result.returncode != 0
+    assert 'File not found' in result.stdout
+    assert (root / '.era-context').read_text() == context
+
+
+def test_make_import_validation_failure_preserves_inputs(make_import_workspace):
+    root = make_import_workspace
+    context = 'arch: 2-8-5-200\nsite: customer-a\nserver_os: rhcos\n'
+    _write_ctx(root, context)
+    workbook = _workbook(root / 'input/2-8-5-200/customer-a/2-8-5-200.xlsx')
+    before = workbook.read_bytes()
+
+    result = _make_import(root, 'import', VALIDATOR_EXIT='1')
+
+    assert result.returncode != 0
+    assert 'Excel validation failed' in result.stdout
+    assert (root / '.era-context').read_text() == context
+    assert workbook.read_bytes() == before
+
+
+def test_context_import_default_does_not_change_deploy_contract(make_import_workspace):
+    root = make_import_workspace
+    _write_ctx(root, 'arch: 2-8-5-200\nsite: customer-a\n')
+    _workbook(root / 'input/2-8-5-200/customer-a/2-8-5-200.xlsx')
+
+    result = _make_import(root, 'deploy')
+
+    assert result.returncode != 0
+    assert 'EXCEL not specified' in result.stdout
+    assert not (root / 'validated-path.txt').exists()
