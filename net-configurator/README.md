@@ -5,6 +5,60 @@
 
 Ansible automation for ERA (Enterprise Reference Architecture) network switch configuration. Fill out an Excel spreadsheet describing your deployment, and this tool generates Ansible inventory, NVUE switch configs, and an NVIDIA Air topology -- then deploys everything via Zero Touch Provisioning (ZTP).
 
+## Bare-metal inspection and optional disk cleaning
+
+After a successful physical fleet inspection, prepare optional cleaning from the
+selected architecture, site, and inspection run in `.era-context`:
+
+make prepare-fleet-wipe FLEET_WIPE_CONCURRENCY=7
+
+Preparation validates the inspection receipt, derives its node list, generates a
+fresh wipe run ID, and displays the review. It selects `fleet_wipe_run_id` in the
+shared context only after release/network preflight and sealing succeed. Preparation
+does not boot hosts or write disks. Choose concurrency for the intended fleet size;
+the preparation default remains one.
+
+The cleaning scope is **all native eligible disks and partitions on the selected
+hosts**, including data disks. Installation-disk hints do not narrow this scope.
+UEFI boot-entry cleanup precedes disk metadata cleaning by default; this does not
+reset BIOS settings. `FLEET_WIPE_CLEAN_UEFI_NVRAM=0` omits boot-entry cleanup.
+
+To execute the selected sealed preparation:
+
+make wipe-fleet-disks
+
+The command displays the exact run, inspection source, nodes, concurrency, and
+clean steps. Type `wipe` at the terminal to authorize execution; cancellation or
+changed inputs prevent execution. For unattended automation, provide both exact
+`FLEET_AUTHORIZE_WIPE_RUN` and `FLEET_AUTHORIZE_WIPE_NODES`. Run/node overrides
+remain available through `FLEET_RUN_ID`, `FLEET_WIPE_RUN_ID`, and `FLEET_NODES`.
+Existing preparations and execution evidence are never overwritten. Use
+`make show-context` to inspect the selected runs.
+
+## Bare-metal installation
+
+After inspection and any optional cleaning complete, build fresh installation
+media with `make generate-ocp-iso`, then run these existing targets in order:
+
+1. `make prepare-ocp-install`
+2. `make serve-ocp-iso`
+3. `make prepare-ocp-boot`
+4. `make boot-ocp-nodes`
+
+The targets reuse the selected architecture, site, inspection run, media build,
+and installation attempt. Review the displayed attempt, physical hosts, expected
+Kubernetes nodes, ISO, and release; type `boot` to authorize installation.
+For an existing reviewed ISO and a fresh repeat attempt, use
+`make prepare-ocp-reinstall` instead of `make prepare-ocp-install`.
+
+`make resume-ocp-install` requires typing `resume` and observes the selected
+installation without repeating node boot. `make continue-ocp-install` requires
+typing `continue` to return to an interrupted manual-media handoff; its existing
+Enter attestation still confirms that the operator inserted media and booted
+the selected nodes. Interactive authorization requires a terminal and revalidates
+the sealed preparation after confirmation. Unattended callers can supply
+`FLEET_AUTHORIZE_BOOT_RUN` with the exact reviewed installation attempt ID.
+
 ## Terms used in this guide
 
 | Term | What it means |

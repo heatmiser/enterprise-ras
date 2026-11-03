@@ -31,6 +31,7 @@ protection.
 import re
 import shlex
 import sys
+from datetime import datetime
 from pathlib import Path
 
 VALID_ARCHS = {"2-4-3-200", "2-4-5-800", "2-8-5-200", "2-8-9-400", "2-8-9-800", "2-8-9-400-SP"}
@@ -47,9 +48,10 @@ def die(message: str) -> None:
     sys.exit(1)
 
 
-def main() -> int:
-    if not CONTEXT_PATH.exists():
-        die(
+def read_context(path: Path = CONTEXT_PATH) -> dict:
+    """Read validated deployment context for Make and existing lifecycle adapters."""
+    if not path.exists():
+        raise ValueError(
             "no .era-context in the current directory — "
             "run `make use ARCH=<type> [SITE=<name>]` to create one"
         )
@@ -57,7 +59,9 @@ def main() -> int:
     arch = None
     site = None
     server_os = None
-    for raw_line in CONTEXT_PATH.read_text().splitlines():
+    fleet_run_id = None
+    fleet_wipe_run_id = None
+    for raw_line in path.read_text().splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
@@ -73,37 +77,58 @@ def main() -> int:
         if m:
             server_os = m.group(1)
             continue
+        if line.startswith('fleet_run_id:'):
+            if fleet_run_id is not None:
+                raise ValueError('duplicate fleet_run_id in .era-context')
+            fleet_run_id = line.split(':', 1)[1].strip()
+        if line.startswith('fleet_wipe_run_id:'):
+            if fleet_wipe_run_id is not None:
+                raise ValueError('duplicate fleet_wipe_run_id in .era-context')
+            fleet_wipe_run_id = line.split(':', 1)[1].strip()
 
     if arch is None:
-        die(".era-context is missing an 'arch:' line")
+        raise ValueError(".era-context is missing an 'arch:' line")
     if arch not in VALID_ARCHS:
-        die(
+        raise ValueError(
             f"invalid arch {arch!r} in .era-context — must be one of: "
             + ", ".join(sorted(VALID_ARCHS))
         )
     if site is None:
         site = "default"
     if not SITE_RE.match(site):
-        die(
+        raise ValueError(
             f"invalid site {site!r} in .era-context — must match "
             "[A-Za-z0-9_-][A-Za-z0-9._-]* (no slashes, no leading dot)"
         )
     # Extra belt-and-braces against path traversal via sneaky site names.
     if ".." in site or site in ("", ".", ".."):
-        die(f"invalid site {site!r} in .era-context — disallowed value")
+        raise ValueError(f"invalid site {site!r} in .era-context — disallowed value")
 
     if server_os is not None and server_os not in VALID_SERVER_OS:
-        die(
+        raise ValueError(
             f"invalid server_os {server_os!r} in .era-context — must be one of: "
             + ", ".join(sorted(VALID_SERVER_OS))
         )
 
-    # shlex.quote preserves single quotes if the value ever contains any,
-    # though the regex above already forbids them.
-    print(f"_ARCH={shlex.quote(arch)}")
-    print(f"_SITE={shlex.quote(site)}")
+    context = {'arch': arch, 'site': site}
     if server_os is not None:
-        print(f"_SERVER_OS={shlex.quote(server_os)}")
+        context['server_os'] = server_os
+    for key, value in [('fleet_run_id', fleet_run_id), ('fleet_wipe_run_id', fleet_wipe_run_id)]:
+        if value is not None:
+            if not re.fullmatch(r'[0-9]{8}T[0-9]{6}Z', value):
+                raise ValueError(f'invalid {key}; require UTC YYYYMMDDTHHMMSSZ')
+            datetime.strptime(value, '%Y%m%dT%H%M%SZ')
+            context[key] = value
+    return context
+
+
+def main() -> int:
+    try:
+        context = read_context()
+    except (ValueError, OSError) as exc:
+        die(str(exc))
+    for key, value in context.items():
+        print(f"_{key.upper()}={shlex.quote(value)}")
     return 0
 
 

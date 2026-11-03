@@ -443,7 +443,8 @@ def prepare_boot(root, arch, site, run_id, collection, lock=RUNTIME_LOCK):
               "Native installer completion AND every expected node Ready are required before cleanup.",
               "Complete private service logs are retained automatically; no additional CLI variables.",
               "Failures retain runtime/evidence; resume observation never repeats node boot.",
-              f"After review: make boot-ocp-nodes FLEET_AUTHORIZE_BOOT_RUN={identity}"]
+              "After review: make boot-ocp-nodes; type boot to confirm the displayed attempt.",
+              f"Unattended authorization: FLEET_AUTHORIZE_BOOT_RUN={identity}"]
     (target / "review.txt").write_text("\n".join(review) + "\n")
     (target / "review.txt").chmod(0o600)
     return target
@@ -525,9 +526,41 @@ def manual_handoff(plan, continuing=False):
                        "confirmed_at": datetime.now(timezone.utc).isoformat()})
 
 
+def confirm_installation(root, arch, site, run_id, collection, bundle, plan, action):
+    """Authorize the displayed sealed attempt without repeating its identifier."""
+    require(action in ('boot', 'resume', 'continue'), 'Invalid installation action')
+    require(sys.stdin.isatty(),
+            'Interactive installation authorization requires a terminal; '
+            'supply explicit FLEET_AUTHORIZE_BOOT_RUN to match the reviewed installation attempt')
+    reviewed = state.fingerprint(plan)
+    identity = plan.get('installation_attempt_id', run_id)
+    serving = plan['serving_plan']
+    scope = {'boot': 'Boot selected nodes, monitor installation, and perform completion cleanup',
+             'resume': 'Resume installation observation and completion cleanup without repeating node boot',
+             'continue': 'Continue the operator manual-media handoff and installation monitoring'}
+    print(f'Installation attempt: {identity}; inspection source: {run_id}', file=sys.stderr)
+    print('Operation: ' + scope[action], file=sys.stderr)
+    print(f'Nodes ({len(plan["node_names"])}): ' + ', '.join(plan['node_names']), file=sys.stderr)
+    print('Expected Ready nodes: ' + ', '.join(plan['expected_cluster_nodes']), file=sys.stderr)
+    print('ISO: ' + plan['serving_receipt']['url'], file=sys.stderr)
+    print('ISO SHA256: ' + serving['iso_sha256'], file=sys.stderr)
+    print('Release: ' + serving['release_image'], file=sys.stderr)
+    print(f'Type {action} to authorize, or press Enter to cancel: ',
+          end='', file=sys.stderr, flush=True)
+    try:
+        response = sys.stdin.readline().strip()
+    except (EOFError, KeyboardInterrupt):
+        raise ValueError('Installation action cancelled; no execution was authorized') from None
+    require(response == action, 'Installation action cancelled; no execution was authorized')
+    current_bundle, current_plan = verify_boot(root, arch, site, run_id, collection)
+    require(current_bundle == bundle and state.fingerprint(current_plan) == reviewed,
+            'Installation inputs changed during confirmation; no execution was authorized')
+    return identity
+
+
 def boot(root, arch, site, run_id, collection, lease, authorize_run, resume=False, continuing=False):
     bundle, plan = verify_boot(root, arch, site, run_id, collection)
-    require(authorize_run == plan.get("installation_attempt_id", run_id),
+    require(not authorize_run or authorize_run == plan.get("installation_attempt_id", run_id),
             "Explicit FLEET_AUTHORIZE_BOOT_RUN must match the reviewed installation attempt")
     require(plan["workflow_ready"] is True,
             "Boot execution disabled until installer monitoring and completion cleanup are implemented")
@@ -541,6 +574,10 @@ def boot(root, arch, site, run_id, collection, lease, authorize_run, resume=Fals
         require(state.read(artifact / "plan.yml") == {"abi_boot_plan": plan}, "Executed boot plan changed")
     else:
         require(not artifact.exists(), "Boot already attempted; use resume-ocp-install for observation")
+    if not authorize_run:
+        action = 'resume' if resume else 'continue' if continuing else 'boot'
+        authorize_run = confirm_installation(root, arch, site, run_id, collection, bundle, plan, action)
+    if not (resume or continuing):
         artifact.mkdir(parents=True, mode=0o700)
         state.write(artifact / "plan.yml", {"abi_boot_plan": plan})
     if manual:

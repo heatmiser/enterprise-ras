@@ -89,6 +89,17 @@ ifneq ($(wildcard .era-context),)
             SERVER_OS := $(_CTX_SERVER_OS)
         endif
     endif
+    # A selected inspection run belongs only to the context's architecture/site.
+    _CTX_RUN_ARCH := $(subst ',,$(patsubst _ARCH=%,%,$(filter _ARCH=%,$(_CTX))))
+    _CTX_RUN_SITE := $(subst ',,$(patsubst _SITE=%,%,$(filter _SITE=%,$(_CTX))))
+    ifeq ($(ARCH)/$(SITE),$(_CTX_RUN_ARCH)/$(_CTX_RUN_SITE))
+        ifndef FLEET_RUN_ID
+            FLEET_RUN_ID := $(subst ',,$(patsubst _FLEET_RUN_ID=%,%,$(filter _FLEET_RUN_ID=%,$(_CTX))))
+        endif
+        ifndef FLEET_WIPE_RUN_ID
+            FLEET_WIPE_RUN_ID := $(subst ',,$(patsubst _FLEET_WIPE_RUN_ID=%,%,$(filter _FLEET_WIPE_RUN_ID=%,$(_CTX))))
+        endif
+    endif
 endif
 
 # Default site if still not set
@@ -714,22 +725,24 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		-e "inspection_preflight_httpd_settings_path=$(CURDIR)/input/$(ARCH)/$(SITE)/ironic-httpd.yml" \
 		"$${VAULT_ARGS[@]}"
 
-prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared release preflight; no physical boot
+prepare-fleet-inspection:  ## Prepare a fresh initial ABI fleet and select it after preflight; no physical boot
 	$(call check_arch,$@)
-	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
-		echo "ERROR: FLEET_RUN_ID and explicit comma-separated FLEET_NODES are required"; exit 1; \
-	fi
-	python3 scripts/prepare-fleet-inspection.py prepare \
-		--arch "$(ARCH)" --site "$(SITE)" --run-id "$(FLEET_RUN_ID)" \
+	@BUNDLE="$$(python3 scripts/prepare-fleet-inspection.py prepare \
+		--arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(if $(filter command line environment override,$(origin FLEET_RUN_ID)),$(FLEET_RUN_ID),)" \
 		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_CONCURRENCY)" \
 		--purpose "$(FLEET_INSPECTION_PURPOSE)" \
-		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
-	@VAULT_ARGS=(); \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)")" || exit 1; \
+	printf 'Inspection preparation: %s\n' "$$BUNDLE"; \
+	cat "$$BUNDLE/review.txt" || exit 1; \
+	VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
 		playbooks/prepare-fleet-inspection.yml \
-		-i "$(FLEET_PREP_DIR)/hosts.yml" -e "@$(FLEET_PREP_DIR)/plan.yml" \
-		"$${VAULT_ARGS[@]}"
+		-i "$$BUNDLE/hosts.yml" -e "@$$BUNDLE/plan.yml" \
+		"$${VAULT_ARGS[@]}" || exit 1; \
+	python3 scripts/prepare-fleet-inspection.py select --root "$(CURDIR)" \
+		--arch "$(ARCH)" --site "$(SITE)" --bundle "$$BUNDLE"
 
 # Keep operator values literal when exporting them to the validated CLI.
 override export FROM_RUN := $(value FROM_RUN)
@@ -740,22 +753,24 @@ restart-fleet-wipe:  ## Prepare a fresh wipe from recorded nodes: FROM_RUN=<old-
 		--from-run "$${FROM_RUN}" --concurrency "$${CONCURRENCY}" \
 		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" --collections-path "$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)"
 
-prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks on selected nodes; no boot or writes
+prepare-fleet-wipe:  ## Prepare and select a fresh wipe from the inspected context; no boot or disk writes
 	$(call check_arch,$@)
-	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_WIPE_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
-		echo "ERROR: FLEET_RUN_ID, fresh FLEET_WIPE_RUN_ID and explicit FLEET_NODES are required"; exit 1; \
-	fi
-	python3 scripts/prepare-fleet-wipe.py \
+	@BUNDLE="$$(python3 scripts/prepare-fleet-wipe.py \
 		--arch "$(ARCH)" --site "$(SITE)" \
-		--inspection-run-id "$(FLEET_RUN_ID)" --wipe-run-id "$(FLEET_WIPE_RUN_ID)" \
+		--inspection-run-id "$(FLEET_RUN_ID)" \
+		--wipe-run-id "$(if $(filter command line environment override,$(origin FLEET_WIPE_RUN_ID)),$(FLEET_WIPE_RUN_ID),)" \
 		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_WIPE_CONCURRENCY)" \
-		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
-		$(if $(filter 1,$(FLEET_WIPE_CLEAN_UEFI_NVRAM)),--clean-uefi-nvram,--no-clean-uefi-nvram)
-	@VAULT_ARGS=(); \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" --print-bundle \
+		$(if $(filter 1,$(FLEET_WIPE_CLEAN_UEFI_NVRAM)),--clean-uefi-nvram,--no-clean-uefi-nvram))" || exit 1; \
+	printf 'Wipe preparation: %s; no physical authority\n' "$$BUNDLE"; \
+	cat "$$BUNDLE/review.txt" || exit 1; \
+	VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
-		playbooks/prepare-fleet-wipe.yml -i "$(FLEET_WIPE_PREP_DIR)/hosts.yml" \
-		-e "@$(FLEET_WIPE_PREP_DIR)/runtime-plan.yml" "$${VAULT_ARGS[@]}"
+		playbooks/prepare-fleet-wipe.yml -i "$$BUNDLE/hosts.yml" \
+		-e "@$$BUNDLE/runtime-plan.yml" "$${VAULT_ARGS[@]}" || exit 1; \
+	python3 scripts/prepare-fleet-wipe.py select --root "$(CURDIR)" \
+		--arch "$(ARCH)" --site "$(SITE)" --bundle "$$BUNDLE"
 
 wipe-fleet-install-disks:  ## Retired installation-volume command; requires a fresh all-disk review
 	@echo "ERROR: installation-volume-only execution is retired. Review a fresh all-disk preparation and use make wipe-fleet-disks."; exit 1
@@ -766,15 +781,24 @@ wipe-fleet-disks:  ## Run separately authorized native metadata cleaning of ALL 
 		$(MAKE) --no-print-directory _wipe-fleet-disks
 
 _wipe-fleet-disks:
-	@if [ -z "$(FLEET_AUTHORIZE_WIPE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_WIPE_NODES)" ] || \
-	    [ "$(FLEET_AUTHORIZE_WIPE_RUN)" != "$(FLEET_WIPE_RUN_ID)" ]; then \
-		echo "ERROR: exact FLEET_AUTHORIZE_WIPE_RUN and FLEET_AUTHORIZE_WIPE_NODES are required"; exit 1; \
+	@if [ -z "$(FLEET_WIPE_RUN_ID)" ]; then \
+		echo "ERROR: no wipe run selected; run make prepare-fleet-wipe first"; exit 1; \
 	fi; \
 	SECRETS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/secrets.yaml"; \
 	if [ ! -f "$$SECRETS" ]; then echo "ERROR: selected site vault is missing"; exit 1; fi; \
-	AUTH="$$(python3 scripts/prepare-fleet-wipe.py begin --root "$(CURDIR)" \
-		--arch "$(ARCH)" --site "$(SITE)" --bundle "$(FLEET_WIPE_PREP_DIR)" \
-		--wipe-run-id "$(FLEET_AUTHORIZE_WIPE_RUN)" --nodes "$(FLEET_AUTHORIZE_WIPE_NODES)")" || exit 1; \
+	if [ -n "$(FLEET_AUTHORIZE_WIPE_RUN)" ] || [ -n "$(FLEET_AUTHORIZE_WIPE_NODES)" ]; then \
+		if [ -z "$(FLEET_AUTHORIZE_WIPE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_WIPE_NODES)" ] || \
+		    [ "$(FLEET_AUTHORIZE_WIPE_RUN)" != "$(FLEET_WIPE_RUN_ID)" ]; then \
+			echo "ERROR: supply both exact FLEET_AUTHORIZE_WIPE_RUN and FLEET_AUTHORIZE_WIPE_NODES, or neither for interactive confirmation"; exit 1; \
+		fi; \
+		AUTH="$$(python3 scripts/prepare-fleet-wipe.py begin --root "$(CURDIR)" \
+			--arch "$(ARCH)" --site "$(SITE)" --bundle "$(FLEET_WIPE_PREP_DIR)" \
+			--wipe-run-id "$(FLEET_AUTHORIZE_WIPE_RUN)" --nodes "$(FLEET_AUTHORIZE_WIPE_NODES)")" || exit 1; \
+	else \
+		AUTH="$$(python3 scripts/prepare-fleet-wipe.py confirm --root "$(CURDIR)" \
+			--arch "$(ARCH)" --site "$(SITE)" --bundle "$(FLEET_WIPE_PREP_DIR)" \
+			--wipe-run-id "$(FLEET_WIPE_RUN_ID)")" || exit 1; \
+	fi; \
 	VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
@@ -788,16 +812,24 @@ record-fleet-wipe-disposition:  ## Record explicit choice after failed native cl
 	python3 scripts/fleet-cleaning-state.py disposition --root "$(CURDIR)" --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_WIPE_RUN_ID)" --nodes "$(FLEET_AUTHORIZE_WIPE_NODES)"
 
-inspect-fleet:  ## Run separately authorized physical fleet inspection; exact run and node list required
+inspect-fleet:  ## Confirm the selected sealed fleet interactively, or supply exact authorization for automation
 	$(call check_arch,$@)
-	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_AUTHORIZE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_NODES)" ]; then \
-		echo "ERROR: FLEET_RUN_ID, FLEET_AUTHORIZE_RUN and FLEET_AUTHORIZE_NODES are required"; exit 1; \
+	@if [ -z "$(FLEET_RUN_ID)" ]; then \
+		echo "ERROR: no inspection run selected; prepare a fleet or supply FLEET_RUN_ID"; exit 1; \
 	fi
 	@SECRETS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/secrets.yaml"; \
 	if [ ! -f "$$SECRETS" ]; then echo "ERROR: collection site secrets are missing"; exit 1; fi; \
-	AUTH="$$(python3 scripts/prepare-fleet-inspection.py authorize \
-		--bundle "$(FLEET_PREP_DIR)" --run-id "$(FLEET_AUTHORIZE_RUN)" \
-		--nodes "$(FLEET_AUTHORIZE_NODES)")" || exit 1; \
+	if [ -n "$(FLEET_AUTHORIZE_RUN)" ] || [ -n "$(FLEET_AUTHORIZE_NODES)" ]; then \
+		if [ -z "$(FLEET_AUTHORIZE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_NODES)" ]; then \
+			echo "ERROR: supply both FLEET_AUTHORIZE_RUN and FLEET_AUTHORIZE_NODES, or neither for interactive confirmation"; exit 1; \
+		fi; \
+		AUTH="$$(python3 scripts/prepare-fleet-inspection.py authorize \
+			--bundle "$(FLEET_PREP_DIR)" --run-id "$(FLEET_AUTHORIZE_RUN)" \
+			--nodes "$(FLEET_AUTHORIZE_NODES)")" || exit 1; \
+	else \
+		AUTH="$$(python3 scripts/prepare-fleet-inspection.py confirm \
+			--bundle "$(FLEET_PREP_DIR)" --run-id "$(FLEET_RUN_ID)")" || exit 1; \
+	fi; \
 	VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
@@ -882,21 +914,21 @@ prepare-ocp-boot:  ## Bind the running ISO server and initial fleet for boot rev
 	python3 scripts/prepare-abi-install.py prepare-boot --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
 
-boot-ocp-nodes:  ## Authorized automatic boot or interactive manual handoff, then installation monitoring
+boot-ocp-nodes:  ## Review selected installation and type boot, or supply explicit run authorization
 	$(call check_arch,$@)
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
 		python3 scripts/prepare-abi-install.py boot --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
 		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
 
-continue-ocp-install:  ## Return to an interrupted manual media handoff, then observe installation
+continue-ocp-install:  ## Type continue to return to the selected interrupted manual media handoff
 	$(call check_arch,$@)
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
 		python3 scripts/prepare-abi-install.py continue --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
 		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
 
-resume-ocp-install:  ## Resume installer observation and completion cleanup without booting nodes again
+resume-ocp-install:  ## Type resume for installer observation and cleanup without booting nodes again
 	$(call check_arch,$@)
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
 		python3 scripts/prepare-abi-install.py resume --arch "$(ARCH)" --site "$(SITE)" \
