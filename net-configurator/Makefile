@@ -179,11 +179,15 @@ endef
 # Context Management
 # ============================================================================
 
-import:  ## Import a filled-out Excel file — auto-detects arch/site from the file
+# Reimport the context-selected workbook unless a source was explicitly supplied.
+# Target-specific: deploy and other EXCEL consumers retain their existing contract.
+import: EXCEL ?= $(if $(ARCH),$(INPUT_XLSX))
+import:  ## Import EXCEL, or reimport the current context's canonical workbook
 	@if [ -z "$(EXCEL)" ]; then \
-		echo "❌ ERROR: EXCEL not specified"; \
+		echo "❌ ERROR: no workbook selected; set deployment context or supply EXCEL"; \
 		echo ""; \
-		echo "Usage: make import EXCEL=/path/to/your-config.xlsx"; \
+		echo "Usage: make import                                  # Current context"; \
+		echo "       make import EXCEL=/path/to/your-config.xlsx"; \
 		echo "       make import EXCEL=/path/to/your-config.xlsx SITE=my-lab"; \
 		echo ""; \
 		echo "The script reads 'architecture' and 'site_name' from the Excel"; \
