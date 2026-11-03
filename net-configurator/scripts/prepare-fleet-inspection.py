@@ -4,7 +4,7 @@
 """Prepare explicit fleet inputs and verify their handoff; never contact hardware."""
 
 import argparse
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import ipaddress
@@ -32,6 +32,8 @@ def load_module(filename):
 OCP = load_module("generate-ocp-inventory.py")
 SETTINGS = load_module("init-ocp-settings.py")
 HTTPD = load_module("ironic-httpd-settings.py")
+CONTEXT = load_module("_era_context.py")
+STATE = load_module("fleet-cleaning-state.py")
 
 
 def require(condition, message):
@@ -141,11 +143,17 @@ def candidate_binding(base, settings, roles, site_vars, arch, endpoints, disks):
 
 def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpose="auto"):
     """Validate every selected node before creating a new run-specific preparation directory."""
+    run_id = run_id or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     validate_run(run_id)
     require(purpose in ("auto", "node-lifecycle"), "Invalid inspection purpose")
+    derive_names = names is None
+    require(not derive_names or purpose == 'auto', 'Node-lifecycle inspection requires explicit nodes')
     require(all(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", value) and value not in (".", "..")
                 for value in (arch, site)), "Invalid architecture/site")
-    require(type(concurrency) is int and 0 < concurrency <= len(names), "Invalid selected-node concurrency")
+    context_path = STATE.safe_path(root / '.era-context')
+    if context_path.exists():
+        CONTEXT.read_context(context_path)
+    context_sha256 = fingerprint(context_path) if context_path.exists() else None
     httpd = HTTPD.site(root, arch, site)
     workbook = root / "input" / arch / site / f"{arch}.xlsx"
     settings_path = workbook.parent / "ocp-settings.yml"
@@ -170,6 +178,17 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpo
         cpu_network, cpu_gateway = SETTINGS.find_cpu_inband_vlan(excel_parser.parse_vlans(wb["VLANs & Profiles"]))
     finally:
         wb.close()
+    if derive_names:
+        initial, _ = OCP.split_abi_membership(roles, site_vars['devices'])
+        for name in roles:
+            matches = [row for row in rows if row['name'] == name]
+            require(len(matches) == 1
+                    and matches[0].get('include_in_initial_abi')
+                    == site_vars['devices'][name].get('include_in_initial_abi'),
+                    f'Workbook ABI membership differs from generated inventory: {name}; regenerate inventory')
+        names = sorted(initial)
+    require(bool(names), 'Initial ABI membership is empty; supply explicit nodes for node-lifecycle inspection')
+    require(type(concurrency) is int and 0 < concurrency <= len(names), "Invalid selected-node concurrency")
     require(site_vars.get("common", {}).get("cpu_network") == cpu_network
             and site_vars.get("common", {}).get("cpu_gateway") == cpu_gateway,
             "Generated CPU network differs from workbook; regenerate inventory")
@@ -242,6 +261,9 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpo
     base = root / "output" / arch / site
     abi_handoff, candidate_paths = ({}, []) if purpose == "node-lifecycle" else candidate_binding(
         base, settings, roles, site_vars, arch, endpoints, disks)
+    if derive_names:
+        require(bool(abi_handoff) and abi_handoff['initial_node_names'] == names,
+                'Automatic selection requires matching generated ABI manifests; run make generate-ocp')
     source_files.extend(candidate_paths)
     evidence = base / "reports/inspection" / run_id
     require(not evidence.exists() and not evidence.is_symlink(), "Evidence run already exists")
@@ -264,6 +286,7 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpo
     if abi_handoff:
         plan["abi_handoff"] = abi_handoff
     write_yaml(bundle / "plan.yml", {"inspect_fleet_plan": plan,
+               "fleet_adapter_context_sha256": context_sha256,
                "fleet_adapter_bundle": str(bundle), "fleet_adapter_expected_version": version,
                "fleet_adapter_collection_vars": str(cluster_path),
                "fleet_adapter_source_sha256": {str(path): fingerprint(path) for path in source_files},
@@ -271,7 +294,10 @@ def prepare(root, arch, site, names, run_id, collection_root, concurrency, purpo
                "fleet_inspection_driver_early_network_dir": str(bundle / "early-network")})
     write_yaml(bundle / "hosts.yml", {"all": {"children": {"bootstrap": {"hosts": {
         "localhost": {"ansible_connection": "local"}}}}}})
-    (bundle / "review.txt").write_text(HTTPD.review(httpd) + "\n")
+    (bundle / "review.txt").write_text(
+        f'Inspection run: {run_id}\nNodes: {", ".join(names)}\nConcurrency: {concurrency}\n'
+        'Preparation only; physical inspection requires separate authorization.\n'
+        + HTTPD.review(httpd) + "\n")
     (bundle / "review.txt").chmod(0o640)
     return bundle
 
@@ -320,17 +346,56 @@ def authorize(bundle, run_id, names):
         "fleet_adapter_authorized_run": run_id, "fleet_adapter_authorized_nodes": names}
 
 
+def select_prepared(root, arch, site, bundle):
+    """Publish only a sealed preparation; context selection grants no hardware authority."""
+    base = STATE.site_root(root, arch, site)
+    bundle = STATE.safe_path(bundle.absolute())
+    document = read_yaml(bundle / 'plan.yml')
+    plan = document['inspect_fleet_plan']
+    run_id = plan['run_id']
+    validate_run(run_id)
+    require(bundle == base / 'ocp/inspection/fleet' / run_id, 'Preparation belongs to another deployment')
+    with STATE.Lease(base):
+        prepared = read_yaml(bundle / 'prepared.yaml')
+        require(prepared['run_id'] == run_id
+                and prepared['node_names'] == [node['name'] for node in plan['authorized_nodes']]
+                and prepared['sha256'] == handoff_files(bundle, document), 'Prepared handoff changed')
+        HTTPD.verify_preflight(read_yaml(bundle / 'preflight-vars.yaml'), plan.get('httpd_tuning', {}))
+        require(not STATE.safe_path(base / 'reports/inspection' / run_id).exists(),
+                'Inspection evidence already exists; do not select an executed run as a new preparation')
+        context_path = STATE.safe_path(root / '.era-context')
+        previous = CONTEXT.read_context(context_path) if context_path.exists() else {}
+        if (previous.get('arch'), previous.get('site'), previous.get('fleet_run_id')) == (arch, site, run_id):
+            return run_id
+        require((fingerprint(context_path) if context_path.exists() else None)
+                == document.get('fleet_adapter_context_sha256'),
+                'Deployment context changed during preparation; preserve the preparation and review selection')
+        context = {'arch': arch, 'site': site}
+        if (previous.get('arch'), previous.get('site')) == (arch, site) and 'server_os' in previous:
+            context['server_os'] = previous['server_os']
+        context['fleet_run_id'] = run_id
+        STATE.write(context_path, context)
+    return run_id
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     prepare_parser = commands.add_parser("prepare")
-    for key in ("arch", "site", "nodes", "run-id", "collection-root"):
+    for key in ("arch", "site", "collection-root"):
         prepare_parser.add_argument(f"--{key}", required=True)
+    prepare_parser.add_argument('--nodes', default='')
+    prepare_parser.add_argument('--run-id', default='')
     prepare_parser.add_argument("--concurrency", type=int, default=2)
     prepare_parser.add_argument("--purpose", choices=("auto", "node-lifecycle"), default="auto")
     prepare_parser.add_argument("--root", type=Path, default=ROOT)
     seal_parser = commands.add_parser("seal")
     seal_parser.add_argument("--bundle", type=Path, required=True)
+    select_parser = commands.add_parser('select')
+    select_parser.add_argument('--root', type=Path, default=ROOT)
+    select_parser.add_argument('--arch', required=True)
+    select_parser.add_argument('--site', required=True)
+    select_parser.add_argument('--bundle', type=Path, required=True)
     authorize_parser = commands.add_parser("authorize")
     authorize_parser.add_argument("--bundle", type=Path, required=True)
     authorize_parser.add_argument("--run-id", required=True)
@@ -338,10 +403,14 @@ def main():
     args = parser.parse_args()
     try:
         if args.command == "prepare":
-            print(prepare(args.root.resolve(), args.arch, args.site, selection(args.nodes), args.run_id,
+            print(prepare(args.root.resolve(), args.arch, args.site,
+                          selection(args.nodes) if args.nodes else None, args.run_id,
                           Path(args.collection_root).expanduser().resolve(), args.concurrency, args.purpose))
         elif args.command == "seal":
             seal(args.bundle.resolve())
+        elif args.command == 'select':
+            print('Selected inspection run: ' + select_prepared(
+                args.root.resolve(), args.arch, args.site, args.bundle))
         else:
             print(json.dumps(authorize(args.bundle.resolve(), args.run_id, selection(args.nodes))))
     except (ValueError, KeyError, OSError, TypeError, yaml.YAMLError) as exc:

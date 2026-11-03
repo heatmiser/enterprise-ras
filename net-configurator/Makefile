@@ -89,6 +89,14 @@ ifneq ($(wildcard .era-context),)
             SERVER_OS := $(_CTX_SERVER_OS)
         endif
     endif
+    # A selected inspection run belongs only to the context's architecture/site.
+    _CTX_RUN_ARCH := $(subst ',,$(patsubst _ARCH=%,%,$(filter _ARCH=%,$(_CTX))))
+    _CTX_RUN_SITE := $(subst ',,$(patsubst _SITE=%,%,$(filter _SITE=%,$(_CTX))))
+    ifeq ($(ARCH)/$(SITE),$(_CTX_RUN_ARCH)/$(_CTX_RUN_SITE))
+        ifndef FLEET_RUN_ID
+            FLEET_RUN_ID := $(subst ',,$(patsubst _FLEET_RUN_ID=%,%,$(filter _FLEET_RUN_ID=%,$(_CTX))))
+        endif
+    endif
 endif
 
 # Default site if still not set
@@ -714,22 +722,24 @@ prepare-inspection-preflight:  ## Generate reviewable Gate-4 preflight inputs - 
 		-e "inspection_preflight_httpd_settings_path=$(CURDIR)/input/$(ARCH)/$(SITE)/ironic-httpd.yml" \
 		"$${VAULT_ARGS[@]}"
 
-prepare-fleet-inspection:  ## Prepare explicit fleet plan/networking and shared release preflight; no physical boot
+prepare-fleet-inspection:  ## Prepare a fresh initial ABI fleet and select it after preflight; no physical boot
 	$(call check_arch,$@)
-	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
-		echo "ERROR: FLEET_RUN_ID and explicit comma-separated FLEET_NODES are required"; exit 1; \
-	fi
-	python3 scripts/prepare-fleet-inspection.py prepare \
-		--arch "$(ARCH)" --site "$(SITE)" --run-id "$(FLEET_RUN_ID)" \
+	@BUNDLE="$$(python3 scripts/prepare-fleet-inspection.py prepare \
+		--arch "$(ARCH)" --site "$(SITE)" \
+		--run-id "$(if $(filter command line environment override,$(origin FLEET_RUN_ID)),$(FLEET_RUN_ID),)" \
 		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_CONCURRENCY)" \
 		--purpose "$(FLEET_INSPECTION_PURPOSE)" \
-		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
-	@VAULT_ARGS=(); \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)")" || exit 1; \
+	printf 'Inspection preparation: %s\n' "$$BUNDLE"; \
+	cat "$$BUNDLE/review.txt" || exit 1; \
+	VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
 		playbooks/prepare-fleet-inspection.yml \
-		-i "$(FLEET_PREP_DIR)/hosts.yml" -e "@$(FLEET_PREP_DIR)/plan.yml" \
-		"$${VAULT_ARGS[@]}"
+		-i "$$BUNDLE/hosts.yml" -e "@$$BUNDLE/plan.yml" \
+		"$${VAULT_ARGS[@]}" || exit 1; \
+	python3 scripts/prepare-fleet-inspection.py select --root "$(CURDIR)" \
+		--arch "$(ARCH)" --site "$(SITE)" --bundle "$$BUNDLE"
 
 # Keep operator values literal when exporting them to the validated CLI.
 override export FROM_RUN := $(value FROM_RUN)

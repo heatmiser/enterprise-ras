@@ -426,3 +426,247 @@ def test_inspection_seal_rejects_policy_different_from_reviewed_snapshot(workspa
     monkeypatch.undo()
     with pytest.raises(ValueError, match="HTTPD preflight settings differ"):
         adapter.seal(bundle)
+
+
+def generated_initial_fleet(workspace, include_all=False):
+    """Generate matching candidates and declarations for the seven-host example."""
+    import openpyxl
+    root, collection = workspace
+    base = root / 'output/2-8-5-200/test01'
+    site_path = base / 'inventory/group_vars/all/main.yml'
+    site = adapter.read_yaml(site_path)
+    if include_all:
+        workbook_path = root / 'input/2-8-5-200/test01/2-8-5-200.xlsx'
+        workbook = openpyxl.load_workbook(workbook_path)
+        for row in workbook['Nodes'].iter_rows(min_row=2):
+            row[11].value = 'Yes'
+        workbook.save(workbook_path)
+        workbook.close()
+        for device in site['devices'].values():
+            device['include_in_initial_abi'] = 'Yes'
+        site_path.write_text(yaml.safe_dump(site))
+    settings = adapter.read_yaml(root / 'input/2-8-5-200/test01/ocp-settings.yml')
+    roles = adapter.OCP.build_role_map(settings, site['devices'], '2-8-5-200', 'test01')
+    initial, _ = adapter.OCP.split_abi_membership(roles, site['devices'])
+    cluster_path = collection / 'inventories/test01/cluster-vars.yaml'
+    cluster = adapter.read_yaml(cluster_path)
+    cluster['ocp_nodes'] = [
+        {'name': name, 'bmc': {'driver': 'idrac', 'host': device['eth0_ip']}}
+        for name, device in site['devices'].items()
+    ]
+    cluster_path.write_text(yaml.safe_dump(cluster))
+    (base / 'ocp').mkdir(exist_ok=True)
+    agent = adapter.OCP.build_agent_config(settings, initial, {}, site, '2-8-5-200')
+    (base / 'ocp/agent-config.yaml').write_text(yaml.safe_dump(agent))
+    (base / 'ocp/install-config.yaml').write_text(yaml.safe_dump({
+        'metadata': {'name': settings['cluster']['name']},
+        'baseDomain': settings['cluster']['domain'],
+        'controlPlane': {'replicas': sum(role == 'control_plane' for role in initial.values())},
+        'compute': [{'replicas': sum(role != 'control_plane' for role in initial.values())}],
+        'networking': {'machineNetwork': [{'cidr': site['common']['cpu_network']}]},
+        'platform': {'baremetal': {'apiVIPs': [settings['cluster']['api_vip']],
+                                  'ingressVIPs': [settings['cluster']['ingress_vip']]}}
+    }))
+    return sorted(initial)
+
+
+@pytest.mark.parametrize('include_all,count', [(False, 6), (True, 7)])
+def test_default_nodes_follow_verified_initial_abi_membership(workspace, include_all, count):
+    root, collection = workspace
+    expected = generated_initial_fleet(workspace, include_all)
+    bundle = adapter.prepare(root, '2-8-5-200', 'test01', None, RUN, collection, 2)
+    plan = adapter.read_yaml(bundle / 'plan.yml')['inspect_fleet_plan']
+    assert plan['expected_node_count'] == count
+    assert [node['name'] for node in plan['authorized_nodes']] == expected
+    assert plan['abi_handoff']['initial_node_names'] == expected
+    assert 'Concurrency: 2' in (bundle / 'review.txt').read_text()
+    assert not (root / '.era-context').exists()  # Not selected before preflight/seal.
+    if include_all:
+        assert sum(node['role'] == 'master' for node in plan['authorized_nodes']) == 3
+        assert sum(node['role'] == 'worker' for node in plan['authorized_nodes']) == 4
+
+
+@pytest.mark.parametrize('case', ['missing', 'stale_agent', 'stale_membership'])
+def test_automatic_selection_rejects_missing_or_stale_abi_inputs(workspace, case):
+    import openpyxl
+    root, collection = workspace
+    generated_initial_fleet(workspace)
+    path = root / 'output/2-8-5-200/test01/ocp/agent-config.yaml'
+    if case == 'missing':
+        path.unlink()
+        path.with_name('install-config.yaml').unlink()
+    elif case == 'stale_agent':
+        document = adapter.read_yaml(path)
+        document['hosts'][0]['hostname'] = 'unexpected.example.com'
+        path.write_text(yaml.safe_dump(document))
+    else:
+        path = root / 'input/2-8-5-200/test01/2-8-5-200.xlsx'
+        workbook = openpyxl.load_workbook(path)
+        for row in workbook['Nodes'].iter_rows(min_row=2):
+            if row[1].value == 'server-gpu-03':
+                row[11].value = 'Yes'
+        workbook.save(path)
+        workbook.close()
+    with pytest.raises(ValueError):
+        adapter.prepare(root, '2-8-5-200', 'test01', None, RUN, collection, 2)
+    assert not (root / 'output/2-8-5-200/test01/ocp/inspection/fleet' / RUN).exists()
+    assert not (root / '.era-context').exists()
+
+
+def test_node_lifecycle_still_requires_explicit_scope(workspace):
+    root, collection = workspace
+    with pytest.raises(ValueError, match='requires explicit nodes'):
+        adapter.prepare(root, '2-8-5-200', 'test01', None, RUN, collection, 1, 'node-lifecycle')
+
+
+def test_explicit_node_subset_and_run_are_retained(workspace):
+    root, collection = workspace
+    bundle = adapter.prepare(root, '2-8-5-200', 'test01', NAMES[1:], RUN, collection, 1)
+    plan = adapter.read_yaml(bundle / 'plan.yml')['inspect_fleet_plan']
+    assert plan['run_id'] == RUN
+    assert [node['name'] for node in plan['authorized_nodes']] == NAMES[1:]
+
+
+def test_fresh_run_is_utc_and_existing_directory_is_refused(workspace, monkeypatch):
+    from datetime import datetime, timezone
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            assert tz == timezone.utc
+            return cls(2000, 1, 1, 12, 0, 0, tzinfo=tz)
+    monkeypatch.setattr(adapter, 'datetime', Clock)
+    root, collection = workspace
+    bundle = adapter.prepare(root, '2-8-5-200', 'test01', NAMES, '', collection, 2)
+    before = (bundle / 'plan.yml').read_bytes()
+    assert bundle.name == RUN
+    with pytest.raises(FileExistsError):
+        adapter.prepare(root, '2-8-5-200', 'test01', NAMES, '', collection, 2)
+    assert (bundle / 'plan.yml').read_bytes() == before
+
+
+@pytest.mark.parametrize('old_context,retain_os', [
+    (None, False),
+    ('arch: 2-8-5-200\nsite: test01\nserver_os: rhcos\nfleet_run_id: 19990101T000000Z\n', True),
+    ('arch: 2-8-5-200\nsite: other-site\nserver_os: rhcos\n', False),
+])
+def test_only_sealed_preparation_is_selected_and_context_preserved(workspace, old_context, retain_os):
+    root, _ = workspace
+    context = root / '.era-context'
+    if old_context is not None:
+        context.write_text(old_context)
+    bundle = prepare(workspace)
+    with pytest.raises(ValueError):
+        adapter.select_prepared(root, '2-8-5-200', 'test01', bundle)
+    assert context.read_text() == old_context if old_context is not None else not context.exists()
+    seal(bundle)
+    assert adapter.select_prepared(root, '2-8-5-200', 'test01', bundle) == RUN
+    value = adapter.CONTEXT.read_context(context)
+    assert value['arch'] == '2-8-5-200' and value['site'] == 'test01'
+    assert value['fleet_run_id'] == RUN
+    assert (value.get('server_os') == 'rhcos') == retain_os
+    selected = context.read_bytes()
+    adapter.select_prepared(root, '2-8-5-200', 'test01', bundle)
+    assert context.read_bytes() == selected
+    assert not (root / 'output/2-8-5-200/test01/reports/inspection' / RUN).exists()
+
+
+@pytest.mark.parametrize('case', ['context_changed', 'seal_changed', 'source_changed',
+                                 'foreign_site', 'executed_run', 'context_symlink'])
+def test_selection_failure_preserves_context(workspace, case):
+    root, _ = workspace
+    context = root / '.era-context'
+    context.write_text('arch: 2-8-5-200\nsite: test01\nserver_os: rhcos\n')
+    bundle = prepare(workspace)
+    seal(bundle)
+    if case == 'context_changed':
+        context.write_text('arch: 2-8-5-200\nsite: other-site\n')
+    elif case == 'seal_changed':
+        (bundle / 'nmstate' / f'{NAMES[0]}.yaml').write_text('changed')
+    elif case == 'source_changed':
+        (root / 'input/2-8-5-200/test01/ocp-settings.yml').write_text('changed')
+    elif case == 'executed_run':
+        (root / 'output/2-8-5-200/test01/reports/inspection' / RUN).mkdir(parents=True)
+    elif case == 'context_symlink':
+        original = root / 'original-context'
+        context.rename(original)
+        context.symlink_to(original)
+    before = context.read_bytes()
+    with pytest.raises(ValueError):
+        adapter.select_prepared(root, '2-8-5-200', 'other-site' if case == 'foreign_site' else 'test01', bundle)
+    assert context.read_bytes() == before
+
+
+@pytest.fixture
+def make_preparation(workspace):
+    root, collection = workspace
+    expected = generated_initial_fleet(workspace, include_all=True)
+    shutil.copyfile(ROOT / 'Makefile', root / 'Makefile')
+    shutil.copytree(ROOT / 'scripts', root / 'scripts')
+    (root / 'vars').mkdir()
+    shutil.copyfile(adapter.OCP.DISK_DEFAULTS_PATH, root / 'vars' / adapter.OCP.DISK_DEFAULTS_PATH.name)
+    (root / '.era-context').write_text(
+        'arch: 2-8-5-200\nsite: test01\nserver_os: rhcos\nfleet_run_id: 19990101T000000Z\n')
+    bin_dir = root / 'bin'
+    bin_dir.mkdir()
+    script = bin_dir / 'ansible-playbook'
+    script.write_text('''#!/usr/bin/env python3
+import importlib.util, os, sys
+from pathlib import Path
+assert sys.argv[1] == 'playbooks/prepare-fleet-inspection.yml'
+bundle = Path(sys.argv[sys.argv.index('-i') + 1]).parent
+if os.environ.get('FAIL_PREFLIGHT'):
+    sys.exit(1)
+spec = importlib.util.spec_from_file_location('local_adapter', 'scripts/prepare-fleet-inspection.py')
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+doc = mod.read_yaml(bundle / 'plan.yml')
+node = doc['inspect_fleet_plan']['authorized_nodes'][0]
+mod.write_yaml(bundle / 'preflight-vars.yaml', {
+    'inspection_preflight_provenance': {
+        'installer_version': doc['fleet_adapter_expected_version'],
+        'callback_target_ip': node['devices']['bond_ip']},
+    'preflight_inspection_nodes': [node],
+    **doc['inspect_fleet_plan'].get('httpd_tuning', {})})
+mod.write_yaml(bundle / 'callback-routes.yaml', {'fixture': 'no route or hardware calls'})
+mod.seal(bundle)
+''')
+    script.chmod(0o700)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith('FLEET_') and key not in {
+               'ARCH', 'SITE', 'SERVER_OS', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES',
+               'RHV_NATIVE_OPERATION_LOCK_FD', 'RHV_NATIVE_OPERATION_SITE'}}
+    env['PATH'] = f'{bin_dir}:{env["PATH"]}'
+    return root, collection, expected, env
+
+
+@pytest.mark.parametrize('case', ['automatic', 'explicit', 'preflight_failure'])
+def test_make_preparation_selects_only_after_success(make_preparation, case):
+    root, collection, expected, env = make_preparation
+    context = root / '.era-context'
+    before = context.read_bytes()
+    args = ['make', '--no-print-directory', 'prepare-fleet-inspection',
+            f'RHV_BAREMETAL_OCP_ROOT={collection}']
+    if case == 'explicit':
+        args.extend([f'FLEET_RUN_ID={RUN}', f'FLEET_NODES={",".join(NAMES)}', 'FLEET_CONCURRENCY=1'])
+        expected = NAMES
+    if case == 'preflight_failure':
+        env['FAIL_PREFLIGHT'] = '1'
+    result = subprocess.run(args, cwd=root, env=env, capture_output=True, text=True, timeout=30)
+    if case == 'preflight_failure':
+        assert result.returncode != 0
+        assert context.read_bytes() == before
+        assert 'Selected inspection run:' not in result.stdout
+        return
+    assert result.returncode == 0, result.stdout + result.stderr
+    selected = adapter.CONTEXT.read_context(context)
+    assert selected['server_os'] == 'rhcos'
+    run = selected['fleet_run_id']
+    assert run != '19990101T000000Z'
+    if case == 'explicit':
+        assert run == RUN
+    bundle = root / 'output/2-8-5-200/test01/ocp/inspection/fleet' / run
+    assert (bundle / 'prepared.yaml').exists()
+    plan = adapter.read_yaml(bundle / 'plan.yml')['inspect_fleet_plan']
+    assert [node['name'] for node in plan['authorized_nodes']] == expected
+    assert plan['concurrency_limit'] == (1 if case == 'explicit' else 2)
+    assert not Path(plan['artifact_root']).exists()
