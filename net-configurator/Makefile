@@ -798,16 +798,24 @@ record-fleet-wipe-disposition:  ## Record explicit choice after failed native cl
 	python3 scripts/fleet-cleaning-state.py disposition --root "$(CURDIR)" --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_WIPE_RUN_ID)" --nodes "$(FLEET_AUTHORIZE_WIPE_NODES)"
 
-inspect-fleet:  ## Run separately authorized physical fleet inspection; exact run and node list required
+inspect-fleet:  ## Confirm the selected sealed fleet interactively, or supply exact authorization for automation
 	$(call check_arch,$@)
-	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_AUTHORIZE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_NODES)" ]; then \
-		echo "ERROR: FLEET_RUN_ID, FLEET_AUTHORIZE_RUN and FLEET_AUTHORIZE_NODES are required"; exit 1; \
+	@if [ -z "$(FLEET_RUN_ID)" ]; then \
+		echo "ERROR: no inspection run selected; prepare a fleet or supply FLEET_RUN_ID"; exit 1; \
 	fi
 	@SECRETS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/secrets.yaml"; \
 	if [ ! -f "$$SECRETS" ]; then echo "ERROR: collection site secrets are missing"; exit 1; fi; \
-	AUTH="$$(python3 scripts/prepare-fleet-inspection.py authorize \
-		--bundle "$(FLEET_PREP_DIR)" --run-id "$(FLEET_AUTHORIZE_RUN)" \
-		--nodes "$(FLEET_AUTHORIZE_NODES)")" || exit 1; \
+	if [ -n "$(FLEET_AUTHORIZE_RUN)" ] || [ -n "$(FLEET_AUTHORIZE_NODES)" ]; then \
+		if [ -z "$(FLEET_AUTHORIZE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_NODES)" ]; then \
+			echo "ERROR: supply both FLEET_AUTHORIZE_RUN and FLEET_AUTHORIZE_NODES, or neither for interactive confirmation"; exit 1; \
+		fi; \
+		AUTH="$$(python3 scripts/prepare-fleet-inspection.py authorize \
+			--bundle "$(FLEET_PREP_DIR)" --run-id "$(FLEET_AUTHORIZE_RUN)" \
+			--nodes "$(FLEET_AUTHORIZE_NODES)")" || exit 1; \
+	else \
+		AUTH="$$(python3 scripts/prepare-fleet-inspection.py confirm \
+			--bundle "$(FLEET_PREP_DIR)" --run-id "$(FLEET_RUN_ID)")" || exit 1; \
+	fi; \
 	VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \

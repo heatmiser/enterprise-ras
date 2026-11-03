@@ -3,11 +3,15 @@
 """Focused fleet preparation and entry-boundary checks; no physical services."""
 
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
+import pty
+import select
 import shutil
 import subprocess
+import time
 
 import pytest
 import yaml
@@ -670,3 +674,201 @@ def test_make_preparation_selects_only_after_success(make_preparation, case):
     assert [node['name'] for node in plan['authorized_nodes']] == expected
     assert plan['concurrency_limit'] == (1 if case == 'explicit' else 2)
     assert not Path(plan['artifact_root']).exists()
+
+
+class InspectionTerminal(io.StringIO):
+    def __init__(self, answer, on_read=None):
+        super().__init__(answer)
+        self.on_read = on_read
+
+    def isatty(self):
+        return True
+
+    def readline(self, *args):
+        if self.on_read is not None:
+            self.on_read()
+        return super().readline(*args)
+
+
+def test_confirmation_reviews_seven_hosts_and_returns_exact_authority(workspace):
+    root, collection = workspace
+    expected = generated_initial_fleet(workspace, include_all=True)
+    (root / 'input/2-8-5-200/test01/ironic-httpd.yml').write_text(
+        'ironic_deploy_httpd_tuning: true\nironic_deploy_httpd_manage_sysctl: true\n')
+    bundle = adapter.prepare(root, '2-8-5-200', 'test01', None, RUN, collection, 7)
+    seal(bundle)
+    output = io.StringIO()
+
+    result = adapter.confirm_inspection(bundle, RUN, InspectionTerminal('inspect\n'), output)
+
+    assert result == adapter.authorize(bundle, RUN, expected)
+    assert f'Inspection run: {RUN}' in output.getvalue()
+    assert f'Nodes (7): {", ".join(expected)}' in output.getvalue()
+    assert 'Concurrency: 7' in output.getvalue()
+    assert 'HTTPD profile: True; host sysctls: True' in output.getvalue()
+    assert not (root / 'output/2-8-5-200/test01/reports/inspection' / RUN).exists()
+
+
+@pytest.mark.parametrize('answer', ['', '\n', 'no\n', 'yes\n', 'INSPECT\n'])
+def test_confirmation_cancellation_preserves_preparation(workspace, answer):
+    bundle = prepare(workspace)
+    seal(bundle)
+    before = {path.relative_to(bundle): path.read_bytes()
+              for path in bundle.rglob('*') if path.is_file()}
+    with pytest.raises(ValueError, match='cancelled'):
+        adapter.confirm_inspection(bundle, RUN, InspectionTerminal(answer), io.StringIO())
+    assert before == {path.relative_to(bundle): path.read_bytes()
+                      for path in bundle.rglob('*') if path.is_file()}
+
+
+def test_piped_confirmation_is_rejected_without_consuming_answer(workspace):
+    bundle = prepare(workspace)
+    seal(bundle)
+    answers = io.StringIO('inspect\n')
+    with pytest.raises(ValueError, match='requires a terminal'):
+        adapter.confirm_inspection(bundle, RUN, answers, io.StringIO())
+    assert answers.tell() == 0
+
+
+@pytest.mark.parametrize('case', ['wrong_run', 'changed_network', 'missing_seal'])
+def test_confirmation_rejects_invalid_preparation_before_prompt(workspace, case):
+    bundle = prepare(workspace)
+    seal(bundle)
+    run = RUN
+    if case == 'wrong_run':
+        run = '20000101T130000Z'
+    elif case == 'changed_network':
+        (bundle / 'nmstate' / f'{NAMES[0]}.yaml').write_text('changed')
+    else:
+        (bundle / 'prepared.yaml').unlink()
+    output = io.StringIO()
+    with pytest.raises(ValueError):
+        adapter.confirm_inspection(bundle, run, InspectionTerminal('inspect\n'), output)
+    assert not output.getvalue()
+
+
+@pytest.mark.parametrize('reseal', [False, True])
+def test_confirmation_rejects_inputs_changed_while_prompting(workspace, reseal):
+    bundle = prepare(workspace)
+    seal(bundle)
+
+    def change():
+        path = bundle / 'plan.yml'
+        doc = adapter.read_yaml(path)
+        doc['inspect_fleet_plan']['concurrency_limit'] = 1
+        path.write_text(yaml.safe_dump(doc))
+        if reseal:
+            receipt_path = bundle / 'prepared.yaml'
+            receipt = adapter.read_yaml(receipt_path)
+            receipt['sha256'] = adapter.handoff_files(bundle, doc)
+            receipt_path.write_text(yaml.safe_dump(receipt))
+
+    with pytest.raises(ValueError, match='changed'):
+        adapter.confirm_inspection(bundle, RUN, InspectionTerminal('inspect\n', change), io.StringIO())
+
+
+def test_confirmation_keyboard_interrupt_cancels(workspace):
+    bundle = prepare(workspace)
+    seal(bundle)
+    def interrupt():
+        raise KeyboardInterrupt
+    with pytest.raises(ValueError, match='cancelled'):
+        adapter.confirm_inspection(bundle, RUN, InspectionTerminal('', interrupt), io.StringIO())
+
+
+@pytest.fixture
+def inspection_command(workspace):
+    root, collection = workspace
+    expected = generated_initial_fleet(workspace, include_all=True)
+    (root / '.era-context').write_text('arch: 2-8-5-200\nsite: test01\nserver_os: rhcos\n')
+    bundle = adapter.prepare(root, '2-8-5-200', 'test01', None, RUN, collection, 7)
+    seal(bundle)
+    adapter.select_prepared(root, '2-8-5-200', 'test01', bundle)
+    shutil.copyfile(ROOT / 'Makefile', root / 'Makefile')
+    shutil.copytree(ROOT / 'scripts', root / 'scripts')
+    (collection / 'inventories/test01/secrets.yaml').write_text('unused fixture')
+    bin_dir = root / 'bin'
+    bin_dir.mkdir()
+    marker = root / 'executed.json'
+    executable = bin_dir / 'ansible-playbook'
+    executable.write_text('#!/usr/bin/env python3\nimport json,os,sys\nfrom pathlib import Path\n'
+                          'Path(os.environ["FLEET_TEST_CAPTURE"]).write_text(json.dumps(sys.argv[1:]))\n')
+    executable.chmod(0o700)
+    env = {key: value for key, value in os.environ.items()
+           if not key.startswith('FLEET_') and key not in {
+               'ARCH', 'SITE', 'SERVER_OS', 'MAKEFLAGS', 'MFLAGS', 'MAKEOVERRIDES'}}
+    env.update(PATH=f'{bin_dir}:{env["PATH"]}', FLEET_TEST_CAPTURE=str(marker))
+    argv = ['make', '--no-print-directory', 'inspect-fleet', f'RHV_BAREMETAL_OCP_ROOT={collection}']
+    return root, bundle, expected, marker, env, argv
+
+
+def run_inspection_terminal(root, env, argv, answer):
+    """Use a real PTY for stdin, with execution replaced by the fixture recorder."""
+    master, slave = pty.openpty()
+    process = None
+    try:
+        process = subprocess.Popen(argv, cwd=root, env=env, stdin=slave,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        os.close(slave)
+        slave = None
+        transcript = bytearray()
+        deadline = time.monotonic() + 15
+        while b'Type inspect to authorize' not in transcript and time.monotonic() < deadline:
+            ready, _, _ = select.select([process.stderr], [], [], 0.2)
+            if ready:
+                block = os.read(process.stderr.fileno(), 4096)
+                if not block:
+                    break
+                transcript.extend(block)
+        assert b'Type inspect to authorize' in transcript, transcript.decode()
+        os.write(master, answer.encode())
+        stdout, stderr = process.communicate(timeout=15)
+        return subprocess.CompletedProcess(argv, process.returncode, stdout, transcript.decode() + stderr)
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.communicate()
+        os.close(master)
+        if slave is not None:
+            os.close(slave)
+
+
+@pytest.mark.parametrize('answer,accepted', [('inspect\n', True), ('\n', False)])
+def test_make_inspect_uses_selected_scope_and_terminal_confirmation(inspection_command, answer, accepted):
+    root, _, expected, marker, env, argv = inspection_command
+    result = run_inspection_terminal(root, env, argv, answer)
+    assert marker.exists() == accepted
+    if accepted:
+        assert result.returncode == 0, result.stdout + result.stderr
+        arguments = json.loads(marker.read_text())
+        authority = next(json.loads(arg) for arg in arguments
+                         if arg.startswith('{"fleet_inspection_driver_physical_authorization"'))
+        assert authority['fleet_adapter_authorized_run'] == RUN
+        assert authority['fleet_adapter_authorized_nodes'] == expected
+        assert 'Nodes (7):' in result.stderr and 'Concurrency: 7' in result.stderr
+        assert 'Physical inspection will boot' not in result.stdout  # AUTH contains JSON only.
+    else:
+        assert result.returncode != 0
+        assert 'cancelled' in result.stderr
+
+
+@pytest.mark.parametrize('case', ['no_terminal', 'partial_run', 'partial_nodes', 'wrong_scope', 'explicit'])
+def test_make_inspect_noninteractive_authorization_contract(inspection_command, case):
+    root, _, expected, marker, env, argv = inspection_command
+    if case in {'partial_run', 'wrong_scope', 'explicit'}:
+        argv.append(f'FLEET_AUTHORIZE_RUN={RUN}')
+    if case in {'partial_nodes', 'wrong_scope', 'explicit'}:
+        names = expected[:1] if case == 'wrong_scope' else expected
+        argv.append(f'FLEET_AUTHORIZE_NODES={",".join(names)}')
+    result = subprocess.run(argv, cwd=root, env=env, input='inspect\n',
+                            capture_output=True, text=True, timeout=15)
+    assert marker.exists() == (case == 'explicit')
+    if case == 'explicit':
+        assert result.returncode == 0, result.stdout + result.stderr
+    else:
+        assert result.returncode != 0
+        if case == 'no_terminal':
+            assert 'requires a terminal' in result.stderr
+        if case in {'partial_run', 'partial_nodes'}:
+            assert 'supply both FLEET_AUTHORIZE_RUN and FLEET_AUTHORIZE_NODES' in result.stdout
+    assert 'Type inspect to authorize' not in result.stderr

@@ -346,6 +346,41 @@ def authorize(bundle, run_id, names):
         "fleet_adapter_authorized_run": run_id, "fleet_adapter_authorized_nodes": names}
 
 
+def confirm_inspection(bundle, run_id, input_stream=None, output_stream=None):
+    """Review a sealed scope on the terminal and require deliberate authorization."""
+    input_stream = sys.stdin if input_stream is None else input_stream
+    output_stream = sys.stderr if output_stream is None else output_stream
+    document = read_yaml(bundle / 'plan.yml')
+    plan = document['inspect_fleet_plan']
+    names = [node['name'] for node in plan['authorized_nodes']]
+    authorize(bundle, run_id, names)
+    reviewed_files = handoff_files(bundle, document)
+    reviewed_seal = fingerprint(bundle / 'prepared.yaml')
+    require(read_yaml(bundle / 'plan.yml') == document,
+            'Prepared plan changed before confirmation; review it again')
+    require(input_stream.isatty(),
+            'Interactive inspection authorization requires a terminal; '
+            'for automation supply both FLEET_AUTHORIZE_RUN and FLEET_AUTHORIZE_NODES')
+    print('Physical inspection will boot the selected hosts into the inspection ramdisk.',
+          file=output_stream)
+    print(f'Inspection run: {run_id}', file=output_stream)
+    print(f'Nodes ({len(names)}): {", ".join(names)}', file=output_stream)
+    print(f'Concurrency: {plan["concurrency_limit"]}', file=output_stream)
+    print(HTTPD.review(plan.get('httpd_tuning', {})), file=output_stream)
+    print('Type inspect to authorize, or press Enter to cancel: ',
+          end='', file=output_stream, flush=True)
+    try:
+        response = input_stream.readline().strip()
+    except KeyboardInterrupt:
+        raise ValueError('Inspection cancelled; no execution was authorized') from None
+    require(response == 'inspect', 'Inspection cancelled; no execution was authorized')
+    authority = authorize(bundle, run_id, names)
+    require(handoff_files(bundle, document) == reviewed_files
+            and fingerprint(bundle / 'prepared.yaml') == reviewed_seal,
+            'Prepared inputs changed during confirmation; no execution was authorized')
+    return authority
+
+
 def select_prepared(root, arch, site, bundle):
     """Publish only a sealed preparation; context selection grants no hardware authority."""
     base = STATE.site_root(root, arch, site)
@@ -400,6 +435,9 @@ def main():
     authorize_parser.add_argument("--bundle", type=Path, required=True)
     authorize_parser.add_argument("--run-id", required=True)
     authorize_parser.add_argument("--nodes", required=True)
+    confirm_parser = commands.add_parser('confirm')
+    confirm_parser.add_argument('--bundle', type=Path, required=True)
+    confirm_parser.add_argument('--run-id', required=True)
     args = parser.parse_args()
     try:
         if args.command == "prepare":
@@ -411,6 +449,8 @@ def main():
         elif args.command == 'select':
             print('Selected inspection run: ' + select_prepared(
                 args.root.resolve(), args.arch, args.site, args.bundle))
+        elif args.command == 'confirm':
+            print(json.dumps(confirm_inspection(args.bundle.resolve(), args.run_id)))
         else:
             print(json.dumps(authorize(args.bundle.resolve(), args.run_id, selection(args.nodes))))
     except (ValueError, KeyError, OSError, TypeError, yaml.YAMLError) as exc:
