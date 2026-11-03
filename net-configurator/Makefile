@@ -914,21 +914,21 @@ prepare-ocp-boot:  ## Bind the running ISO server and initial fleet for boot rev
 	python3 scripts/prepare-abi-install.py prepare-boot --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
 
-boot-ocp-nodes:  ## Authorized automatic boot or interactive manual handoff, then installation monitoring
+boot-ocp-nodes:  ## Review selected installation and type boot, or supply explicit run authorization
 	$(call check_arch,$@)
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
 		python3 scripts/prepare-abi-install.py boot --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
 		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
 
-continue-ocp-install:  ## Return to an interrupted manual media handoff, then observe installation
+continue-ocp-install:  ## Type continue to return to the selected interrupted manual media handoff
 	$(call check_arch,$@)
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
 		python3 scripts/prepare-abi-install.py continue --arch "$(ARCH)" --site "$(SITE)" \
 		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
 		--authorize-run "$(FLEET_AUTHORIZE_BOOT_RUN)"
 
-resume-ocp-install:  ## Resume installer observation and completion cleanup without booting nodes again
+resume-ocp-install:  ## Type resume for installer observation and cleanup without booting nodes again
 	$(call check_arch,$@)
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" \
 		python3 scripts/prepare-abi-install.py resume --arch "$(ARCH)" --site "$(SITE)" \

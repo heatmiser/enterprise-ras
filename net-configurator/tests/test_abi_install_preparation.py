@@ -2,6 +2,7 @@
 """Existing-ISO preparation rejects drift without generating or booting anything."""
 
 import importlib.util
+import io
 import json
 from pathlib import Path
 import shutil
@@ -443,7 +444,7 @@ def test_repeat_boot_adopts_selected_attempt_and_original_private_assets(served_
     assert (original / 'boot/plan.yml').read_bytes() == old_boot
 
 
-@pytest.mark.parametrize('authorization', ['', RUN, 'another-attempt'])
+@pytest.mark.parametrize('authorization', [RUN, 'another-attempt'])
 def test_repeat_boot_rejects_inspection_or_previous_attempt_authorization(served_repeat, monkeypatch, authorization):
     root, collection, _, _, _, lock = served_repeat
     install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
@@ -453,6 +454,94 @@ def test_repeat_boot_rejects_inspection_or_previous_attempt_authorization(served
     with pytest.raises(ValueError, match='must match the reviewed installation attempt'):
         install.boot(root, '2-8-5-200', 'test01', RUN, collection, SimpleNamespace(fd=123), authorization)
     assert not Path(plan['artifact_root']).exists()
+
+
+class InstallationInput(io.StringIO):
+    def isatty(self):
+        return True
+
+
+@pytest.mark.parametrize('action', ['boot', 'resume', 'continue'])
+def test_interactive_installation_confirms_exact_selected_attempt(served_repeat, monkeypatch, capsys, action):
+    root, collection, _, fresh, _, lock = served_repeat
+    target = install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    original_verify = install.verify_boot
+    monkeypatch.setattr(install, 'verify_boot', lambda *args: original_verify(*args, lock=lock))
+    monkeypatch.setattr(install.sys, 'stdin', InstallationInput(action + '\n'))
+    identity = install.confirm_installation(root, '2-8-5-200', 'test01', RUN, collection, target, plan, action)
+    assert identity == fresh.name and identity != RUN
+    output = capsys.readouterr().err
+    assert fresh.name in output and plan['serving_plan']['iso_sha256'] in output
+    assert all(name in output for name in plan['node_names'] + plan['expected_cluster_nodes'])
+    assert not Path(plan['artifact_root']).exists()
+
+
+@pytest.mark.parametrize('response', ['', '\n', 'yes\n', 'resume\n', 'BOOT\n', 'non-tty'])
+def test_interactive_boot_rejection_creates_no_execution(served_install, monkeypatch, response):
+    root, collection, _, _, lock = served_install
+    install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    original_verify = install.verify_boot
+    monkeypatch.setattr(install, 'verify_boot', lambda *args: original_verify(*args, lock=lock))
+    stream = io.StringIO('boot\n') if response == 'non-tty' else InstallationInput(response)
+    monkeypatch.setattr(install.sys, 'stdin', stream)
+    secrets = collection / 'inventories/test01/secrets.yaml'
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.write_text('fixture: vaulted')
+    with pytest.raises(ValueError, match='cancelled|requires a terminal'):
+        install.boot(root, '2-8-5-200', 'test01', RUN, collection, SimpleNamespace(fd=123), '')
+    assert not Path(plan['artifact_root']).exists()
+
+
+def test_changed_boot_inputs_during_confirmation_create_no_execution(served_install, monkeypatch):
+    root, collection, _, _, lock = served_install
+    install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    original_verify = install.verify_boot
+    monkeypatch.setattr(install, 'verify_boot', lambda *args: original_verify(*args, lock=lock))
+    class ChangedInput(InstallationInput):
+        def readline(self):
+            (Path(plan['installer_dir']) / 'agent.x86_64.iso').write_bytes(b'changed during confirmation')
+            return 'boot\n'
+    monkeypatch.setattr(install.sys, 'stdin', ChangedInput())
+    secrets = collection / 'inventories/test01/secrets.yaml'
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.write_text('fixture: vaulted')
+    with pytest.raises(ValueError):
+        install.boot(root, '2-8-5-200', 'test01', RUN, collection, SimpleNamespace(fd=123), '')
+    assert not Path(plan['artifact_root']).exists()
+
+
+@pytest.mark.parametrize('resume', [False, True])
+def test_confirmed_installation_passes_exact_authority_to_existing_executor(served_install, monkeypatch, resume):
+    root, collection, _, _, lock = served_install
+    target = install.prepare_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    _, plan = install.verify_boot(root, '2-8-5-200', 'test01', RUN, collection, lock)
+    artifact = Path(plan['artifact_root'])
+    if resume:
+        artifact.mkdir(parents=True)
+        (artifact / 'plan.yml').write_bytes((target / 'plan.yml').read_bytes())
+        (artifact / 'runtime.yaml').write_text(yaml.safe_dump({'boot_complete': True, 'runtime_retained': True}))
+    original_verify = install.verify_boot
+    monkeypatch.setattr(install, 'verify_boot', lambda *args: original_verify(*args, lock=lock))
+    monkeypatch.setattr(install.sys, 'stdin', InstallationInput('resume\n' if resume else 'boot\n'))
+    secrets = collection / 'inventories/test01/secrets.yaml'
+    secrets.parent.mkdir(parents=True, exist_ok=True)
+    secrets.write_text('fixture: vaulted')
+    calls = []
+    monkeypatch.setattr(install.subprocess, 'run', lambda *a, **k: calls.append((a, k)) or SimpleNamespace(returncode=0))
+    # Route reads are part of revalidation; retain their synthetic response too.
+    def record(*args, **kwargs):
+        if args[0][0] == 'ip':
+            return SimpleNamespace(stdout=json.dumps([{'dev': 'eno1', 'prefsrc': '192.0.2.10'}]))
+        calls.append((args, kwargs))
+        return SimpleNamespace(returncode=0)
+    monkeypatch.setattr(install.subprocess, 'run', record)
+    install.boot(root, '2-8-5-200', 'test01', RUN, collection, SimpleNamespace(fd=123), '', resume=resume)
+    assert len(calls) == 1
+    assert 'abi_install_driver_authorize_run=' + RUN in calls[0][0][0]
+    assert 'abi_install_driver_action=' + ('resume' if resume else 'install') in calls[0][0][0]
 
 
 def test_repeat_serving_receipt_from_another_attempt_cannot_be_adopted(served_repeat):
