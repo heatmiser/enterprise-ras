@@ -60,6 +60,7 @@ def read_context(path: Path = CONTEXT_PATH) -> dict:
     site = None
     server_os = None
     fleet_run_id = None
+    fleet_wipe_run_id = None
     for raw_line in path.read_text().splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -80,6 +81,10 @@ def read_context(path: Path = CONTEXT_PATH) -> dict:
             if fleet_run_id is not None:
                 raise ValueError('duplicate fleet_run_id in .era-context')
             fleet_run_id = line.split(':', 1)[1].strip()
+        if line.startswith('fleet_wipe_run_id:'):
+            if fleet_wipe_run_id is not None:
+                raise ValueError('duplicate fleet_wipe_run_id in .era-context')
+            fleet_wipe_run_id = line.split(':', 1)[1].strip()
 
     if arch is None:
         raise ValueError(".era-context is missing an 'arch:' line")
@@ -108,11 +113,12 @@ def read_context(path: Path = CONTEXT_PATH) -> dict:
     context = {'arch': arch, 'site': site}
     if server_os is not None:
         context['server_os'] = server_os
-    if fleet_run_id is not None:
-        if not re.fullmatch(r'[0-9]{8}T[0-9]{6}Z', fleet_run_id):
-            raise ValueError('invalid fleet_run_id; require UTC YYYYMMDDTHHMMSSZ')
-        datetime.strptime(fleet_run_id, '%Y%m%dT%H%M%SZ')
-        context['fleet_run_id'] = fleet_run_id
+    for key, value in [('fleet_run_id', fleet_run_id), ('fleet_wipe_run_id', fleet_wipe_run_id)]:
+        if value is not None:
+            if not re.fullmatch(r'[0-9]{8}T[0-9]{6}Z', value):
+                raise ValueError(f'invalid {key}; require UTC YYYYMMDDTHHMMSSZ')
+            datetime.strptime(value, '%Y%m%dT%H%M%SZ')
+            context[key] = value
     return context
 
 

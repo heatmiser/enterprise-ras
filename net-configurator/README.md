@@ -5,6 +5,36 @@
 
 Ansible automation for ERA (Enterprise Reference Architecture) network switch configuration. Fill out an Excel spreadsheet describing your deployment, and this tool generates Ansible inventory, NVUE switch configs, and an NVIDIA Air topology -- then deploys everything via Zero Touch Provisioning (ZTP).
 
+## Bare-metal inspection and optional disk cleaning
+
+After a successful physical fleet inspection, prepare optional cleaning from the
+selected architecture, site, and inspection run in `.era-context`:
+
+make prepare-fleet-wipe FLEET_WIPE_CONCURRENCY=7
+
+Preparation validates the inspection receipt, derives its node list, generates a
+fresh wipe run ID, and displays the review. It selects `fleet_wipe_run_id` in the
+shared context only after release/network preflight and sealing succeed. Preparation
+does not boot hosts or write disks. Choose concurrency for the intended fleet size;
+the preparation default remains one.
+
+The cleaning scope is **all native eligible disks and partitions on the selected
+hosts**, including data disks. Installation-disk hints do not narrow this scope.
+UEFI boot-entry cleanup precedes disk metadata cleaning by default; this does not
+reset BIOS settings. `FLEET_WIPE_CLEAN_UEFI_NVRAM=0` omits boot-entry cleanup.
+
+To execute the selected sealed preparation:
+
+make wipe-fleet-disks
+
+The command displays the exact run, inspection source, nodes, concurrency, and
+clean steps. Type `wipe` at the terminal to authorize execution; cancellation or
+changed inputs prevent execution. For unattended automation, provide both exact
+`FLEET_AUTHORIZE_WIPE_RUN` and `FLEET_AUTHORIZE_WIPE_NODES`. Run/node overrides
+remain available through `FLEET_RUN_ID`, `FLEET_WIPE_RUN_ID`, and `FLEET_NODES`.
+Existing preparations and execution evidence are never overwritten. Use
+`make show-context` to inspect the selected runs.
+
 ## Terms used in this guide
 
 | Term | What it means |

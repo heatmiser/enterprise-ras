@@ -367,6 +367,35 @@ def test_valid_inspection_selection_is_emitted_with_os(ctx_dir):
     assert '_FLEET_RUN_ID=20000101T120000Z' in result.stdout
 
 
+@pytest.mark.parametrize('selection', ['20000101T130000Z', '', '../run', '$(touch marker)',
+                                      '20000230T120000Z',
+                                      '20000101T130000Z\nfleet_wipe_run_id: 20000101T140000Z'])
+def test_wipe_context_selection_is_validated(ctx_dir, selection):
+    _write_ctx(ctx_dir, 'arch: 2-8-5-200\nsite: customer-a\n'
+                       f'fleet_wipe_run_id: {selection}\n')
+    result = _run(ctx_dir)
+    if selection == '20000101T130000Z':
+        assert result.returncode == 0
+        assert '_FLEET_WIPE_RUN_ID=20000101T130000Z' in result.stdout
+    else:
+        assert result.returncode != 0 and not result.stdout
+    assert not (ctx_dir / 'marker').exists()
+
+
+@pytest.mark.parametrize('arguments,expected', [([], '20000101T130000Z'),
+                                              (['SITE=customer-b'], ''),
+                                              (['ARCH=2-4-3-200'], ''),
+                                              (['FLEET_WIPE_RUN_ID=20000101T140000Z'], '20000101T140000Z')])
+def test_make_binds_selected_wipe_to_its_deployment(make_import_workspace, arguments, expected):
+    root = make_import_workspace
+    _write_ctx(root, 'arch: 2-8-5-200\nsite: customer-a\nfleet_wipe_run_id: 20000101T130000Z\n')
+    with (root / 'Makefile').open('a') as stream:
+        stream.write("\nprint-selected-wipe:\n\t@printf '%s\\n' '$(FLEET_WIPE_RUN_ID)'\n")
+    result = _make_import(root, 'print-selected-wipe', *arguments)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == expected
+
+
 @pytest.mark.parametrize('selection', [
     '', '../another-run', '20000101T120000Z;id', '$(touch marker)',
     '20000230T120000Z', '20000101T250000Z',

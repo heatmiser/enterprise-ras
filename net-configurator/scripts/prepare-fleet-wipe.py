@@ -4,6 +4,7 @@
 """Seal optional native metadata-cleaning preparation; never boot nodes or write disks."""
 
 import argparse
+from datetime import datetime, timezone
 import importlib.util
 import json
 from pathlib import Path
@@ -27,6 +28,25 @@ gate = load_module(ROOT / "scripts/validate-physical-inspection.py", "wipe_inspe
 state = load_module(ROOT / "scripts/fleet-cleaning-state.py", "wipe_state")
 HTTPD = load_module(ROOT / "scripts/ironic-httpd-settings.py", "wipe_httpd")
 REDFISH = load_module(ROOT / "scripts/ironic-redfish-settings.py", "wipe_redfish")
+CONTEXT = load_module(ROOT / "scripts/_era_context.py", "wipe_context")
+
+
+def resolve_preparation(root, arch, site, inspection_run_id="", wipe_run_id="", names=None):
+    """Resolve a fresh preparation from validated context and inspected membership."""
+    context_path = state.safe_path(root.absolute() / '.era-context')
+    context = CONTEXT.read_context(context_path) if context_path.exists() else {}
+    if not inspection_run_id:
+        gate.require((context.get('arch'), context.get('site')) == (arch, site),
+                     'Select an inspection run for this architecture/site')
+        inspection_run_id = context.get('fleet_run_id', '')
+    adapter = load_module(ROOT / 'scripts/prepare-fleet-inspection.py', 'wipe_selection_adapter')
+    adapter.validate_run(inspection_run_id)
+    _, receipt, _ = gate.validate_handoff(root.absolute(), arch, site, inspection_run_id)
+    if names is None:
+        names = sorted(receipt['node_names'])
+    wipe_run_id = wipe_run_id or datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
+    adapter.validate_run(wipe_run_id)
+    return inspection_run_id, wipe_run_id, names
 
 
 def collection_hashes(collection):
@@ -77,6 +97,10 @@ def declared_oem(root, arch, site):
 
 def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_root, concurrency_limit=1, clean_uefi_nvram=True):
     root = root.absolute()
+    context_path = state.safe_path(root / '.era-context')
+    if context_path.exists():
+        CONTEXT.read_context(context_path)
+    context_sha256 = gate.digest(context_path) if context_path.exists() else None
     httpd = HTTPD.site(root, arch, site)
     # Physical readiness is independent of initial ABI membership. Legacy ABI
     # receipts remain valid sources under their original sealed input contract.
@@ -136,6 +160,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
     runtime = {"redfish_retry": redfish, "redfish_deadlines": deadline_contract,
                "preparation_code_sha256": {str(path): gate.digest(path) for path in (
                    ROOT / "scripts/prepare-fleet-wipe.py", ROOT / "scripts/ironic-redfish-settings.py")},
+               "context_sha256": context_sha256,
                "concurrency_limit": plan["concurrency_limit"], "httpd_tuning": httpd, "run_id": wipe_run_id,
                "artifact_root": str(evidence_root), "oem": oem, "native_profile": profile,
                "authorized_nodes": selected, "inspection_receipt_name": receipt_name,
@@ -161,7 +186,7 @@ def prepare(root, arch, site, inspection_run_id, wipe_run_id, names, collection_
               "SCOPE: ALL NATIVE ELIGIBLE DISKS AND PARTITIONS ON EVERY SELECTED NODE",
               "No installation-volume selector; no operator disk exclusions",
               "IPA native safeguards and device selection remain in force",
-              "Manual clean step: deploy.erase_devices_metadata only",
+              "Manual clean steps: " + ', '.join('deploy.' + step['step'] for step in plan['clean_steps']),
               f"Workbook OEM: {oem}; native hardware type: {profile['driver']}",
               f"Boot: {profile['boot_interface']}; management: {profile['management_interface']}; "
               f"power: {profile['power_interface']}",
@@ -317,9 +342,63 @@ def authorize(root, arch, site, bundle, run, names, start=False):
             "prepared_sha256": gate.digest(bundle / "prepared.yaml")}}
 
 
+def select_prepared(root, arch, site, bundle):
+    """Select only a sealed, unexecuted preparation; grant no physical authority."""
+    root = root.absolute()
+    base = state.site_root(root, arch, site)
+    with state.Lease(base):
+        state.check(base)
+        plan, runtime = verify(root, arch, site, bundle.absolute())
+        gate.require(not state.evidence_root(base, plan['run_id']).exists(),
+                     'Wipe execution already exists; preserve its evidence')
+        path = state.safe_path(root / '.era-context')
+        previous = CONTEXT.read_context(path) if path.exists() else {}
+        if (previous.get('arch'), previous.get('site'), previous.get('fleet_run_id'),
+                previous.get('fleet_wipe_run_id')) == (arch, site, plan['inspection_run_id'], plan['run_id']):
+            return plan['run_id']
+        gate.require((gate.digest(path) if path.exists() else None) == runtime.get('context_sha256'),
+                     'Deployment context changed during preparation; preserve the bundle and review selection')
+        context = {'arch': arch, 'site': site}
+        if (previous.get('arch'), previous.get('site')) == (arch, site) and 'server_os' in previous:
+            context['server_os'] = previous['server_os']
+        context.update(fleet_run_id=plan['inspection_run_id'], fleet_wipe_run_id=plan['run_id'])
+        state.write(path, context)
+    return plan['run_id']
+
+
+def confirm_wipe(root, arch, site, bundle, run, input_stream=None, output_stream=None):
+    """Review sealed destructive scope, then register exactly the confirmed execution."""
+    input_stream = sys.stdin if input_stream is None else input_stream
+    output_stream = sys.stderr if output_stream is None else output_stream
+    plan, _ = verify(root, arch, site, bundle)
+    names = sorted(node['name'] for node in plan['authorized_nodes'])
+    authorize(root, arch, site, bundle, run, names)
+    reviewed_plan = state.fingerprint(plan)
+    reviewed_seal = gate.digest(bundle / 'prepared.yaml')
+    gate.require(input_stream.isatty(),
+                 'Interactive wipe authorization requires a terminal; for automation supply '
+                 'both FLEET_AUTHORIZE_WIPE_RUN and FLEET_AUTHORIZE_WIPE_NODES')
+    print(f'Wipe run: {run}; inspection source: {plan["inspection_run_id"]}', file=output_stream)
+    print('Scope: ALL NATIVE ELIGIBLE DISKS AND PARTITIONS; no operator disk exclusions', file=output_stream)
+    print(f'Nodes ({len(names)}): {", ".join(names)}', file=output_stream)
+    print(f'Concurrency: {plan["concurrency_limit"]}', file=output_stream)
+    print('Clean steps: ' + ', '.join(step['step'] for step in plan['clean_steps']), file=output_stream)
+    print('Type wipe to authorize, or press Enter to cancel: ', end='', file=output_stream, flush=True)
+    try:
+        response = input_stream.readline().strip()
+    except KeyboardInterrupt:
+        raise ValueError('Wipe cancelled; no execution was authorized') from None
+    gate.require(response == 'wipe', 'Wipe cancelled; no execution was authorized')
+    current_plan, _ = verify(root, arch, site, bundle)
+    gate.require(state.fingerprint(current_plan) == reviewed_plan
+                 and gate.digest(bundle / 'prepared.yaml') == reviewed_seal,
+                 'Prepared inputs changed during confirmation; no execution was authorized')
+    return authorize(root, arch, site, bundle, run, names, start=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", nargs="?", default="prepare", choices=("prepare", "seal", "verify", "begin"))
+    parser.add_argument("command", nargs="?", default="prepare", choices=("prepare", "seal", "verify", "begin", "select", "confirm"))
     parser.add_argument("--root", type=Path, default=ROOT)
     for name in ("arch", "site"):
         parser.add_argument("--" + name, required=True)
@@ -330,6 +409,7 @@ def main():
     parser.add_argument("--no-clean-uefi-nvram", dest="clean_uefi_nvram", action="store_false")
     parser.add_argument("--collection-root", type=Path)
     parser.add_argument("--bundle", type=Path)
+    parser.add_argument("--print-bundle", action="store_true")
     args = parser.parse_args()
     try:
         gate.require(args.collection_root is not None if args.command == "prepare" else args.bundle is not None,
@@ -338,15 +418,23 @@ def main():
                      "Concurrency may only be selected during preparation")
         adapter = load_module(ROOT / "scripts/prepare-fleet-inspection.py", "wipe_cli_adapter")
         if args.command == "prepare":
-            names = adapter.selection(args.nodes)
-            bundle = prepare(args.root, args.arch, args.site, args.inspection_run_id, args.wipe_run_id,
-                             names, args.collection_root, 1 if args.concurrency is None else args.concurrency)
-            print(f"Wipe preparation seeded: {bundle}; no physical authority")
+            inspection_run, wipe_run, names = resolve_preparation(
+                args.root, args.arch, args.site, args.inspection_run_id, args.wipe_run_id,
+                adapter.selection(args.nodes) if args.nodes else None)
+            bundle = prepare(args.root, args.arch, args.site, inspection_run, wipe_run,
+                             names, args.collection_root, 1 if args.concurrency is None else args.concurrency,
+                             args.clean_uefi_nvram)
+            print(str(bundle) if args.print_bundle else f"Wipe preparation seeded: {bundle}; no physical authority")
         elif args.command == "seal":
             seal(args.root.absolute(), args.arch, args.site, args.bundle.absolute())
             print("Native runtime preparation sealed; no physical authority")
         elif args.command == "verify":
             verify(args.root.absolute(), args.arch, args.site, args.bundle.absolute())
+        elif args.command == "select":
+            print('Selected wipe run: ' + select_prepared(args.root, args.arch, args.site, args.bundle))
+        elif args.command == "confirm":
+            print(json.dumps(confirm_wipe(args.root.absolute(), args.arch, args.site,
+                                          args.bundle.absolute(), args.wipe_run_id)))
         else:
             print(json.dumps(authorize(args.root.absolute(), args.arch, args.site, args.bundle.absolute(),
                                       args.wipe_run_id, adapter.selection(args.nodes), start=True)))

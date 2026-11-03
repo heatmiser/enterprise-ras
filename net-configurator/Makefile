@@ -96,6 +96,9 @@ ifneq ($(wildcard .era-context),)
         ifndef FLEET_RUN_ID
             FLEET_RUN_ID := $(subst ',,$(patsubst _FLEET_RUN_ID=%,%,$(filter _FLEET_RUN_ID=%,$(_CTX))))
         endif
+        ifndef FLEET_WIPE_RUN_ID
+            FLEET_WIPE_RUN_ID := $(subst ',,$(patsubst _FLEET_WIPE_RUN_ID=%,%,$(filter _FLEET_WIPE_RUN_ID=%,$(_CTX))))
+        endif
     endif
 endif
 
@@ -750,22 +753,24 @@ restart-fleet-wipe:  ## Prepare a fresh wipe from recorded nodes: FROM_RUN=<old-
 		--from-run "$${FROM_RUN}" --concurrency "$${CONCURRENCY}" \
 		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" --collections-path "$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)"
 
-prepare-fleet-wipe:  ## Prepare native metadata cleaning of ALL eligible disks on selected nodes; no boot or writes
+prepare-fleet-wipe:  ## Prepare and select a fresh wipe from the inspected context; no boot or disk writes
 	$(call check_arch,$@)
-	@if [ -z "$(FLEET_RUN_ID)" ] || [ -z "$(FLEET_WIPE_RUN_ID)" ] || [ -z "$(FLEET_NODES)" ]; then \
-		echo "ERROR: FLEET_RUN_ID, fresh FLEET_WIPE_RUN_ID and explicit FLEET_NODES are required"; exit 1; \
-	fi
-	python3 scripts/prepare-fleet-wipe.py \
+	@BUNDLE="$$(python3 scripts/prepare-fleet-wipe.py \
 		--arch "$(ARCH)" --site "$(SITE)" \
-		--inspection-run-id "$(FLEET_RUN_ID)" --wipe-run-id "$(FLEET_WIPE_RUN_ID)" \
+		--inspection-run-id "$(FLEET_RUN_ID)" \
+		--wipe-run-id "$(if $(filter command line environment override,$(origin FLEET_WIPE_RUN_ID)),$(FLEET_WIPE_RUN_ID),)" \
 		--nodes "$(FLEET_NODES)" --concurrency "$(FLEET_WIPE_CONCURRENCY)" \
-		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
-		$(if $(filter 1,$(FLEET_WIPE_CLEAN_UEFI_NVRAM)),--clean-uefi-nvram,--no-clean-uefi-nvram)
-	@VAULT_ARGS=(); \
+		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" --print-bundle \
+		$(if $(filter 1,$(FLEET_WIPE_CLEAN_UEFI_NVRAM)),--clean-uefi-nvram,--no-clean-uefi-nvram))" || exit 1; \
+	printf 'Wipe preparation: %s; no physical authority\n' "$$BUNDLE"; \
+	cat "$$BUNDLE/review.txt" || exit 1; \
+	VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \
-		playbooks/prepare-fleet-wipe.yml -i "$(FLEET_WIPE_PREP_DIR)/hosts.yml" \
-		-e "@$(FLEET_WIPE_PREP_DIR)/runtime-plan.yml" "$${VAULT_ARGS[@]}"
+		playbooks/prepare-fleet-wipe.yml -i "$$BUNDLE/hosts.yml" \
+		-e "@$$BUNDLE/runtime-plan.yml" "$${VAULT_ARGS[@]}" || exit 1; \
+	python3 scripts/prepare-fleet-wipe.py select --root "$(CURDIR)" \
+		--arch "$(ARCH)" --site "$(SITE)" --bundle "$$BUNDLE"
 
 wipe-fleet-install-disks:  ## Retired installation-volume command; requires a fresh all-disk review
 	@echo "ERROR: installation-volume-only execution is retired. Review a fresh all-disk preparation and use make wipe-fleet-disks."; exit 1
@@ -776,15 +781,24 @@ wipe-fleet-disks:  ## Run separately authorized native metadata cleaning of ALL 
 		$(MAKE) --no-print-directory _wipe-fleet-disks
 
 _wipe-fleet-disks:
-	@if [ -z "$(FLEET_AUTHORIZE_WIPE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_WIPE_NODES)" ] || \
-	    [ "$(FLEET_AUTHORIZE_WIPE_RUN)" != "$(FLEET_WIPE_RUN_ID)" ]; then \
-		echo "ERROR: exact FLEET_AUTHORIZE_WIPE_RUN and FLEET_AUTHORIZE_WIPE_NODES are required"; exit 1; \
+	@if [ -z "$(FLEET_WIPE_RUN_ID)" ]; then \
+		echo "ERROR: no wipe run selected; run make prepare-fleet-wipe first"; exit 1; \
 	fi; \
 	SECRETS="$(RHV_BAREMETAL_OCP_ROOT)/inventories/$(SITE)/secrets.yaml"; \
 	if [ ! -f "$$SECRETS" ]; then echo "ERROR: selected site vault is missing"; exit 1; fi; \
-	AUTH="$$(python3 scripts/prepare-fleet-wipe.py begin --root "$(CURDIR)" \
-		--arch "$(ARCH)" --site "$(SITE)" --bundle "$(FLEET_WIPE_PREP_DIR)" \
-		--wipe-run-id "$(FLEET_AUTHORIZE_WIPE_RUN)" --nodes "$(FLEET_AUTHORIZE_WIPE_NODES)")" || exit 1; \
+	if [ -n "$(FLEET_AUTHORIZE_WIPE_RUN)" ] || [ -n "$(FLEET_AUTHORIZE_WIPE_NODES)" ]; then \
+		if [ -z "$(FLEET_AUTHORIZE_WIPE_RUN)" ] || [ -z "$(FLEET_AUTHORIZE_WIPE_NODES)" ] || \
+		    [ "$(FLEET_AUTHORIZE_WIPE_RUN)" != "$(FLEET_WIPE_RUN_ID)" ]; then \
+			echo "ERROR: supply both exact FLEET_AUTHORIZE_WIPE_RUN and FLEET_AUTHORIZE_WIPE_NODES, or neither for interactive confirmation"; exit 1; \
+		fi; \
+		AUTH="$$(python3 scripts/prepare-fleet-wipe.py begin --root "$(CURDIR)" \
+			--arch "$(ARCH)" --site "$(SITE)" --bundle "$(FLEET_WIPE_PREP_DIR)" \
+			--wipe-run-id "$(FLEET_AUTHORIZE_WIPE_RUN)" --nodes "$(FLEET_AUTHORIZE_WIPE_NODES)")" || exit 1; \
+	else \
+		AUTH="$$(python3 scripts/prepare-fleet-wipe.py confirm --root "$(CURDIR)" \
+			--arch "$(ARCH)" --site "$(SITE)" --bundle "$(FLEET_WIPE_PREP_DIR)" \
+			--wipe-run-id "$(FLEET_WIPE_RUN_ID)")" || exit 1; \
+	fi; \
 	VAULT_ARGS=(); \
 	if [ -f ".era-secrets/vault-pass" ]; then VAULT_ARGS+=(--vault-password-file .era-secrets/vault-pass); else VAULT_ARGS+=(--ask-vault-pass); fi; \
 	ANSIBLE_COLLECTIONS_PATH="$(RHV_BAREMETAL_OCP_COLLECTIONS_PATH)" ansible-playbook \

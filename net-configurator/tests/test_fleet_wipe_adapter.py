@@ -5,10 +5,13 @@
 import hashlib
 import importlib.util
 import json
+import io
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
+import textwrap
 
 import pytest
 
@@ -246,19 +249,58 @@ def test_real_make_preparation_invokes_only_preflight_driver(wipe_source):
         command.chmod(0o700)
     preflight_capture = root / "preflight-call.json"
     command = bin_dir / "ansible-playbook"
-    command.write_text("#!/usr/bin/env python3\nimport json,os,sys\nfrom pathlib import Path\n"
-                       "Path(os.environ['PREFLIGHT_CAPTURE']).write_text(json.dumps(sys.argv[1:]))\n")
+    command.write_text("#!/usr/bin/env python3\n" + textwrap.dedent("""\
+        import json, os, sys, subprocess
+        from pathlib import Path
+        import yaml
+        Path(os.environ['PREFLIGHT_CAPTURE']).write_text(json.dumps(sys.argv[1:]))
+        runtime_path = next(Path(arg[1:]) for arg in sys.argv if arg.startswith('@') and arg.endswith('runtime-plan.yml'))
+        bundle = runtime_path.parent
+        runtime = yaml.safe_load(runtime_path.read_text())['fleet_wipe_runtime_plan']
+        original = yaml.safe_load(Path(os.environ['WIPE_PREFLIGHT_SOURCE']).read_text())
+        candidate = runtime['authorized_nodes'][0]
+        preflight = {
+            **original, **runtime.get('httpd_tuning', {}),
+            'inspection_preflight_provenance': {**original['inspection_preflight_provenance'],
+                'callback_target_ip': candidate['devices']['bond_ip']},
+            'preflight_inspection_nodes': [candidate],
+            'ironic_deploy_provisioning_ip': '192.0.2.10',
+            'ironic_deploy_provisioning_interface': 'eth-test',
+        }
+        (bundle / 'preflight-vars.yaml').write_text(yaml.safe_dump(preflight))
+        routes = {'nodes': [n['name'] for n in runtime['authorized_nodes']],
+                  'routes': [{'item': n, 'stdout': json.dumps([{'dst': n['devices']['bond_ip'],
+                              'dev': 'eth-test', 'prefsrc': '192.0.2.10'}])} for n in runtime['authorized_nodes']]}
+        (bundle / 'callback-routes.yaml').write_text(yaml.safe_dump(routes))
+        subprocess.run([sys.executable, 'scripts/prepare-fleet-wipe.py', 'seal',
+                        '--arch', '2-8-5-200', '--site', 'test01', '--bundle', str(bundle)], check=True)
+        """))
     command.chmod(0o700)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "WIPE_RUNTIME_CAPTURE": str(capture),
-           "PREFLIGHT_CAPTURE": str(preflight_capture)}
-    command = ["make", "prepare-fleet-wipe", "ARCH=2-8-5-200", "SITE=test01", f"FLEET_RUN_ID={RUN}",
-               f"FLEET_WIPE_RUN_ID={WIPE}", "FLEET_NODES=" + ",".join(NAMES),
+           "PREFLIGHT_CAPTURE": str(preflight_capture),
+           "WIPE_PREFLIGHT_SOURCE": str(wipe_source[1] / "preflight-vars.yaml")}
+    write(root / '.era-context', {'arch': '2-8-5-200', 'site': 'test01', 'server_os': 'rhcos',
+                                  'fleet_run_id': RUN, 'fleet_wipe_run_id': WIPE})
+    env = {key: value for key, value in env.items() if not key.startswith('FLEET_')}
+    command = ["make", "prepare-fleet-wipe", "FLEET_WIPE_CONCURRENCY=" + str(len(NAMES)),
                "RHV_BAREMETAL_OCP_ROOT=" + str(collection)]
     result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert not capture.exists()
     assert "playbooks/prepare-fleet-wipe.yml" in json.loads(preflight_capture.read_text())
     assert "no physical authority" in result.stdout
+    context = wipe.CONTEXT.read_context(root / '.era-context')
+    assert context['fleet_run_id'] == RUN and context['fleet_wipe_run_id'] != WIPE
+    selected = root / 'output/2-8-5-200/test01/ocp/wipe/fleet' / context['fleet_wipe_run_id']
+    verified = subprocess.run(
+        [sys.executable, str(root / 'scripts/prepare-fleet-wipe.py'), 'verify',
+         '--arch', '2-8-5-200', '--site', 'test01', '--bundle', str(selected)],
+        cwd=root, env=env, capture_output=True, text=True, timeout=60)
+    assert verified.returncode == 0, verified.stdout + verified.stderr
+    selected_plan = gate.read_yaml(selected / 'plan.yml')['fleet_native_disk_clean_plan']
+    assert selected_plan['concurrency_limit'] == len(NAMES)
+    assert sorted(n['name'] for n in selected_plan['authorized_nodes']) == sorted(NAMES)
+    assert not (root / 'output/2-8-5-200/test01/reports/wipe').exists()
 
 
 def test_previous_preparation_is_preserved_when_fresh_native_plan_is_created(wipe_source):
@@ -299,6 +341,123 @@ def seal_bundle(source, bundle):
     fresh_preflight(source, bundle)
     wipe.seal(source[0], "2-8-5-200", "test01", bundle)
     return bundle
+
+
+def selected_inspection(source):
+    write(source[0] / '.era-context', {'arch': '2-8-5-200', 'site': 'test01',
+                                      'server_os': 'rhcos', 'fleet_run_id': RUN})
+
+
+def test_preparation_resolves_receipt_membership_and_fresh_id(wipe_source):
+    selected_inspection(wipe_source)
+    inspection, run, names = wipe.resolve_preparation(wipe_source[0], '2-8-5-200', 'test01')
+    assert inspection == RUN and names == sorted(NAMES) and run > RUN
+    assert not (wipe_source[0] / 'output/2-8-5-200/test01/ocp/wipe').exists()
+    assert wipe.resolve_preparation(wipe_source[0], '2-8-5-200', 'test01', RUN, WIPE, NAMES[:1]) == (
+        RUN, WIPE, NAMES[:1])
+
+
+@pytest.mark.parametrize('case', ['missing', 'wrong-site', 'invalid-run', 'altered-evidence'])
+def test_automatic_preparation_rejects_invalid_context_or_receipt(wipe_source, case):
+    root = wipe_source[0]
+    selected_inspection(wipe_source)
+    if case == 'missing':
+        (root / '.era-context').unlink()
+    elif case == 'wrong-site':
+        write(root / '.era-context', {'arch': '2-8-5-200', 'site': 'other', 'fleet_run_id': RUN})
+    elif case == 'invalid-run':
+        write(root / '.era-context', {'arch': '2-8-5-200', 'site': 'test01', 'fleet_run_id': '../bad'})
+    else:
+        (wipe_source[2] / NAMES[0] / 'cleanup.yaml').write_text('{}')
+    with pytest.raises(ValueError):
+        wipe.resolve_preparation(root, '2-8-5-200', 'test01')
+    assert not (root / 'output/2-8-5-200/test01/ocp/wipe').exists()
+
+
+def test_selection_publishes_only_sealed_preparation(wipe_source):
+    selected_inspection(wipe_source)
+    root = wipe_source[0]
+    previous = (root / '.era-context').read_bytes()
+    bundle = prepare(wipe_source)
+    with pytest.raises(ValueError):
+        wipe.select_prepared(root, '2-8-5-200', 'test01', bundle)
+    assert (root / '.era-context').read_bytes() == previous
+    seal_bundle(wipe_source, bundle)
+    assert wipe.select_prepared(root, '2-8-5-200', 'test01', bundle) == WIPE
+    assert wipe.CONTEXT.read_context(root / '.era-context') == {
+        'arch': '2-8-5-200', 'site': 'test01', 'server_os': 'rhcos',
+        'fleet_run_id': RUN, 'fleet_wipe_run_id': WIPE}
+    assert wipe.select_prepared(root, '2-8-5-200', 'test01', bundle) == WIPE
+    assert not (root / 'output/2-8-5-200/test01/reports/wipe').exists()
+
+
+def test_selection_rejects_context_changed_during_preflight(wipe_source):
+    selected_inspection(wipe_source)
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    path = wipe_source[0] / '.era-context'
+    write(path, {'arch': '2-8-5-200', 'site': 'other'})
+    previous = path.read_bytes()
+    with pytest.raises(ValueError, match='context changed'):
+        wipe.select_prepared(wipe_source[0], '2-8-5-200', 'test01', bundle)
+    assert path.read_bytes() == previous
+
+
+class TerminalInput(io.StringIO):
+    def isatty(self):
+        return True
+
+
+@pytest.mark.parametrize('response,terminal', [('', True), ('yes\n', True), ('wipe\n', False)])
+def test_confirmation_cancellation_creates_no_execution(wipe_source, response, terminal):
+    root = wipe_source[0]
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    stream = TerminalInput(response) if terminal else io.StringIO(response)
+    with pytest.raises(ValueError):
+        wipe.confirm_wipe(root, '2-8-5-200', 'test01', bundle, WIPE, stream, io.StringIO())
+    assert not (root / 'output/2-8-5-200/test01/reports/wipe').exists()
+
+
+def test_confirmation_records_exact_scope_under_existing_lease(wipe_source):
+    root = wipe_source[0]
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    output = io.StringIO()
+    with wipe.state.Lease(wipe.state.site_root(root, '2-8-5-200', 'test01')):
+        authority = wipe.confirm_wipe(root, '2-8-5-200', 'test01', bundle, WIPE,
+                                      TerminalInput('wipe\n'), output)
+    assert authority['fleet_wipe_authorization']['node_names'] == sorted(NAMES)
+    intent = gate.read_yaml(root / 'output/2-8-5-200/test01/reports/wipe' / WIPE / 'execution-intent.yaml')
+    assert intent['node_names'] == sorted(NAMES) and intent['scope'] == 'all_native_eligible_disks'
+    assert 'ALL NATIVE ELIGIBLE DISKS' in output.getvalue()
+    assert 'clean_uefi_nvram, erase_devices_metadata' in output.getvalue()
+
+
+def test_confirmation_revalidates_inputs_after_prompt(wipe_source):
+    root = wipe_source[0]
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+
+    class ChangedInput(TerminalInput):
+        def readline(self):
+            path = bundle / 'nmstate' / (NAMES[0] + '.yaml')
+            path.write_bytes(path.read_bytes() + b'\n# changed\n')
+            return 'wipe\n'
+
+    with pytest.raises(ValueError):
+        wipe.confirm_wipe(root, '2-8-5-200', 'test01', bundle, WIPE, ChangedInput(), io.StringIO())
+    assert not (root / 'output/2-8-5-200/test01/reports/wipe').exists()
+
+
+def test_cli_honors_nvram_opt_out(wipe_source):
+    root = wipe_source[0]
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/prepare-fleet-wipe.py'),
+        '--root', str(root), '--arch', '2-8-5-200', '--site', 'test01',
+        '--inspection-run-id', RUN, '--wipe-run-id', WIPE, '--nodes', ','.join(NAMES),
+        '--collection-root', str(wipe_source[3]), '--no-clean-uefi-nvram', '--print-bundle'],
+        text=True, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stdout + result.stderr
+    bundle = Path(result.stdout.strip())
+    plan = gate.read_yaml(bundle / 'plan.yml')['fleet_native_disk_clean_plan']
+    assert plan['clean_steps'] == [{'interface': 'deploy', 'step': 'erase_devices_metadata', 'args': {}}]
+    assert 'clean_uefi_nvram' not in (bundle / 'review.txt').read_text()
 
 
 def test_fresh_seal_and_exact_authorization_do_not_start_execution(wipe_source):
