@@ -896,7 +896,7 @@ retire-ocp-runtime:  ## Retire reviewed owned ABI services; no node power, media
 prepare-ocp-install:  ## Bind an existing ABI ISO and inspected fleet for review; no services or boot
 	$(call check_arch,$@)
 	python3 scripts/prepare-abi-install.py prepare --arch "$(ARCH)" --site "$(SITE)" \
-		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)"
+		--run-id "$(FLEET_RUN_ID)" --collection-root "$(RHV_BAREMETAL_OCP_ROOT)" $(ABI_MEDIA_BUILD_ARGUMENT)
 
 prepare-ocp-reinstall:  ## Prepare and select a fresh installation attempt using the existing ISO; no services or boot
 	$(call check_arch,$@)
@@ -937,12 +937,14 @@ resume-ocp-install:  ## Type resume for installer observation and cleanup withou
 
 ABI_COREOS_INSTALLER_IMAGE ?= quay.io/coreos/coreos-installer@sha256:db8c1dc7aa5955613243c5cd73d2be58ae7b839873563dc44e0bf0a15e7fed71
 ABI_LSINITRD ?= /usr/bin/lsinitrd
-export ABI_MEDIA_BUILD_ID
+# Only a deliberate Make command-line override selects a named build.
+# Inherited shell values must not control generation or preparation.
+ABI_MEDIA_BUILD_ARGUMENT = $(if $(filter command line,$(origin ABI_MEDIA_BUILD_ID)),--build-id "$(ABI_MEDIA_BUILD_ID)")
 
 generate-ocp-iso:  ## Build isolated ABI media from a successful eligible physical inspection
 	$(call check_arch,$@)
 	python3 scripts/build-abi-media.py --arch "$(ARCH)" --site "$(SITE)" \
-		--run-id "$(FLEET_RUN_ID)" --build-id "$(ABI_MEDIA_BUILD_ID)" \
+		--run-id "$(FLEET_RUN_ID)" $(ABI_MEDIA_BUILD_ARGUMENT) \
 		--ee-image "$(OCP_EE_IMAGE)" --installer "$(OPENSHIFT_INSTALL)" \
 		--collection-root "$(RHV_BAREMETAL_OCP_ROOT)" \
 		--coreos-installer-image "$(ABI_COREOS_INSTALLER_IMAGE)" --lsinitrd "$(ABI_LSINITRD)"

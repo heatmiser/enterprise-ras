@@ -34,6 +34,7 @@ state = gate.cleaning_state
 require = gate.require
 MEDIA = load(ROOT / "scripts/abi-media-settings.py", "install_media")
 HTTPD = load(ROOT / "scripts/ironic-httpd-settings.py", "install_httpd")
+CONTEXT = load(ROOT / "scripts/_era_context.py", "install_context")
 
 
 def digest(path):
@@ -233,8 +234,10 @@ def require_previous_cleanup(base, run_id, lock):
 def prepare_repeat(root, arch, site, run_id, collection, lock=None):
     base = state.site_root(root, arch, site)
     require_previous_cleanup(base, run_id, RUNTIME_LOCK if lock is None else lock)
+    _, previous_plan = verify(root, arch, site, run_id, collection)
+    build_id = previous_plan['media']['build_id']
     attempt_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
-    bundle = prepare(root, arch, site, run_id, collection, attempt_id=attempt_id)
+    bundle = prepare(root, arch, site, run_id, collection, attempt_id=attempt_id, build_id=build_id)
     prepared = state.read(bundle / "prepared.yaml")
     original, _ = installation_paths(base, run_id)
     # CLI callers hold the site lease. Publish the reference only after all
@@ -245,9 +248,25 @@ def prepare_repeat(root, arch, site, run_id, collection, lock=None):
     return bundle
 
 
-def prepare(root, arch, site, run_id, collection, attempt_id=""):
+def selected_media(root, arch, site, run_id, build_id=None):
+    """Resolve explicit media or the receipt-bound shared-context selection."""
+    if build_id is not None:
+        require(bool(build_id), 'Explicit ABI media build identity must not be empty')
+        MEDIA.build_path(state.site_root(root, arch, site), run_id, build_id)
+        return build_id
+    context = CONTEXT.read_context(state.safe_path(root / '.era-context'))
+    require((context['arch'], context['site'], context.get('fleet_run_id'), context.get('abi_media_run_id'))
+            == (arch, site, run_id, run_id),
+            'No ABI media selected for this deployment and inspection; run make generate-ocp-iso')
+    build_id = context['abi_media_build_id']
+    stage = MEDIA.build_path(state.site_root(root, arch, site), run_id, build_id)
+    require(digest(stage / 'media-build.yaml') == context['abi_media_receipt_sha256'],
+            'Selected ABI media build receipt changed')
+    return build_id
+
+
+def prepare(root, arch, site, run_id, collection, attempt_id="", build_id=""):
     httpd = HTTPD.site(root, arch, site)
-    build_id = os.environ.get("ABI_MEDIA_BUILD_ID", "")
     base, iso, hashes, ee, release, nodes, rendezvous = inputs(root, arch, site, run_id, build_id, collection)
     state.check(base)
     contract = media_contract(iso, build_id)
@@ -620,12 +639,14 @@ def main():
         parser.add_argument("--" + name, required=True)
     parser.add_argument("--collection-root", type=Path, required=True)
     parser.add_argument("--authorize-run", default="")
+    parser.add_argument("--build-id", default=None)
     args = parser.parse_args()
     try:
         root, collection = args.root.absolute(), args.collection_root.absolute()
         with state.Lease(state.site_root(root, args.arch, args.site)) as lease:
             if args.action == "prepare":
-                bundle = prepare(root, args.arch, args.site, args.run_id, collection)
+                build_id = selected_media(root, args.arch, args.site, args.run_id, args.build_id)
+                bundle = prepare(root, args.arch, args.site, args.run_id, collection, build_id=build_id)
                 print(f"Prepared: {bundle}; review review.txt. No services or hardware touched.")
             elif args.action == "prepare-repeat":
                 bundle = prepare_repeat(root, args.arch, args.site, args.run_id, collection)

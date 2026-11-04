@@ -89,6 +89,23 @@ def test_existing_iso_and_private_state_remain_unchanged(staged_install):
     assert before == {str(path): path.read_bytes() for path in stage.rglob("*") if path.is_file()}
 
 
+def test_preparation_ignores_inherited_media_and_sealed_plan_keeps_selection(staged_install, monkeypatch):
+    root, collection, _ = staged_install
+    monkeypatch.setenv('ABI_MEDIA_BUILD_ID', 'stale-inherited-build')
+    prepare(staged_install)
+    (root / '.era-context').write_text('arch: 2-4-3-200\nsite: other\n')
+    _, plan = verify(staged_install)
+    assert plan['media']['build_id'] == ''
+
+
+def test_explicit_media_selection_validates_identity(staged_install):
+    root, _, _ = staged_install
+    assert install.selected_media(root, '2-8-5-200', 'test01', RUN, 'intentional') == 'intentional'
+    for invalid in ('', '../outside', 'bad;command'):
+        with pytest.raises(ValueError):
+            install.selected_media(root, '2-8-5-200', 'test01', RUN, invalid)
+
+
 @pytest.mark.parametrize("filename", ["agent.x86_64.iso", "auth/kubeconfig", "endpoint-map.yaml"])
 def test_serving_rejects_changed_generated_assets(staged_install, filename):
     prepare(staged_install)

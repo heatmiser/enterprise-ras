@@ -367,6 +367,54 @@ def test_valid_inspection_selection_is_emitted_with_os(ctx_dir):
     assert '_FLEET_RUN_ID=20000101T120000Z' in result.stdout
 
 
+@pytest.mark.parametrize('fault', ['', 'partial', 'duplicate', 'run', 'digest', 'path'])
+def test_media_selection_requires_complete_safe_inspection_binding(ctx_dir, fault):
+    selection = {'abi_media_build_id': 'minimal-unique', 'abi_media_run_id': '20000101T120000Z',
+                 'abi_media_receipt_sha256': 'a' * 64}
+    if fault == 'partial':
+        selection.pop('abi_media_run_id')
+    elif fault == 'run':
+        selection['abi_media_run_id'] = '20000101T130000Z'
+    elif fault == 'digest':
+        selection['abi_media_receipt_sha256'] = 'invalid'
+    elif fault == 'path':
+        selection['abi_media_build_id'] = '../outside'
+    body = 'arch: 2-8-5-200\nsite: customer-a\nfleet_run_id: 20000101T120000Z\n'
+    body += ''.join(f'{key}: {value}\n' for key, value in selection.items())
+    if fault == 'duplicate':
+        body += 'abi_media_build_id: another\n'
+    _write_ctx(ctx_dir, body)
+    result = _run(ctx_dir)
+    assert (result.returncode == 0) == (fault == '')
+    if fault:
+        assert not result.stdout
+    else:
+        assert '_ABI_MEDIA_BUILD_ID=minimal-unique' in result.stdout
+
+
+@pytest.mark.parametrize('explicit', [False, True])
+def test_make_media_override_requires_command_line(make_import_workspace, explicit):
+    root = make_import_workspace
+    with (root / 'Makefile').open('a') as stream:
+        stream.write("\nprint-media-argument:\n\t@printf '%s\\n' '$(ABI_MEDIA_BUILD_ARGUMENT)'\n")
+    args = ['print-media-argument'] + (['ABI_MEDIA_BUILD_ID=intentional'] if explicit else [])
+    result = _make_import(root, *args, ABI_MEDIA_BUILD_ID='inherited-old')
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == ('--build-id "intentional"' if explicit else '')
+
+
+@pytest.mark.parametrize('target', ['use', 'import'])
+def test_context_reset_discards_media_selection(make_import_workspace, target):
+    root = make_import_workspace
+    _workbook(root / 'input/2-8-5-200/customer-a/2-8-5-200.xlsx')
+    _write_ctx(root, 'arch: 2-8-5-200\nsite: customer-a\nfleet_run_id: 20000101T120000Z\n'
+                    'abi_media_build_id: old\nabi_media_run_id: 20000101T120000Z\n'
+                    'abi_media_receipt_sha256: ' + 'a' * 64 + '\n')
+    result = _make_import(root, target)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert 'abi_media_' not in (root / '.era-context').read_text()
+
+
 @pytest.mark.parametrize('selection', ['20000101T130000Z', '', '../run', '$(touch marker)',
                                       '20000230T120000Z',
                                       '20000101T130000Z\nfleet_wipe_run_id: 20000101T140000Z'])
