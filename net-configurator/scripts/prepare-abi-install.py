@@ -47,7 +47,8 @@ def digest(path):
 
 
 def collection_hashes(collection):
-    paths = [collection / "playbooks" / name for name in ("serve_abi_iso.yml", "_abi_iso_runtime.yml")]
+    paths = [collection / "playbooks" / name for name in (
+        "serve_abi_iso.yml", "_abi_iso_runtime.yml", "_abi_serving_log_read.yml", "_abi_serving_log_retain.yml")]
     for role in ("ironic_deploy", "ironic_cleanup", "ironic_image_resolve"):
         directory = collection / "roles" / role
         require(directory.is_dir(), f"Missing collection role: {role}")
@@ -358,6 +359,10 @@ OEM_BOOT_PROFILES = {
 def boot_hashes(collection):
     paths = [collection / "playbooks/install_abi.yml"]
     paths.extend(sorted((collection / "roles/abi_install_driver").rglob("*.yml")))
+    runtime_paths = [collection / ("plugins/" + kind + "/abi_install_monitor.py")
+                     for kind in ("action", "module_utils", "modules")]
+    require(all(path.is_file() for path in runtime_paths), "Incomplete ABI monitor packaging")
+    paths.extend(runtime_paths)
     required = {"main.yml", "adopt.yml", "boot.yml", "monitor.yml", "complete.yml", "manual_handoff.yml"}
     require(required <= {path.name for path in (collection / "roles/abi_install_driver/tasks").glob("*.yml")}
             and (collection / "roles/abi_install_driver/defaults/main.yml").is_file()
