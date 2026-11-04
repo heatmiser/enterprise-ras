@@ -4,7 +4,7 @@
   connection: local
   gather_facts: false
   tasks:
-    - name: Recheck immutable preparation immediately before runtime work
+    - name: Recheck immutable preparation immediately before runtime work | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.command:
         argv:
           - '{{ ansible_playbook_python }}'
@@ -17,10 +17,10 @@
           - --bundle
           - '{{ fleet_wipe_bundle }}'
       changed_when: false
-    - name: Load the sealed release and networking inputs
+    - name: Load the sealed release and networking inputs | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.include_vars:
         file: '{{ fleet_wipe_bundle }}/preflight-vars.yaml'
-    - name: Require effective execution variables match the sealed files
+    - name: Require effective execution variables match the sealed files | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.assert:
         that:
           - fleet_native_disk_clean_plan == (lookup('ansible.builtin.file', fleet_wipe_bundle ~ '/plan.yml') | from_yaml).fleet_native_disk_clean_plan
@@ -28,7 +28,7 @@
           - vars[item.key] == item.value
       loop: '{{ (lookup(''ansible.builtin.file'', fleet_wipe_bundle ~ ''/preflight-vars.yaml'') | from_yaml) | dict2items }}'
       no_log: true
-    - name: Require effective HTTPD settings match the sealed preparation
+    - name: Require effective HTTPD settings match the sealed preparation | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.assert:
         that:
           - vars[item.key] | default(item.value) == item.value
@@ -42,26 +42,33 @@
                'ironic_deploy_httpd_manage_sysctl': false}
              | combine(fleet_wipe_runtime_plan.httpd_tuning | default({})) }}
 
-    - name: Initialize the selected native cleaning inputs
+      loop_control:
+        label: "{{ item.key }}"
+    - name: Initialize the selected native cleaning inputs | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.set_fact:
         fleet_native_disk_clean_driver_plan: '{{ fleet_native_disk_clean_plan }}'
         fleet_native_disk_clean_driver_runtime_plan: '{{ fleet_wipe_runtime_plan }}'
         fleet_native_disk_clean_driver_authorization: '{{ fleet_wipe_authorization }}'
         fleet_native_disk_clean_driver_credentials: {}
       no_log: true
-    - name: Require credentials for exactly the selected nodes
-      ansible.builtin.assert:
-        that:
-          - bmc_credentials[item.name].username | default('') | length > 0
-          - bmc_credentials[item.name].password | default('') | length > 0
-      loop: '{{ fleet_wipe_runtime_plan.authorized_nodes }}'
-      no_log: true
-    - name: Adapt only the selected vaulted credentials
-      ansible.builtin.set_fact:
-        fleet_native_disk_clean_driver_credentials: '{{ fleet_native_disk_clean_driver_credentials | combine({item.name: bmc_credentials[item.name]})
-          }}'
-      loop: '{{ fleet_wipe_runtime_plan.authorized_nodes }}'
-      no_log: true
+    # Validate the whole selection before projecting any vaulted credentials.
+    # Included tasks receive node context before their private headings render.
+    - name: Validate every selected credential before adaptation | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
+      ansible.builtin.include_tasks: _fleet-wipe-credentials.yml
+      vars:
+        __fleet_wipe_credential_phase: validate
+      loop: "{{ fleet_wipe_runtime_plan.authorized_nodes }}"
+      loop_control:
+        loop_var: __fleet_wipe_credential_node
+        label: "{{ __fleet_wipe_credential_node.name }}"
+    - name: Adapt only the validated selected credentials | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
+      ansible.builtin.include_tasks: _fleet-wipe-credentials.yml
+      vars:
+        __fleet_wipe_credential_phase: adapt
+      loop: "{{ fleet_wipe_runtime_plan.authorized_nodes }}"
+      loop_control:
+        loop_var: __fleet_wipe_credential_node
+        label: "{{ __fleet_wipe_credential_node.name }}"
 - name: Run only the authorized native collection lifecycle
   ansible.builtin.import_playbook: rhvp.baremetal_ocp.wipe_fleet_install_disks
 ...

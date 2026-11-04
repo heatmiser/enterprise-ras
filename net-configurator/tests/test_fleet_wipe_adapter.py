@@ -14,6 +14,7 @@ import sys
 import textwrap
 
 import pytest
+import yaml
 
 from tests.test_abi_eligibility_handoff import (
     candidate_workspace, eligible_run, gate, refresh_receipt, write,
@@ -735,3 +736,128 @@ def test_disabled_adaptive_reads_do_not_publish_conductor_deadlines(wipe_source)
     bundle = prepare(wipe_source)
     plan = gate.read_yaml(bundle / "plan.yml")["fleet_native_disk_clean_plan"]
     assert plan["redfish_deadlines"] == {}
+
+
+def test_wipe_adapter_target_output_without_hardware(wipe_source, tmp_path):
+    """Execute adapter tasks with synthetic routes, secrets and a no-service preflight role."""
+    bundle = seal_bundle(wipe_source, prepare(wipe_source))
+    runtime = gate.read_yaml(bundle / 'runtime-plan.yml')['fleet_wipe_runtime_plan']
+    harness = tmp_path / 'adapter-output'
+    playbooks = harness / 'playbooks'
+    playbooks.mkdir(parents=True)
+    shutil.copyfile(ROOT / 'playbooks/_fleet-wipe-credentials.yml',
+                    playbooks / '_fleet-wipe-credentials.yml')
+    scripts = harness / 'scripts'
+    scripts.mkdir()
+    capture = harness / 'calls.jsonl'
+    (scripts / 'prepare-fleet-wipe.py').write_text(textwrap.dedent('''\
+        import json, os, sys
+        from pathlib import Path
+        assert sys.argv[1] in ('seal', 'verify'), sys.argv
+        with Path(os.environ['WIPE_OUTPUT_CALLS']).open('a') as stream:
+            stream.write(json.dumps(sys.argv[1:]) + '\\n')
+        '''))
+    secrets = harness / '.era-secrets'
+    secrets.mkdir()
+    write(secrets / 'air-secrets.yml', {'ocp_pull_secret': 'synthetic-output-secret'})
+    settings = harness / 'cluster-vars.yml'
+    write(settings, {})
+    runtime['cluster_vars'] = str(settings)
+    # This fixture exercises real task output; existing adapter tests verify real seals.
+    write(bundle / 'runtime-plan.yml', {'fleet_wipe_runtime_plan': runtime})
+    write(bundle / 'plan.yml', {'fleet_native_disk_clean_plan':
+                              gate.read_yaml(bundle / 'plan.yml')['fleet_native_disk_clean_plan']})
+    binary = harness / 'bin'
+    binary.mkdir()
+    ip = binary / 'ip'
+    ip.write_text('#!/usr/bin/env python3\n' + textwrap.dedent('''\
+        import json, sys
+        assert sys.argv[1:4] == ['-j', 'route', 'get']
+        print(json.dumps([{'dst': sys.argv[4], 'dev': 'fixture0', 'prefsrc': '192.0.2.10'}]))
+        '''))
+    ip.chmod(0o700)
+    namespace = harness / 'collections/ansible_collections/rhvp/baremetal_ocp/roles/inspection_preflight_prepare/tasks'
+    namespace.mkdir(parents=True)
+    write(namespace / 'main.yml', [{'name': 'Mock release resolution without container execution',
+                                   'ansible.builtin.assert': {'that': 'true'}}])
+    private_home = harness / 'home'
+    private_home.mkdir()
+    environment = {**os.environ, 'HOME': str(private_home), 'WIPE_OUTPUT_CALLS': str(capture),
+                   'ANSIBLE_NOCOLOR': '1', 'ANSIBLE_STDOUT_CALLBACK': 'default',
+                   'ANSIBLE_COLLECTIONS_SCAN_SYS_PATH': 'false',
+                   'ANSIBLE_COLLECTIONS_PATH': str(harness / 'collections') + ':' + os.environ.get('ANSIBLE_COLLECTIONS_PATH', ''),
+                   'PATH': str(binary) + ':' + os.environ['PATH']}
+    values = {'fleet_wipe_runtime_plan': runtime, 'fleet_wipe_bundle': str(bundle),
+              'fleet_wipe_arch': '2-8-5-200', 'fleet_wipe_site': 'test01',
+              'fleet_native_disk_clean_plan': gate.read_yaml(bundle / 'plan.yml')['fleet_native_disk_clean_plan'],
+              'fleet_wipe_authorization': {'fixture': True},
+              'bmc_credentials': {n['name']: {'username': 'fixture', 'password': 'synthetic-output-secret'}
+                                  for n in runtime['authorized_nodes']}}
+    values['bmc_credentials']['unselected-node'] = {
+        'username': 'unselected-fixture', 'password': 'unselected-output-secret'}
+    projection = {'name': 'Verify only selected credentials were projected',
+                  'ansible.builtin.assert': {'that': [
+                      'fleet_native_disk_clean_driver_credentials.keys() | list | sort == '
+                      '(fleet_wipe_runtime_plan.authorized_nodes | map(attribute="name") | list | sort)',
+                      'fleet_native_disk_clean_driver_credentials == '
+                      '(bmc_credentials | dict2items | selectattr("key", "in", '
+                      'fleet_wipe_runtime_plan.authorized_nodes | map(attribute="name") | list) | items2dict)']},
+                  'no_log': True}
+    output = ''
+    for filename in ('prepare-fleet-wipe.yml', 'wipe-fleet-install-disks.yml'):
+        # The second production play imports the physical driver. Only the adapter play
+        # belongs to this fixture; native driver execution has its own loopback harness.
+        play = yaml.safe_load((ROOT / 'playbooks' / filename).read_text())[0]
+        play['vars'] = values
+        if filename == 'wipe-fleet-install-disks.yml':
+            play['tasks'].append(projection)
+        path = playbooks / filename
+        write(path, [play])
+        result = subprocess.run(['ansible-playbook', '-i', 'localhost,', str(path)],
+                                env=environment, capture_output=True, text=True, timeout=120)
+        (harness / (filename + '.log')).write_text(result.stdout + result.stderr)
+        assert result.returncode == 0, result.stdout + result.stderr
+        output += result.stdout + result.stderr
+    for node in runtime['authorized_nodes']:
+        assert node['name'] + ' | callback=' + node['devices']['bond_ip'] in output
+        assert 'Require credentials for exactly the selected nodes | run=' + WIPE + ' | node=' + node['name'] in output
+        assert 'Adapt only the selected vaulted credentials | run=' + WIPE + ' | node=' + node['name'] in output
+    candidate = runtime['authorized_nodes'][0]['name']
+    assert 'Prepare the same immutable release with fresh route evidence | run=' + WIPE + ' | candidate=' + candidate in output
+    assert 'synthetic-output-secret' not in output
+    assert 'unselected-output-secret' not in output
+    assert "'item' is undefined" not in output and 'template error' not in output.lower()
+    assert [json.loads(line)[0] for line in capture.read_text().splitlines()] == ['seal', 'verify']
+    assert not (harness / 'runtime-started').exists()
+
+    # A missing credential on the second node must fail while the projection is
+    # still empty: validating and adapting each node in one pass would violate this.
+    missing = runtime['authorized_nodes'][-1]['name']
+    failure_values = {**values, 'bmc_credentials': {
+        key: value for key, value in values['bmc_credentials'].items() if key != missing}}
+    original = yaml.safe_load((ROOT / 'playbooks/wipe-fleet-install-disks.yml').read_text())[0]
+    failure_receipt = harness / 'missing-credential.json'
+    failure_play = {**original, 'vars': failure_values, 'tasks': [{
+        'name': 'Exercise missing selected credentials before adaptation', 'block': original['tasks'],
+        'rescue': [
+            {'name': 'Require the credential projection to remain empty',
+             'ansible.builtin.assert': {'that': 'fleet_native_disk_clean_driver_credentials == {}'},
+             'no_log': True},
+            {'name': 'Record sanitized missing-credential rejection',
+             'ansible.builtin.copy': {'dest': str(failure_receipt),
+                 'content': '{{ {"status": "rejected_before_adaptation", "credential_keys": '
+                            'fleet_native_disk_clean_driver_credentials.keys() | list} | to_json }}',
+                 'mode': '0600'}, 'no_log': True}]}]}
+    failure_path = playbooks / 'missing-credential.yml'
+    write(failure_path, [failure_play])
+    result = subprocess.run(['ansible-playbook', '-i', 'localhost,', str(failure_path)],
+                            env=environment, capture_output=True, text=True, timeout=120)
+    failure_output = result.stdout + result.stderr
+    (harness / 'missing-credential.log').write_text(failure_output)
+    assert result.returncode == 0, failure_output
+    assert json.loads(failure_receipt.read_text()) == {
+        'status': 'rejected_before_adaptation', 'credential_keys': []}
+    assert 'Require credentials for exactly the selected nodes | run=' + WIPE + ' | node=' + missing in failure_output
+    assert 'synthetic-output-secret' not in failure_output and 'unselected-output-secret' not in failure_output
+    assert "'item' is undefined" not in failure_output and 'template error' not in failure_output.lower()
+    assert not (harness / 'runtime-started').exists()
