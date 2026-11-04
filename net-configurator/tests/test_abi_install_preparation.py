@@ -35,7 +35,7 @@ def oem_workspace(candidate_workspace):
     book.close()
     for role in ("ironic_deploy", "ironic_cleanup", "ironic_image_resolve"):
         shutil.copytree(COLLECTION / "roles" / role, collection / "roles" / role)
-    for name in ("serve_abi_iso.yml", "_abi_iso_runtime.yml"):
+    for name in ("serve_abi_iso.yml", "_abi_iso_runtime.yml", "_abi_serving_log_read.yml", "_abi_serving_log_retain.yml"):
         target = collection / "playbooks" / name
         target.parent.mkdir(exist_ok=True)
         shutil.copyfile(COLLECTION / "playbooks" / name, target)
@@ -89,6 +89,23 @@ def test_existing_iso_and_private_state_remain_unchanged(staged_install):
     assert before == {str(path): path.read_bytes() for path in stage.rglob("*") if path.is_file()}
 
 
+def test_preparation_ignores_inherited_media_and_sealed_plan_keeps_selection(staged_install, monkeypatch):
+    root, collection, _ = staged_install
+    monkeypatch.setenv('ABI_MEDIA_BUILD_ID', 'stale-inherited-build')
+    prepare(staged_install)
+    (root / '.era-context').write_text('arch: 2-4-3-200\nsite: other\n')
+    _, plan = verify(staged_install)
+    assert plan['media']['build_id'] == ''
+
+
+def test_explicit_media_selection_validates_identity(staged_install):
+    root, _, _ = staged_install
+    assert install.selected_media(root, '2-8-5-200', 'test01', RUN, 'intentional') == 'intentional'
+    for invalid in ('', '../outside', 'bad;command'):
+        with pytest.raises(ValueError):
+            install.selected_media(root, '2-8-5-200', 'test01', RUN, invalid)
+
+
 @pytest.mark.parametrize("filename", ["agent.x86_64.iso", "auth/kubeconfig", "endpoint-map.yaml"])
 def test_serving_rejects_changed_generated_assets(staged_install, filename):
     prepare(staged_install)
@@ -115,6 +132,26 @@ def test_serving_rejects_collection_drift(staged_install):
         verify(staged_install)
 
 
+@pytest.mark.parametrize("helper", ["_abi_serving_log_read.yml", "_abi_serving_log_retain.yml"])
+@pytest.mark.parametrize("change", ["modify", "remove"])
+def test_serving_rejects_diagnostic_helper_drift(staged_install, helper, change):
+    prepare(staged_install)
+    path = staged_install[1] / "playbooks" / helper
+    if change == "remove":
+        path.unlink()
+    else:
+        path.write_text(path.read_text() + "\n# changed\n")
+    with pytest.raises(ValueError):
+        verify(staged_install)
+
+
+@pytest.mark.parametrize("helper", ["_abi_serving_log_read.yml", "_abi_serving_log_retain.yml"])
+def test_serving_requires_complete_diagnostic_helpers(staged_install, helper):
+    (staged_install[1] / "playbooks" / helper).unlink()
+    with pytest.raises(ValueError, match="Missing regular file"):
+        prepare(staged_install)
+
+
 def test_preparation_cannot_overwrite_a_reviewed_plan(staged_install):
     prepare(staged_install)
     with pytest.raises(ValueError, match="preparation exists"):
@@ -137,6 +174,11 @@ def served_install(staged_install):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(path, target)
     shutil.copyfile(COLLECTION / 'playbooks/install_abi.yml', collection / 'playbooks/install_abi.yml')
+    for kind in ("action", "module_utils", "modules"):
+        relative = Path("plugins") / kind / "abi_install_monitor.py"
+        target = collection / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(COLLECTION / relative, target)
     bundle = prepare(staged_install)
     _, plan = verify(staged_install)
     attempt = Path(plan['reports_dir']) / 'attempt-fixture'
@@ -631,3 +673,90 @@ def test_manual_site_seals_boot_method_while_reusing_full_artifacts(staged_insta
     _, plan = verify(staged_install)
     assert plan['boot_method'] == 'manual'
     assert plan['media']['mode'] == 'full'
+
+
+@pytest.mark.parametrize("helper", ["adopt_resource.yml", "adopt_node.yml", "complete_node.yml"])
+def test_boot_seals_private_target_helpers(served_install, helper):
+    root, collection, _, _, lock = served_install
+    install.prepare_boot(root, "2-8-5-200", "test01", RUN, collection, lock)
+    _, plan = install.verify_boot(root, "2-8-5-200", "test01", RUN, collection, lock)
+    relative = "roles/abi_install_driver/tasks/" + helper
+    assert relative in plan["collection_sha256"]
+    path = collection / relative
+    path.write_text(path.read_text() + "# changed after preparation\n")
+    with pytest.raises(ValueError, match="Boot implementation changed"):
+        install.verify_boot(root, "2-8-5-200", "test01", RUN, collection, lock)
+
+
+@pytest.mark.parametrize("case", ["selected", "missing_second", "manual"])
+def test_install_adapter_target_output_without_hardware(tmp_path, case):
+    """Exercise real private tasks without importing the hardware executor."""
+    import os
+    import subprocess
+
+    harness = tmp_path / case
+    harness.mkdir()
+    shutil.copyfile(ROOT / "playbooks/_abi-install-credentials.yml",
+                    harness / "_abi-install-credentials.yml")
+    play = yaml.safe_load((ROOT / "playbooks/install-ocp.yml").read_text())[0]
+    names = ["node-a", "node-b"]
+    secret = "synthetic-install-target-password"
+    credentials = {name: {"username": "fixture", "password": secret} for name in names}
+    credentials["unselected-node"] = {"username": "other", "password": "unselected-target-password"}
+    values = {"abi_boot_plan": {"node_names": names, "inspection_run_id": RUN,
+                               "installation_attempt_id": "fixture-attempt",
+                               "profile": {"method": "operator_manual" if case == "manual" else "dell_virtual_media_once"}}}
+    if case != "manual":
+        values["bmc_credentials"] = credentials
+    if case == "missing_second":
+        del credentials["node-b"]
+        receipt = harness / "rejected.json"
+        play["tasks"] = [{"name": "Exercise late credential rejection", "block": play["tasks"],
+                          "rescue": [
+                              {"name": "Require no credential initialization or projection",
+                               "ansible.builtin.assert": {"that": "abi_install_driver_credentials is not defined"},
+                               "no_log": True},
+                              {"name": "Record sanitized rejection",
+                               "ansible.builtin.copy": {"dest": str(receipt), "content": '{"rejected": true}',
+                                                        "mode": "0600"}, "no_log": True}]}]
+    else:
+        expected = {} if case == "manual" else {name: credentials[name] for name in names}
+        values["expected_projection"] = expected
+        play["tasks"].append({"name": "Require exact selected credential projection",
+                              "ansible.builtin.assert": {"that": "abi_install_driver_credentials == expected_projection"},
+                              "no_log": True})
+    play["vars"] = values
+    path = harness / "adapter.yml"
+    path.write_text(yaml.safe_dump([play], sort_keys=False))
+    env = {**os.environ, "ANSIBLE_NOCOLOR": "1", "ANSIBLE_STDOUT_CALLBACK": "default"}
+    result = subprocess.run(["ansible-playbook", "-i", "localhost,", str(path)],
+                            env=env, capture_output=True, text=True, timeout=120)
+    output = result.stdout + result.stderr
+    (harness / "ansible.log").write_text(output)
+    assert result.returncode == 0, output
+    assert all(value not in output for value in [secret, "unselected-target-password"])
+    assert "is undefined" not in output and "Error while resolving" not in output
+    if case == "missing_second":
+        assert json.loads(receipt.read_text()) == {"rejected": True}
+        assert "Require selected site credentials | attempt=fixture-attempt | node=node-b" in output
+    elif case == "selected":
+        for name in names:
+            assert "Require selected site credentials | attempt=fixture-attempt | node=" + name in output
+            assert "Adapt selected credentials without publishing secrets | attempt=fixture-attempt | node=" + name in output
+
+
+@pytest.mark.parametrize("kind", ["action", "module_utils", "modules"])
+@pytest.mark.parametrize("change", ["drift", "remove"])
+def test_boot_seals_monitor_runtime(served_install, kind, change):
+    root, collection, _, _, lock = served_install
+    install.prepare_boot(root, "2-8-5-200", "test01", RUN, collection, lock)
+    _, plan = install.verify_boot(root, "2-8-5-200", "test01", RUN, collection, lock)
+    relative = "plugins/" + kind + "/abi_install_monitor.py"
+    assert relative in plan["collection_sha256"]
+    path = collection / relative
+    if change == "drift":
+        path.write_text(path.read_text() + "# changed after preparation\n")
+    else:
+        path.unlink()
+    with pytest.raises(ValueError, match="Boot implementation changed|Incomplete ABI monitor packaging"):
+        install.verify_boot(root, "2-8-5-200", "test01", RUN, collection, lock)

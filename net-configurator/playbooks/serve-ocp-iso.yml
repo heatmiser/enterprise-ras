@@ -1,36 +1,54 @@
 ---
-- name: Materialize the existing shared registry authfile for ABI serving
+- name: >-
+    Materialize the existing shared registry authfile for ABI serving | {{ 'attempt=' ~ (abi_install_plan.installation_attempt_id |
+    default(abi_install_plan.inspection_run_id | default('unresolved'))) ~ ' | authfile=' ~ lookup('ansible.builtin.env', 'HOME') ~
+    '/.era-secrets/pull-secret.json' }}
   hosts: localhost
   connection: local
   gather_facts: false
   tasks:
-    - name: Read the shared vaulted OpenShift pull secret
+    - name: >-
+        Read the shared vaulted OpenShift pull secret | {{ 'attempt=' ~ (abi_install_plan.installation_attempt_id |
+        default(abi_install_plan.inspection_run_id | default('unresolved'))) }}
       ansible.builtin.include_vars:
         file: "{{ playbook_dir }}/../.era-secrets/air-secrets.yml"
       no_log: true
 
-    - name: Require the shared pull secret
+    - name: >-
+        Require the shared pull secret | {{ 'attempt=' ~ (abi_install_plan.installation_attempt_id |
+        default(abi_install_plan.inspection_run_id | default('unresolved'))) }}
       ansible.builtin.assert:
         that:
           - ocp_pull_secret | default('') | length > 0
       no_log: true
 
-    - name: Prepare the local authfile parent
+    - name: >-
+        Prepare the local authfile parent | {{ 'attempt=' ~ (abi_install_plan.installation_attempt_id |
+        default(abi_install_plan.inspection_run_id | default('unresolved'))) ~ ' | authfile=' ~ lookup('ansible.builtin.env', 'HOME') ~
+        '/.era-secrets/pull-secret.json' }}
       ansible.builtin.file:
         path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets"
         state: directory
         mode: "0700"
 
-    - name: Materialize the registry authfile through the existing pattern
+    - name: >-
+        Materialize the registry authfile through the existing pattern | {{ 'attempt=' ~ (abi_install_plan.installation_attempt_id |
+        default(abi_install_plan.inspection_run_id | default('unresolved'))) ~ ' | authfile=' ~ lookup('ansible.builtin.env', 'HOME') ~
+        '/.era-secrets/pull-secret.json' }}
       ansible.builtin.copy:
         content: "{{ ocp_pull_secret | trim }}\n"
         dest: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets/pull-secret.json"
         mode: "0600"
       no_log: true
 
-    - name: Bind the registry authfile for collection use
+    - name: >-
+        Bind the registry authfile for collection use | {{ 'attempt=' ~ (abi_install_plan.installation_attempt_id |
+        default(abi_install_plan.inspection_run_id | default('unresolved'))) ~ ' | authfile=' ~ lookup('ansible.builtin.env', 'HOME') ~
+        '/.era-secrets/pull-secret.json' }}
       ansible.builtin.set_fact:
         abi_install_pull_secret_path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets/pull-secret.json"
 
-- name: Serve the existing ISO through the reusable collection
+- name: >-
+    Serve the existing ISO through the reusable collection | {{ 'attempt=' ~ (abi_install_plan.installation_attempt_id |
+    default(abi_install_plan.inspection_run_id | default('unresolved'))) }}
   ansible.builtin.import_playbook: rhvp.baremetal_ocp.serve_abi_iso

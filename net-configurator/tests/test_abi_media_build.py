@@ -63,6 +63,79 @@ def policy(root, mode):
     (root / 'input/2-8-5-200/test01/abi-media.yml').write_text(yaml.safe_dump(value))
 
 
+def select_inspection(root):
+    path = root / '.era-context'
+    path.write_text(f'arch: 2-8-5-200\nsite: test01\nserver_os: rhcos\nfleet_run_id: {RUN}\n'
+                    'fleet_wipe_run_id: 20000101T130000Z\n')
+    return path
+
+
+@pytest.mark.parametrize('explicit', [None, 'intentional-build'])
+def test_verified_build_publishes_bound_context(eligible_run, explicit, monkeypatch):
+    root, _, _ = eligible_run
+    path = select_inspection(root)
+    policy(root, 'full-ram')
+    monkeypatch.setenv('ABI_MEDIA_BUILD_ID', 'inherited-old')
+    stage = builder.build_and_select(root, '2-8-5-200', 'test01', RUN, explicit,
+                                     run=native(root, 'full-ram', []))
+    context = builder.CONTEXT.read_context(path)
+    assert context['abi_media_build_id'] == stage.name != 'inherited-old'
+    assert context['abi_media_run_id'] == RUN
+    assert context['abi_media_receipt_sha256'] == builder.digest(stage / 'media-build.yaml')
+    assert context['fleet_wipe_run_id'] == '20000101T130000Z'
+    assert context['server_os'] == 'rhcos'
+    assert install.selected_media(root, '2-8-5-200', 'test01', RUN) == stage.name
+    if explicit:
+        assert stage.name == explicit
+    else:
+        second = builder.build_and_select(root, '2-8-5-200', 'test01', RUN,
+                                          run=native(root, 'full-ram', []))
+        assert second != stage and (stage / 'media-build.yaml').is_file()
+
+
+@pytest.mark.parametrize('fault', ['tool', 'context', 'receipt', 'artifact'])
+def test_failed_build_never_publishes_selection(eligible_run, fault):
+    root, _, _ = eligible_run
+    path = select_inspection(root)
+    before = path.read_bytes()
+    policy(root, 'full')
+    original = native(root, 'full', [])
+    def run(argv, **kwargs):
+        if fault == 'tool':
+            raise ValueError('fixture construction failed')
+        result = original(argv, **kwargs)
+        stage = Path(argv[argv.index('--dir') + 1])
+        if fault == 'context':
+            path.write_bytes(before + b'# concurrent context edit\n')
+        elif fault == 'artifact':
+            # A zero-length ISO must fail before the build can be selected.
+            (stage / 'agent.x86_64.iso').write_bytes(b'')
+        elif fault == 'receipt':
+            # The post-build verifier must reject invalid derived input.
+            (stage / 'media-agent-config.yaml').write_text('changed: true\n')
+        return result
+    with pytest.raises(ValueError):
+        builder.build_and_select(root, '2-8-5-200', 'test01', RUN, 'failed', run=run)
+    assert path.read_bytes() == before + (b'# concurrent context edit\n' if fault == 'context' else b'')
+    assert 'abi_media_build_id' not in builder.CONTEXT.read_context(path)
+
+
+@pytest.mark.parametrize('fault', ['site', 'run', 'digest', 'missing'])
+def test_selection_rejects_wrong_lineage_or_receipt(eligible_run, fault):
+    root, _, _ = eligible_run
+    path = select_inspection(root)
+    stage = builder.build_and_select(root, '2-8-5-200', 'test01', RUN, 'selected',
+                                     run=native(root, 'full', []))
+    if fault == 'digest':
+        receipt = stage / 'media-build.yaml'
+        receipt.write_bytes(receipt.read_bytes() + b'# changed\n')
+    elif fault == 'missing':
+        path.write_text(f'arch: 2-8-5-200\nsite: test01\nfleet_run_id: {RUN}\n')
+    with pytest.raises(ValueError):
+        install.selected_media(root, '2-8-5-200', 'other' if fault == 'site' else 'test01',
+                               '20000101T140000Z' if fault == 'run' else RUN)
+
+
 @pytest.mark.parametrize('mode', ['full', 'full-ram', 'minimal', 'manual'])
 def test_build_isolated_variants_preserve_sources_and_bind_exact_artifacts(eligible_run, mode):
     root, bundle, _ = eligible_run
@@ -138,8 +211,7 @@ def test_minimal_preparation_adds_node_sources_and_seals_variant(staged_install,
         target = stage / name
         target.parent.mkdir(exist_ok=True)
         target.write_bytes((old_stage / name).read_bytes())
-    monkeypatch.setenv('ABI_MEDIA_BUILD_ID', 'minimal-a')
-    install.prepare(root, '2-8-5-200', 'test01', RUN, collection)
+    install.prepare(root, '2-8-5-200', 'test01', RUN, collection, build_id='minimal-a')
     monkeypatch.setenv('ABI_MEDIA_BUILD_ID', 'unrelated-runtime-selection')
     _, plan = install.verify(root, '2-8-5-200', 'test01', RUN, collection)
     assert plan['media']['mode'] == 'minimal'

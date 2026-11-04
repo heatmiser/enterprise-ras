@@ -61,9 +61,16 @@ def read_context(path: Path = CONTEXT_PATH) -> dict:
     server_os = None
     fleet_run_id = None
     fleet_wipe_run_id = None
+    media_selection = {}
     for raw_line in path.read_text().splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
+            continue
+        key, _, value = line.partition(':')
+        if key in ('abi_media_build_id', 'abi_media_run_id', 'abi_media_receipt_sha256'):
+            if key in media_selection:
+                raise ValueError(f'duplicate {key} in .era-context')
+            media_selection[key] = value.strip()
             continue
         m = re.match(r"^arch:\s*(\S+)\s*$", line)
         if m:
@@ -119,6 +126,16 @@ def read_context(path: Path = CONTEXT_PATH) -> dict:
                 raise ValueError(f'invalid {key}; require UTC YYYYMMDDTHHMMSSZ')
             datetime.strptime(value, '%Y%m%dT%H%M%SZ')
             context[key] = value
+    if media_selection:
+        if set(media_selection) != {'abi_media_build_id', 'abi_media_run_id', 'abi_media_receipt_sha256'}:
+            raise ValueError('incomplete ABI media selection in .era-context')
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{0,63}', media_selection['abi_media_build_id']):
+            raise ValueError('invalid ABI media build identity in .era-context')
+        if media_selection['abi_media_run_id'] != fleet_run_id:
+            raise ValueError('ABI media selection belongs to another inspection run')
+        if not re.fullmatch(r'[0-9a-f]{64}', media_selection['abi_media_receipt_sha256']):
+            raise ValueError('invalid ABI media receipt digest in .era-context')
+        context.update(media_selection)
     return context
 
 

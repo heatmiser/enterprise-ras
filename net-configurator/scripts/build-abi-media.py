@@ -3,11 +3,12 @@
 """Build isolated ABI media from an unchanged eligible inspection handoff."""
 
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import importlib.util
-import os
 from pathlib import Path
 import subprocess
+import uuid
 
 import yaml
 
@@ -23,6 +24,7 @@ def load(name):
 
 gate = load("validate-abi-handoff")
 media = load("abi-media-settings")
+CONTEXT = load("_era_context")
 
 
 def digest(path):
@@ -113,12 +115,42 @@ def build(root, arch, site, run_id, build_id="", ee_image="", installer="", run=
     return stage
 
 
+def build_and_select(root, arch, site, run_id, build_id=None, **kwargs):
+    """Build and select verified media under the existing site lease."""
+    state = gate.cleaning_state
+    base = state.site_root(root, arch, site)
+    with state.Lease(base):
+        path = state.safe_path(root / '.era-context')
+        previous_hash = digest(path)
+        context = CONTEXT.read_context(path)
+        gate.require((context['arch'], context['site'], context.get('fleet_run_id')) == (arch, site, run_id),
+                     'Media construction requires the selected deployment and inspection run')
+        if build_id is None:
+            mode = media.site(root, arch, site)['mode']
+            build_id = f"{mode}-{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:12]}"
+        gate.require(bool(build_id), 'Explicit ABI media build identity must not be empty')
+        stage = build(root, arch, site, run_id, build_id, **kwargs)
+        image, candidates, _ = gate.validate_handoff(
+            root, arch, site, run_id, kwargs.get('ee_image', ''), kwargs.get('installer', ''))
+        release = gate.read_yaml(base / 'ocp/inspection/fleet' / run_id / 'preflight-vars.yaml')[
+            'inspection_preflight_provenance']['release_image']
+        install = load('prepare-abi-install')
+        install.media_build(stage, run_id, build_id, image, release, candidates,
+                            kwargs.get('collection_root', DEFAULT_COLLECTION))
+        gate.require(digest(path) == previous_hash,
+                     'Deployment context changed during media construction; build retained but not selected')
+        context.update(abi_media_build_id=build_id, abi_media_run_id=run_id,
+                       abi_media_receipt_sha256=digest(stage / 'media-build.yaml'))
+        state.write(path, context)
+    return stage
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=ROOT)
     for name in ("arch", "site", "run-id"):
         parser.add_argument("--" + name, required=True)
-    parser.add_argument("--build-id", default=os.environ.get("ABI_MEDIA_BUILD_ID", ""))
+    parser.add_argument("--build-id", default=None)
     parser.add_argument("--ee-image", default="")
     parser.add_argument("--installer", default="")
     parser.add_argument("--collection-root", type=Path, required=True)
@@ -127,10 +159,10 @@ def main():
     args = parser.parse_args()
     try:
         root = args.root.absolute()
-        with gate.cleaning_state.Lease(gate.cleaning_state.site_root(root, args.arch, args.site)):
-            stage = build(root, args.arch, args.site, args.run_id, args.build_id, args.ee_image, args.installer,
-                          collection_root=args.collection_root.absolute(),
-                          coreos_image=args.coreos_installer_image, lsinitrd=args.lsinitrd)
+        stage = build_and_select(root, args.arch, args.site, args.run_id, args.build_id,
+                                 ee_image=args.ee_image, installer=args.installer,
+                                 collection_root=args.collection_root.absolute(),
+                                 coreos_image=args.coreos_installer_image, lsinitrd=args.lsinitrd)
         print(f"ABI media built: {stage}; no services or nodes changed.")
     except (ValueError, KeyError, TypeError, OSError, yaml.YAMLError, subprocess.SubprocessError):
         parser.exit(1, "ERROR: ABI media build rejected; retain private build evidence and use a fresh build identity.\n")
