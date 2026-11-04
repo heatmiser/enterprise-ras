@@ -4,7 +4,7 @@
   connection: local
   gather_facts: false
   tasks:
-    - name: Load the reviewed collection settings and shared pull secret
+    - name: Load the reviewed collection settings and shared pull secret | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.include_vars:
         file: "{{ item }}"
       loop:
@@ -12,14 +12,16 @@
         - "{{ playbook_dir }}/../.era-secrets/air-secrets.yml"
       no_log: true
 
-    - name: Resolve fresh routes for every selected callback address
+    - name: Resolve fresh routes for every selected callback address | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.command:
         argv: [ip, -j, route, get, "{{ item.devices.bond_ip }}"]
       loop: "{{ fleet_wipe_runtime_plan.authorized_nodes }}"
       register: __wipe_routes
       changed_when: false
 
-    - name: Require a single shared bastion source address and interface
+      loop_control:
+        label: "{{ item.name ~ ' | callback=' ~ item.devices.bond_ip }}"
+    - name: Require a single shared bastion source address and interface | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.assert:
         that:
           - __route.dev | default('') | length > 0
@@ -31,26 +33,30 @@
         __first: "{{ (__wipe_routes.results[0].stdout | from_json) | first }}"
       loop: "{{ __wipe_routes.results }}"
 
-    - name: Require the shared OCP pull secret before local materialization
+      loop_control:
+        label: "{{ item.item.name ~ ' | callback=' ~ item.item.devices.bond_ip }}"
+    - name: Require the shared OCP pull secret before local materialization | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.assert:
         that:
           - ocp_pull_secret | default('') | length > 0
       no_log: true
 
-    - name: Prepare the existing local pull-secret directory
+    - name: Prepare the existing local pull-secret directory | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.file:
         path: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets"
         state: directory
         mode: "0700"
 
-    - name: Materialize the shared pull secret through the existing authfile pattern
+    - name: Materialize the shared pull secret through the existing authfile pattern | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.copy:
         content: "{{ ocp_pull_secret | trim }}\n"
         dest: "{{ lookup('ansible.builtin.env', 'HOME') }}/.era-secrets/pull-secret.json"
         mode: "0600"
       no_log: true
 
-    - name: Prepare the same immutable release with fresh route evidence
+    - name: >-
+        Prepare the same immutable release with fresh route evidence | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id ~ ' | candidate=' ~
+        fleet_wipe_runtime_plan.authorized_nodes[0].name }}
       ansible.builtin.include_role:
         name: rhvp.baremetal_ocp.inspection_preflight_prepare
       vars:
@@ -69,7 +75,7 @@
         inspection_preflight_prepare_callback_target_ip: "{{ fleet_wipe_runtime_plan.authorized_nodes[0].devices.bond_ip }}"
         inspection_preflight_prepare_expected_ocp_version: "{{ fleet_wipe_runtime_plan.original_provenance.installer_version }}"
 
-    - name: Retain all fresh callback routes
+    - name: Retain all fresh callback routes | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.copy:
         dest: "{{ fleet_wipe_bundle }}/callback-routes.yaml"
         mode: "0600"
@@ -77,7 +83,7 @@
           {{ {'nodes': fleet_wipe_runtime_plan.authorized_nodes | map(attribute='name') | list,
               'routes': __wipe_routes.results} | to_nice_yaml }}
 
-    - name: Seal preparation without granting execution authority
+    - name: Seal preparation without granting execution authority | {{ 'run=' ~ fleet_wipe_runtime_plan.run_id }}
       ansible.builtin.command:
         argv:
           - "{{ ansible_playbook_python }}"
