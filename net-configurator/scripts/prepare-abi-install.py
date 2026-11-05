@@ -108,6 +108,8 @@ def inputs(root, arch, site, run_id, build_id="", collection=None):
         build = media_build(stage, run_id, build_id, image, release, candidates, collection)
         source_hashes["media-build.yaml"] = digest(stage / "media-build.yaml")
         source_hashes["media-agent-config.yaml"] = digest(stage / "media-agent-config.yaml")
+        for manifest in build.get("custom_manifests", []):
+            source_hashes[manifest["source"]] = manifest["sha256"]
         if build.get("schema_version") == 2:
             validation = json.loads((stage / build["validation"]["source"]).read_text())
             source_hashes[build["validation"]["source"]] = build["validation"]["sha256"]
@@ -127,6 +129,10 @@ def media_build(stage, run_id, build_id, image, release, candidates, collection=
     require(build["source_manifest_sha256"] == {
         name: hashlib.sha256(content).hexdigest() for name, content in candidates.items()},
         "Media source manifest binding changed")
+    builder = load(ROOT / "scripts/build-abi-media.py", "install_media_builder")
+    _, custom_records = builder.custom_manifests(stage / "custom-manifests")
+    require(build.get("custom_manifests", []) == custom_records,
+            "Custom manifest source membership, identity or bytes changed")
     require(digest(stage / "media-agent-config.yaml") == build["derived_agent_sha256"]
             and state.read(stage / "media-agent-config.yaml") == MEDIA.derive(
                 yaml.safe_load(candidates["agent-config.yaml"]), policy), "Derived media configuration changed")
@@ -142,7 +148,6 @@ def media_build(stage, run_id, build_id, image, release, candidates, collection=
                 "Media artifact identity changed")
     if policy["mode"] in ("full-ram", "minimal"):
         require(build.get("schema_version") == 2, "Obsolete variant validation; generate a fresh build")
-        builder = load(ROOT / "scripts/build-abi-media.py", "install_media_builder")
         shared = builder.verifier(collection if collection is not None else builder.DEFAULT_COLLECTION)
         require(build.get("verifier_sha256") == shared.verifier_digest(), "Media verifier identity changed")
         reference = build["validation"]
@@ -161,7 +166,8 @@ def media_contract(iso, build_id=""):
         return {"mode": "full", "build_id": "", "boot_artifacts_base_url": "", "artifacts": [
             {"name": iso.name, "source": iso.name, "sha256": digest(iso), "size": iso.stat().st_size}]}
     build = state.read(iso.parent / "media-build.yaml")
-    return {**build["policy"], "build_id": build_id, "artifacts": build["artifacts"]}
+    return {**build["policy"], "build_id": build_id, "artifacts": build["artifacts"],
+            **({"custom_manifests": build["custom_manifests"]} if "custom_manifests" in build else {})}
 
 
 def firewall_sources(contract, bmc_sources, nodes):
@@ -312,6 +318,13 @@ def prepare(root, arch, site, run_id, collection, attempt_id="", build_id=""):
               "Scope: start Ironic/HTTPD and publish the existing ISO; NO node enrollment, boot or cleaning.",
               f"Media mode: {contract['mode']}; build: {build_id or 'legacy'}; boot: {plan['boot_method']}",
               "Only sealed boot artifacts enter the serving directory; installer state/auth remain private."]
+    review.append(f"Custom manifest files: {len(contract.get('custom_manifests', []))}")
+    for manifest in contract.get("custom_manifests", []):
+        review.append(f"  {manifest['filename']}; SHA256: {manifest['sha256']}")
+        for resource in manifest["resources"]:
+            scope = ("machineconfig role=" + resource["role"] if resource["role"] else
+                     "namespace=" + resource["namespace"] if resource["namespace"] else "cluster-scoped or default namespace")
+            review.append(f"    {resource['apiVersion']} {resource['kind']}/{resource['name']}; {scope}")
     review.append(HTTPD.review(httpd))
     (bundle / "review.txt").write_text("\n".join(review) + "\n")
     (bundle / "review.txt").chmod(0o600)

@@ -59,6 +59,41 @@ the selected nodes. Interactive authorization requires a terminal and revalidate
 the sealed preparation after confirmation. Unattended callers can supply
 `FLEET_AUTHORIZE_BOOT_RUN` with the exact reviewed installation attempt ID.
 
+### Additional installation manifests
+
+Place optional Kubernetes YAML manifests in `input/<arch>/<site>/openshift/`
+before running `make generate-ocp-iso`. No additional CLI variables are required.
+An absent or empty directory retains vanilla installation behavior. Use regular
+`.yaml` or `.yml` files in this flat directory; a file may contain multiple YAML
+documents. Each document must have `apiVersion`, `kind`, and `metadata.name`.
+Duplicate resource identities, symlinks, subdirectories, and malformed inputs are
+rejected before the installer runs. These checks do not replace API admission or
+verify that an Operator or CRD required by a manifest is available at installation.
+
+The builder retains original bytes under `custom-manifests/` in the private build
+directory and stages copies in `openshift/` before invoking the pinned installer EE.
+It records filenames, resource identities, MachineConfig roles, and SHA256 hashes
+in `media-build.yaml`, and rejects source changes during construction. Installation
+preparation verifies retained sources, binds them into the sealed plan, and lists
+them in `review.txt`. Only boot artifacts enter the HTTP serving directory.
+The installer may consume the working copies; retained sources remain verifiable.
+
+For worker IOMMU passthrough, a worker-role MachineConfig can specify
+`spec.kernelArguments: [iommu=pt]`. Worker-role scope covers every applicable worker
+pool, including custom pools that inherit worker configurations. Choose that scope
+deliberately. Site inputs are normally Git-ignored; distribute the intended site
+manifests alongside the other site configuration.
+
+MachineConfig kernel arguments configure the installed operating system; they do
+not configure the live discovery ISO's kernel arguments. After installation,
+verify the MachineConfig, MachineConfigPool convergence, and effective kernel
+arguments on each targeted node before accepting the customization. Generate a
+fresh build for changed manifests. Existing prepared attempts continue to use
+their sealed build, independently of later edits to site inputs. Additional
+manifests do not alter the inspection receipt's hardware and network binding.
+
+See [Red Hat's Agent-based Installer customization guidance](https://docs.redhat.com/en/documentation/openshift_container_platform/4.22/html-single/installing_an_on-premise_cluster_with_the_agent-based_installer/index).
+
 ## Terms used in this guide
 
 | Term | What it means |

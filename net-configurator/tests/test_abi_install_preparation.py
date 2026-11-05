@@ -98,6 +98,47 @@ def test_preparation_ignores_inherited_media_and_sealed_plan_keeps_selection(sta
     assert plan['media']['build_id'] == ''
 
 
+@pytest.mark.parametrize('fault', ['none', 'snapshot', 'membership', 'identity'])
+def test_custom_manifest_review_and_sealed_source_binding(staged_install, fault):
+    from tests.test_abi_media_build import builder, native, custom_input, CUSTOM
+    root, collection, old_stage = staged_install
+    path = custom_input(root)
+    stage = builder.build(root, '2-8-5-200', 'test01', RUN, 'custom', run=native(root, 'full', []))
+    for name in ('rendezvousIP', '.openshift_install_state.json', 'auth/kubeconfig', 'auth/kubeadmin-password'):
+        target = stage / name
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes((old_stage / name).read_bytes())
+    bundle = install.prepare(root, '2-8-5-200', 'test01', RUN, collection, build_id='custom')
+    _, plan = verify(staged_install)
+    source = 'custom-manifests/' + path.name
+    assert plan['source_sha256'][source] == install.digest(stage / source)
+    review = (bundle / 'review.txt').read_text()
+    assert 'Custom manifest files: 1' in review
+    assert 'MachineConfig/99-worker-gpudirect-iommu-pt; machineconfig role=worker' in review
+    assert plan['source_sha256'][source] in review
+    # Later site edits must not change an already sealed installation attempt.
+    path.write_bytes(CUSTOM + b'# next build\n')
+    if fault == 'none':
+        assert verify(staged_install)[1] == plan
+    else:
+        if fault == 'snapshot': (stage / source).write_bytes(CUSTOM + b'# tampered\n')
+        elif fault == 'membership': (stage / 'custom-manifests/extra.yaml').write_bytes(CUSTOM)
+        else:
+            receipt = yaml.safe_load((stage / 'media-build.yaml').read_text())
+            receipt['custom_manifests'][0]['resources'][0]['role'] = 'master'
+            (stage / 'media-build.yaml').write_text(yaml.safe_dump(receipt))
+        with pytest.raises(ValueError):
+            verify(staged_install)
+
+
+def test_preexisting_media_contract_keeps_legacy_shape(staged_install):
+    _, _, stage = staged_install
+    build = {'policy': {'mode': 'full', 'boot_artifacts_base_url': ''}, 'artifacts': []}
+    (stage / 'media-build.yaml').write_text(yaml.safe_dump(build))
+    assert install.media_contract(stage / 'agent.x86_64.iso') == {
+        **build['policy'], 'build_id': '', 'artifacts': []}
+
+
 def test_explicit_media_selection_validates_identity(staged_install):
     root, _, _ = staged_install
     assert install.selected_media(root, '2-8-5-200', 'test01', RUN, 'intentional') == 'intentional'
