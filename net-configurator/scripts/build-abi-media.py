@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import importlib.util
 from pathlib import Path
+import re
 import subprocess
 import uuid
 
@@ -55,6 +56,60 @@ def command(image, stage, tool, *args):
             "--entrypoint", tool, image, *map(str, args)]
 
 
+def custom_manifests(directory):
+    """Read optional flat YAML inputs and describe their Kubernetes identities.
+
+    This is structural validation, not API admission or dependency validation.
+    The same reader verifies retained build snapshots after installer consumption.
+    """
+    state = gate.cleaning_state
+    state.safe_path(directory)
+    if not directory.exists():
+        return {}, []
+    gate.require(directory.is_dir(), "Custom manifest path must be a directory")
+    contents, records, identities = {}, [], set()
+    for path in sorted(directory.iterdir()):
+        state.safe_path(path)
+        gate.require(path.is_file() and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*\.(yaml|yml)", path.name),
+                     "Custom manifests require regular YAML files in a flat directory")
+        gate.require(0 < path.stat().st_size <= 16 * 1024 * 1024, "Empty or oversized custom manifest")
+        content = path.read_bytes()
+        resources = []
+        for document in yaml.safe_load_all(content):
+            gate.require(isinstance(document, dict), "Each custom manifest document must be an object")
+            metadata = document.get("metadata")
+            gate.require(isinstance(metadata, dict), "Custom manifest requires metadata")
+            version, kind, name = document.get("apiVersion"), document.get("kind"), metadata.get("name")
+            namespace = metadata.get("namespace", "")
+            gate.require(all(isinstance(value, str) and value and not any(c.isspace() for c in value)
+                             for value in (version, kind, name)), "Custom manifest requires apiVersion, kind and name")
+            gate.require(isinstance(namespace, str) and not any(c.isspace() for c in namespace),
+                         "Invalid custom manifest namespace")
+            identity = (version.split('/')[0] if '/' in version else '', kind, namespace, name)
+            gate.require(identity not in identities, "Duplicate custom Kubernetes resource identity")
+            identities.add(identity)
+            labels = metadata.get("labels", {})
+            gate.require(isinstance(labels, dict), "Custom manifest labels must be a mapping")
+            role = labels.get("machineconfiguration.openshift.io/role", "")
+            gate.require(isinstance(role, str) and not any(c.isspace() for c in role),
+                         "Invalid MachineConfig role")
+            if kind == "MachineConfig":
+                spec = document.get("spec")
+                gate.require(version == "machineconfiguration.openshift.io/v1" and bool(role)
+                             and not namespace and isinstance(spec, dict), "Invalid MachineConfig identity or scope")
+                if "kernelArguments" in spec:
+                    gate.require(isinstance(spec["kernelArguments"], list)
+                                 and all(isinstance(arg, str) and arg for arg in spec["kernelArguments"]),
+                                 "MachineConfig kernelArguments must be a list of nonempty strings")
+            resources.append({"apiVersion": version, "kind": kind, "name": name,
+                              "namespace": namespace, "role": role})
+        gate.require(bool(resources), "Custom manifest contains no resources")
+        contents[path.name] = content
+        records.append({"filename": path.name, "source": "custom-manifests/" + path.name,
+                        "sha256": hashlib.sha256(content).hexdigest(), "resources": resources})
+    return contents, records
+
+
 def build(root, arch, site, run_id, build_id="", ee_image="", installer="", run=subprocess.run,
           collection_root=DEFAULT_COLLECTION, coreos_image=COREOS_IMAGE, lsinitrd="/usr/bin/lsinitrd"):
     state = gate.cleaning_state
@@ -64,12 +119,21 @@ def build(root, arch, site, run_id, build_id="", ee_image="", installer="", run=
     gate.require(policy["mode"] == "full" or build_id, "Nondefault media requires a fresh ABI_MEDIA_BUILD_ID")
     gate.require(not installer or policy["mode"] == "full", "Variant builds require the pinned installer EE")
     image, candidates, eligibility = gate.validate_handoff(root, arch, site, run_id, ee_image, installer)
+    custom_dir = root / "input" / arch / site / "openshift"
+    custom, custom_records = custom_manifests(custom_dir)
     stage = state.safe_path(gate.staging_path(base, run_id, build_id))
     gate.require(not stage.exists(), "ABI media destination exists; use a fresh build identity")
     stage.mkdir(parents=True, mode=0o700)
     for name, content in candidates.items():
         (stage / name).write_bytes(content)
         (stage / name).chmod(0o600)
+    if custom:
+        for folder in ("custom-manifests", "openshift"):
+            (stage / folder).mkdir(mode=0o700)
+            for name, content in custom.items():
+                target = stage / folder / name
+                target.write_bytes(content)
+                target.chmod(0o600)
     source_hashes = {name: hashlib.sha256(content).hexdigest() for name, content in candidates.items()}
     agent = yaml.safe_load(candidates["agent-config.yaml"])
     derived = media.derive(agent, policy)
@@ -104,10 +168,15 @@ def build(root, arch, site, run_id, build_id="", ee_image="", installer="", run=
     gate.require(all(item["size"] > 0 for item in artifacts), "Empty generated media")
     gate.require(gate.validate_handoff(root, arch, site, run_id, ee_image, installer)[1] == candidates,
                  "Inspected inputs changed during media construction")
+    gate.require(custom_manifests(custom_dir) == (custom, custom_records),
+                 "Custom manifests changed during media construction")
+    gate.require(custom_manifests(stage / "custom-manifests") == (custom, custom_records),
+                 "Retained custom manifest sources changed during media construction")
     state.write(stage / "media-build.yaml", {
         "schema_version": 2 if validation else 1, "inspection_run_id": run_id, "build_id": build_id, "policy": policy,
         "installer_ee": image, "release_image": provenance["release_image"],
         "source_manifest_sha256": source_hashes, "derived_agent_sha256": derived_hash,
+        "custom_manifests": custom_records,
         "kernel_arguments": kargs, "artifacts": artifacts,
         **({"validation": {"source": "media-validation/validation.json",
                             "sha256": digest(stage / "media-validation/validation.json")},

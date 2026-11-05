@@ -70,6 +70,106 @@ def select_inspection(root):
     return path
 
 
+CUSTOM = b'''# Preserve source comments and formatting.
+apiVersion: machineconfiguration.openshift.io/v1
+kind: MachineConfig
+metadata:
+  name: 99-worker-gpudirect-iommu-pt
+  labels:
+    machineconfiguration.openshift.io/role: worker
+spec:
+  kernelArguments:
+    - iommu=pt
+'''
+
+
+def custom_input(root, content=CUSTOM):
+    path = root / 'input/2-8-5-200/test01/openshift/99-worker.yaml'
+    path.parent.mkdir(exist_ok=True)
+    path.write_bytes(content)
+    return path
+
+
+@pytest.mark.parametrize('mode', ['full', 'full-ram', 'minimal', 'manual'])
+def test_custom_manifests_staged_before_installer_and_retained_after_consumption(eligible_run, mode):
+    root, bundle, _ = eligible_run
+    path = custom_input(root)
+    policy(root, mode)
+    original = native(root, mode, [])
+    def run(argv, **kwargs):
+        if '--dir' in argv:
+            stage = Path(argv[argv.index('--dir') + 1])
+            assert (stage / 'openshift' / path.name).read_bytes() == CUSTOM
+            assert (stage / 'custom-manifests' / path.name).read_bytes() == CUSTOM
+            # The real installer may consume manifests while generating assets.
+            shutil.rmtree(stage / 'openshift')
+        return original(argv, **kwargs)
+    stage = builder.build(root, '2-8-5-200', 'test01', RUN, 'custom', run=run)
+    image, candidates, _ = builder.gate.validate_handoff(root, '2-8-5-200', 'test01', RUN)
+    release = builder.gate.read_yaml(bundle / 'preflight-vars.yaml')['inspection_preflight_provenance']['release_image']
+    record = install.media_build(stage, RUN, 'custom', image, release, candidates)
+    assert path.read_bytes() == CUSTOM
+    assert record['custom_manifests'][0]['resources'][0]['role'] == 'worker'
+    assert record['custom_manifests'][0]['sha256'] == builder.digest(path)
+
+
+@pytest.mark.parametrize('fault', ['yaml', 'object', 'name', 'duplicate', 'role', 'arguments',
+                                 'symlink', 'directory', 'extension', 'empty'])
+def test_invalid_custom_inputs_rejected_before_installer(eligible_run, fault):
+    root, _, _ = eligible_run
+    path = custom_input(root)
+    if fault == 'yaml': path.write_text('metadata: [')
+    elif fault == 'object': path.write_text('- not-an-object\n')
+    elif fault == 'name': path.write_bytes(CUSTOM.replace(b'  name:', b'  generateName:'))
+    elif fault == 'duplicate': path.write_bytes(CUSTOM + b'---\n' + CUSTOM)
+    elif fault == 'role': path.write_bytes(CUSTOM.replace(b'role: worker', b'role: []'))
+    elif fault == 'arguments': path.write_bytes(CUSTOM.replace(b'kernelArguments:\n    - iommu=pt', b'kernelArguments: iommu=pt'))
+    elif fault == 'symlink':
+        path.unlink()
+        path.symlink_to(root / '.era-context')
+    elif fault == 'directory': (path.parent / 'nested').mkdir()
+    elif fault == 'extension': path.rename(path.with_suffix('.txt'))
+    else: path.write_bytes(b'')
+    calls = []
+    with pytest.raises((ValueError, yaml.YAMLError)):
+        builder.build(root, '2-8-5-200', 'test01', RUN, 'invalid', run=native(root, 'full', calls))
+    assert not calls
+
+
+@pytest.mark.parametrize('fault', ['edit', 'add', 'remove', 'snapshot'])
+def test_custom_drift_prevents_successful_receipt_and_context_selection(eligible_run, fault):
+    root, _, _ = eligible_run
+    path = custom_input(root)
+    context = select_inspection(root)
+    before = context.read_bytes()
+    original = native(root, 'full', [])
+    def run(argv, **kwargs):
+        result = original(argv, **kwargs)
+        stage = Path(argv[argv.index('--dir') + 1])
+        if fault == 'edit': path.write_bytes(CUSTOM + b'# changed\n')
+        elif fault == 'add': (path.parent / 'another.yaml').write_text('apiVersion: v1\nkind: Namespace\nmetadata:\n  name: extra\n')
+        elif fault == 'remove': path.unlink()
+        else: (stage / 'custom-manifests' / path.name).write_bytes(CUSTOM + b'# changed\n')
+        return result
+    with pytest.raises(ValueError, match='[Cc]ustom manifest'):
+        builder.build_and_select(root, '2-8-5-200', 'test01', RUN, 'drift', run=run)
+    assert context.read_bytes() == before
+    assert not (root / f'output/2-8-5-200/test01/ocp-iso/{RUN}/builds/drift/media-build.yaml').exists()
+
+
+def test_multiple_namespaced_documents_and_version_independent_duplicates(tmp_path):
+    directory = tmp_path / 'openshift'
+    directory.mkdir()
+    content = 'apiVersion: example.test/v1\nkind: Example\nmetadata:\n  name: same\n  namespace: one\n'
+    path = directory / 'objects.yaml'
+    path.write_text(content + '---\n' + content.replace('namespace: one', 'namespace: two'))
+    _, records = builder.custom_manifests(directory)
+    assert len(records[0]['resources']) == 2
+    path.write_text(content + '---\n' + content.replace('example.test/v1', 'example.test/v2'))
+    with pytest.raises(ValueError, match='Duplicate'):
+        builder.custom_manifests(directory)
+
+
 @pytest.mark.parametrize('explicit', [None, 'intentional-build'])
 def test_verified_build_publishes_bound_context(eligible_run, explicit, monkeypatch):
     root, _, _ = eligible_run
