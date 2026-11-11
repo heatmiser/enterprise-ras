@@ -114,6 +114,50 @@ def test_kubeconfig_faults_rejected(tmp_path, fault):
         access.selected_access(tmp_path)
 
 
+@pytest.mark.parametrize("omitted", [("apiVersion",), ("kind",), ("apiVersion", "kind")])
+def test_headerless_sealed_source_is_supported(tmp_path, omitted):
+    bundle, _, kube = completed(tmp_path, "20261110T233043Z-00000001")
+    source = tmp_path / "output/2-8-5-200/test01/ocp-iso" / RUN / "auth/kubeconfig"
+    config = yaml.safe_load(source.read_text())
+    for key in omitted:
+        del config[key]
+    write(source, config)
+    serving = yaml.safe_load((bundle / "plan.yml").read_text())["abi_install_plan"]
+    serving["source_sha256"]["auth/kubeconfig"] = access.INSTALL.state.digest(source)
+    fingerprint = access.INSTALL.state.fingerprint
+    write(bundle / "plan.yml", {"abi_install_plan": serving})
+    write(bundle / "prepared.yaml", {"plan_sha256": fingerprint(serving)})
+    current = bundle.parent.parent / "current-attempt.yaml"
+    marker = yaml.safe_load(current.read_text())
+    marker["plan_sha256"] = fingerprint(serving)
+    write(current, marker)
+    boot = yaml.safe_load((bundle / "boot/plan.yml").read_text())["abi_boot_plan"]
+    boot["serving_plan"] = serving
+    write(bundle / "boot/plan.yml", {"abi_boot_plan": boot})
+    write(bundle / "boot/prepared.yaml", {"plan_sha256": fingerprint(boot)})
+    assert access.selected_access(tmp_path) == (IMAGE, kube)
+
+
+@pytest.mark.parametrize("change", [{"apiVersion": "invalid"}, {"kind": "Invalid"}, {"kind": None}])
+def test_explicit_invalid_source_headers_are_rejected(tmp_path, change):
+    _, _, kube = completed(tmp_path)
+    config = yaml.safe_load(kube.read_text())
+    config.update(change)
+    write(kube, config)
+    with pytest.raises(ValueError, match="Invalid kubeconfig structure"):
+        access.kube_identity(kube, sealed_source=True)
+
+
+@pytest.mark.parametrize("header", ["apiVersion", "kind"])
+def test_completed_working_config_still_requires_headers(tmp_path, header):
+    _, _, kube = completed(tmp_path)
+    config = yaml.safe_load(kube.read_text())
+    del config[header]
+    write(kube, config)
+    with pytest.raises(ValueError, match="Invalid kubeconfig structure"):
+        access.selected_access(tmp_path)
+
+
 def test_completed_working_credentials_can_differ_from_sealed_source(tmp_path):
     _, _, kube = completed(tmp_path, "20261110T233043Z-00000001")
     config = yaml.safe_load(kube.read_text())

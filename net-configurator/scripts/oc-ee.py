@@ -25,11 +25,14 @@ CONTEXT = load(ROOT / "scripts/_era_context.py", "oc_ee_context")
 INSTALL = load(ROOT / "scripts/prepare-abi-install.py", "oc_ee_install")
 
 
-def kube_identity(path):
+def kube_identity(path, sealed_source=False):
     """Require a self-contained TLS kubeconfig and return its selected API URL."""
     require = INSTALL.require
     config = INSTALL.state.read(path)
-    require(config.get("apiVersion") == "v1" and config.get("kind") == "Config",
+    # Original installer inputs can omit type metadata. The completed working
+    # config must declare it; explicitly invalid source metadata still fails.
+    require(config.get("apiVersion", "v1" if sealed_source else None) == "v1"
+            and config.get("kind", "Config" if sealed_source else None) == "Config",
             "Invalid kubeconfig structure")
     selected = config.get("current-context")
     require(isinstance(selected, str) and bool(selected), "Missing current kubeconfig context")
@@ -109,7 +112,7 @@ def selected_access(root):
             "Original sealed installer credentials changed")
     # Native installer waits can update the private working credentials. Their
     # bytes need not equal the pre-install source; keep the selected API binding.
-    require(kube_identity(kubeconfig) == kube_identity(source), "Working kubeconfig API endpoint changed")
+    require(kube_identity(kubeconfig) == kube_identity(source, sealed_source=True), "Working kubeconfig API endpoint changed")
     return image, kubeconfig
 
 
