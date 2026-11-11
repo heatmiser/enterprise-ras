@@ -25,6 +25,45 @@ CONTEXT = load(ROOT / "scripts/_era_context.py", "oc_ee_context")
 INSTALL = load(ROOT / "scripts/prepare-abi-install.py", "oc_ee_install")
 
 
+def kube_identity(path):
+    """Require a self-contained TLS kubeconfig and return its selected API URL."""
+    require = INSTALL.require
+    config = INSTALL.state.read(path)
+    require(config.get("apiVersion") == "v1" and config.get("kind") == "Config",
+            "Invalid kubeconfig structure")
+    selected = config.get("current-context")
+    require(isinstance(selected, str) and bool(selected), "Missing current kubeconfig context")
+
+    def named(section, name):
+        entries = config.get(section)
+        require(isinstance(entries, list) and all(isinstance(item, dict) for item in entries),
+                "Invalid kubeconfig entries")
+        matches = [item for item in entries if item.get("name") == name]
+        require(len(matches) == 1, "Missing or ambiguous kubeconfig identity")
+        value = matches[0].get({"contexts": "context", "clusters": "cluster", "users": "user"}[section])
+        require(isinstance(value, dict), "Invalid kubeconfig entry")
+        return value
+
+    context = named("contexts", selected)
+    cluster = named("clusters", context.get("cluster"))
+    user = named("users", context.get("user"))
+    server = cluster.get("server")
+    require(isinstance(server, str) and server.startswith("https://"), "Require HTTPS API endpoint")
+    require(not cluster.get("insecure-skip-tls-verify")
+            and isinstance(cluster.get("certificate-authority-data"), str)
+            and bool(cluster["certificate-authority-data"])
+            and "certificate-authority" not in cluster and "proxy-url" not in cluster,
+            "Require inline CA and verified TLS")
+    require(not any(key in user for key in (
+        "exec", "auth-provider", "tokenFile", "client-certificate", "client-key")),
+        "Require inline kubeconfig credentials")
+    certificate = all(isinstance(user.get(key), str) and bool(user[key])
+                      for key in ("client-certificate-data", "client-key-data"))
+    require(certificate or (isinstance(user.get("token"), str) and bool(user["token"])),
+            "Missing inline kubeconfig credentials")
+    return server
+
+
 def selected_access(root):
     """Resolve existing context/attempt contracts without changing any evidence."""
     state = INSTALL.state
@@ -63,8 +102,14 @@ def selected_access(root):
             "Installer EE must use an immutable digest")
     kubeconfig = state.safe_path(reports / "boot/installer/auth/kubeconfig")
     require(kubeconfig.is_file() and os.access(kubeconfig, os.R_OK), "Selected kubeconfig is missing or unreadable")
-    require(state.digest(kubeconfig) == serving["source_sha256"]["auth/kubeconfig"],
-            "Selected kubeconfig differs from sealed installer credentials")
+    source = state.safe_path(Path(boot["installer_dir"]) / "auth/kubeconfig")
+    require(Path(boot["installer_dir"]) == Path(serving["iso_path"]).parent,
+            "Installer source directory differs from selected media")
+    require(state.digest(source) == serving["source_sha256"]["auth/kubeconfig"],
+            "Original sealed installer credentials changed")
+    # Native installer waits can update the private working credentials. Their
+    # bytes need not equal the pre-install source; keep the selected API binding.
+    require(kube_identity(kubeconfig) == kube_identity(source), "Working kubeconfig API endpoint changed")
     return image, kubeconfig
 
 

@@ -280,7 +280,7 @@ Then run commands from any directory:
     oc_ee get clusterversion
 
 The function reads `.era-context` and the existing selected-installation reference
-on every invocation. It uses the completed attempt's private installer kubeconfig
+on every invocation. It uses the completed attempt's private working kubeconfig
 and digest-pinned installer EE. No `ABI_REPORT` or `KUBECONFIG` export is needed;
 those inherited variables do not select credentials. Original installations and
 repeat attempts use the same interface, including after subsequent reinstalls.
@@ -288,8 +288,13 @@ To load the function in new interactive shells, add the source line to your
 `~/.bashrc` yourself; installation does not edit shell startup files.
 
 The selected installation must record successful bootstrap, installation, fleet
-readiness and cleanup. Missing or changed plans/credentials and incomplete selected
-attempts fail without falling back to a previous installation. Completion evidence
+readiness and cleanup. The original installer kubeconfig must still match its
+sealed input hash. The native installer can update the private working kubeconfig;
+that completed working copy need not remain byte-identical to the original.
+The helper checks its structure, selected API endpoint against the sealed source,
+inline credentials and CA, and TLS verification settings. Missing or inconsistent
+plans/credentials and incomplete selected attempts fail without falling back to a
+previous installation. Completion evidence
 is historical; each `oc` command still performs normal API authentication and TLS
 verification. A successful receipt does not establish continuing cluster health.
 

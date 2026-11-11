@@ -29,8 +29,16 @@ def completed(root, attempt="", site="test01"):
     bundle, reports = access.INSTALL.installation_paths(base, RUN, attempt)
     kube = reports / "boot/installer/auth/kubeconfig"
     kube.parent.mkdir(parents=True, exist_ok=True)
-    kube.write_text("fixture kubeconfig for " + (attempt or RUN))
+    config = {"apiVersion": "v1", "kind": "Config", "current-context": "admin",
+              "contexts": [{"name": "admin", "context": {"cluster": "cluster", "user": "admin"}}],
+              "clusters": [{"name": "cluster", "cluster": {
+                  "server": "https://api.fixture.example:6443", "certificate-authority-data": "fixture-source-ca"}}],
+              "users": [{"name": "admin", "user": {"token": "fixture-source-token"}}]}
+    write(kube, config)
+    source = base / "ocp-iso" / RUN / "auth/kubeconfig"
+    write(source, config)
     serving = {"inspection_run_id": RUN, "reports_dir": str(reports / "serving"),
+               "iso_path": str(source.parent.parent / "agent.x86_64.iso"),
                "installer_ee": IMAGE, "node_names": ["node01"], "iso_sha256": "b" * 64,
                "source_sha256": {"auth/kubeconfig": access.INSTALL.state.digest(kube)}}
     if attempt:
@@ -42,7 +50,8 @@ def completed(root, attempt="", site="test01"):
         write(base / "ocp/install/fleet" / RUN / "current-attempt.yaml",
               {"schema_version": 1, "inspection_run_id": RUN,
                "installation_attempt_id": attempt, "plan_sha256": fingerprint(serving)})
-    boot = {"inspection_run_id": RUN, "serving_plan": serving, "artifact_root": str(reports / "boot")}
+    boot = {"inspection_run_id": RUN, "serving_plan": serving, "artifact_root": str(reports / "boot"),
+            "installer_dir": str(source.parent.parent)}
     if attempt:
         boot["installation_attempt_id"] = attempt
     write(bundle / "boot/plan.yml", {"abi_boot_plan": boot})
@@ -101,6 +110,48 @@ def test_kubeconfig_faults_rejected(tmp_path, fault):
         target.write_bytes(kube.read_bytes())
         kube.unlink()
         kube.symlink_to(target)
+    with pytest.raises(ValueError):
+        access.selected_access(tmp_path)
+
+
+def test_completed_working_credentials_can_differ_from_sealed_source(tmp_path):
+    _, _, kube = completed(tmp_path, "20261110T233043Z-00000001")
+    config = yaml.safe_load(kube.read_text())
+    config["clusters"][0]["cluster"]["certificate-authority-data"] = "fixture-final-ca"
+    config["users"][0]["user"] = {"client-certificate-data": "fixture-final-cert",
+                                  "client-key-data": "fixture-final-key"}
+    write(kube, config)
+    assert access.selected_access(tmp_path) == (IMAGE, kube)
+
+
+@pytest.mark.parametrize("change", [
+    {"server": "https://foreign.example:6443"}, {"server": "http://api.fixture.example:6443"},
+    {"insecure-skip-tls-verify": True}, {"certificate-authority-data": ""},
+    {"certificate-authority": "/outside/ca"}, {"proxy-url": "http://foreign.example"},
+])
+def test_working_endpoint_and_tls_policy_rejected(tmp_path, change):
+    _, _, kube = completed(tmp_path)
+    config = yaml.safe_load(kube.read_text())
+    config["clusters"][0]["cluster"].update(change)
+    write(kube, config)
+    with pytest.raises(ValueError):
+        access.selected_access(tmp_path)
+
+
+@pytest.mark.parametrize("fault", ["context", "credentials", "external_auth", "sealed_source"])
+def test_working_structure_and_source_binding_rejected(tmp_path, fault):
+    _, _, kube = completed(tmp_path)
+    config = yaml.safe_load(kube.read_text())
+    if fault == "context":
+        config["current-context"] = "missing"
+    elif fault == "credentials":
+        config["users"][0]["user"] = {}
+    elif fault == "external_auth":
+        config["users"][0]["user"]["exec"] = {"command": "external"}
+    else:
+        source = tmp_path / "output/2-8-5-200/test01/ocp-iso" / RUN / "auth/kubeconfig"
+        source.write_text("changed source fixture")
+    write(kube, config)
     with pytest.raises(ValueError):
         access.selected_access(tmp_path)
 
